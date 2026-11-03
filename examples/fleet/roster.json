@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "shared_paths": ["roles/shared.md"],
+  "agents": [
+    {"username": "assistant-a", "user_id": "example-user-a", "home_channel_id": "example-channel-a", "unit": "mattermost-acp-gateway-assistant-a.service", "env_file": "assistant-a.env.example", "role": "roles/reviewer.md", "harness": "codex", "protected": true},
+    {"username": "assistant-b", "user_id": "example-user-b", "home_channel_id": "example-channel-b", "unit": "mattermost-acp-gateway-assistant-b.service", "env_file": "assistant-b.env.example", "role": "roles/helper.md", "harness": "claude", "protected": false}
+  ]
+}

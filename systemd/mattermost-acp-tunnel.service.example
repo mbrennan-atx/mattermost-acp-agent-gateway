@@ -1,0 +1,22 @@
+# Optional loopback reverse SSH forwarding. Configure and trust the SSH host first.
+[Unit]
+Description=Mattermost ACP slash reverse SSH tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+ExecStart=/usr/bin/ssh -i __SSH_KEY__ \
+  -o BatchMode=yes -o IdentitiesOnly=yes \
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+  -o ExitOnForwardFailure=yes -o StrictHostKeyChecking=yes \
+  -N -R __REMOTE_PORT__:127.0.0.1:__LOCAL_PORT__ \
+  -p __SSH_PORT__ -- __SSH_HOST__
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Agent-to-agent posts on the Mattermost floor.
+
+mm-ask   Post to the configured support assistant and print the final reply. Exits 2 on timeout.
+mm-tell  Post to the configured coordinator and return. Does not wait.
+
+The gateway wakes the named agent only when a root post mentions exactly
+that one user. Thread replies do not wake anyone, so the caller waits here
+instead of starting a second turn.
+
+A turn posts a live status post first (⏳ Working…) and edits it to ✅ Done
+when the turn finishes. The answer is a separate post. mm-ask ignores both
+status versions and returns only after that answer is final.
+
+Environment (set by the gateway unit):
+  MATTERMOST_URL
+  MATTERMOST_TOKEN_FILE
+  MATTERMOST_PEER_CHANNEL_ID
+  MATTERMOST_SYSADMIN_USERNAME   required for mm-ask
+  MATTERMOST_COS_USERNAME        required for mm-tell
+  MM_ASK_TIMEOUT_SEC             default 900
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+
+def _env(name: str, default: str = "") -> str:
+    return os.environ.get(name, default).strip()
+
+
+def _die(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _token() -> str:
+    path = _env("MATTERMOST_TOKEN_FILE")
+    if not path:
+        _die("MATTERMOST_TOKEN_FILE is not set")
+    try:
+        token = Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        _die(f"cannot read token file: {exc}")
+    if not token:
+        _die("token file is empty")
+    return token
+
+
+def _request(base: str, token: str, method: str, path: str, body: dict | None = None) -> dict:
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        base.rstrip("/") + path,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:300]
+        _die(f"{method} {path} -> {exc.code}: {detail}")
+    if not raw:
+        return {}
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        _die(f"{path} returned {type(parsed).__name__}")
+    return parsed
+
+
+# Status posts put the model stamp and the status line on adjacent lines.
+# Answer posts put a blank line between the stamp and the body.
+_MODEL_STAMP_PREFIX = "> *Model:"
+_INFLIGHT_RE = re.compile(r"… \(\d+s\)$")
+_TERMINAL_RE = re.compile(r"^(?:✅ Done|❌ Failed) · ")
+# How many unchanged polls to accept an answer the status post never closes.
+_PENDING_POLLS = 3
+
+
+def classify_reply(text: str) -> str:
+    """Return inflight, terminal, empty, or answer.
+
+    Inflight is the live status post (``⏳ Working… (3s)`` and the other
+    catalog lines). Terminal is the collapsed ``✅ Done`` / ``❌ Failed``
+    summary. Anything else from the target user is part of the reply.
+    """
+    lines = (text or "").splitlines()
+    if not lines or not "".join(lines).strip():
+        return "empty"
+    content = lines
+    if lines[0].startswith(_MODEL_STAMP_PREFIX):
+        if len(lines) > 1 and lines[1].strip() == "":
+            return "answer"
+        content = lines[1:]
+    while content and not content[0].strip():
+        content = content[1:]
+    first = content[0].strip() if content else ""
+    if _TERMINAL_RE.match(first):
+        return "terminal"
+    if _INFLIGHT_RE.search(first):
+        return "inflight"
+    return "answer"
+
+
+def select_final_reply(posts: dict, target_id: str, root_id: str) -> tuple[str | None, str]:
+    """Pick the answer posts out of one thread snapshot.
+
+    Returns ``(text, state)``. ``ready`` means the turn has closed (the
+    status post is ``✅ Done`` / ``❌ Failed``, or there is no live status
+    post). ``pending`` means an answer is visible but the status post is
+    still ``Working…``. ``waiting`` means there is no answer yet.
+    """
+    replies: list[dict] = []
+    if isinstance(posts, dict):
+        for item in posts.values():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id") or "") == root_id:
+                continue
+            if str(item.get("user_id") or "") != target_id:
+                continue
+            replies.append(item)
+    replies.sort(key=lambda item: (int(item.get("create_at") or 0), str(item.get("id") or "")))
+    answers: list[str] = []
+    inflight = False
+    terminal = False
+    for item in replies:
+        kind = classify_reply(str(item.get("message") or ""))
+        if kind == "inflight":
+            inflight = True
+        elif kind == "terminal":
+            terminal = True
+        elif kind == "answer":
+            text = str(item.get("message") or "").strip()
+            if text:
+                answers.append(text)
+    if not answers:
+        return None, "waiting"
+    body = "\n\n".join(answers)
+    if terminal or not inflight:
+        return body, "ready"
+    return body, "pending"
+
+
+def _mode() -> str:
+    name = Path(sys.argv[0]).name
+    if name == "mm-tell":
+        return "tell"
+    if len(sys.argv) > 1 and sys.argv[1] in {"ask", "tell"}:
+        return sys.argv.pop(1)
+    return "ask"
+
+
+def main() -> None:
+    mode = _mode()
+    message = " ".join(sys.argv[1:]).strip()
+    if not message:
+        _die(f"usage: {Path(sys.argv[0]).name} <message>")
+    base = _env("MATTERMOST_URL")
+    channel = _env("MATTERMOST_PEER_CHANNEL_ID")
+    if not base or not channel:
+        _die("MATTERMOST_URL and MATTERMOST_PEER_CHANNEL_ID are required")
+    if mode == "tell":
+        target_name = _env("MATTERMOST_COS_USERNAME")
+    else:
+        target_name = _env("MATTERMOST_SYSADMIN_USERNAME")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", target_name):
+        _die("Explicit helper destination username is required")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]*", target_name):
+        _die("Explicit helper destination username is required")
+    token = _token()
+    me = _request(base, token, "GET", "/api/v4/users/me")
+    my_name = str(me.get("username") or "")
+    if target_name.lower() == my_name.lower():
+        _die(f"refusing to {mode} yourself")
+    target = _request(base, token, "GET", f"/api/v4/users/username/{target_name}")
+    target_id = str(target.get("id") or "")
+    if not target_id:
+        _die(f"no such user {target_name}")
+    post = _request(
+        base,
+        token,
+        "POST",
+        "/api/v4/posts",
+        {"channel_id": channel, "message": f"@{target_name} {message}"},
+    )
+    post_id = str(post.get("id") or "")
+    if not post_id:
+        _die("post created without an id")
+    if mode == "tell":
+        print(f"told @{target_name} post={post_id}")
+        return
+    timeout = int(_env("MM_ASK_TIMEOUT_SEC", "900") or "900")
+    deadline = time.monotonic() + timeout
+    print(f"waiting for @{target_name} post={post_id}", file=sys.stderr)
+    pending: str | None = None
+    stable = 0
+    while time.monotonic() < deadline:
+        thread = _request(base, token, "GET", f"/api/v4/posts/{post_id}/thread")
+        posts = thread.get("posts") if isinstance(thread.get("posts"), dict) else {}
+        text, state = select_final_reply(posts, target_id, post_id)
+        if state == "ready" and text:
+            print(text)
+            return
+        if state == "pending" and text and text == pending:
+            stable += 1
+            if stable >= _PENDING_POLLS:
+                print(text)
+                return
+        else:
+            pending = text if state == "pending" else None
+            stable = 0
+        time.sleep(2)
+    _die(f"no reply from @{target_name} within {timeout}s (post={post_id})", 2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+[router]
+harnesses = ["codex"]
+
+# Replace these illustrative IDs with models available to your account.
+[aliases]
+fast = "example-fast-model"
+careful = "example-reasoning-model high"
+
+[[rules]]
+name = "code-review"
+keywords = ["review"]
+model = "example-reasoning-model"
+effort = "high"
