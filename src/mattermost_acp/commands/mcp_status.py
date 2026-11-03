@@ -112,7 +112,7 @@ def format_doctor_json(data: dict, *, server_filter: str | None = None) -> str:
 
     lines.append("")
     lines.append(
-        "_MCP tools are available in normal chat_ (Grok agent + always-approve). "
+        "_MCP tools in normal chat use the native Grok configuration and permissions._ "
         "Ask for Glean/Slack/Jira/etc. — no special Mattermost MCP client needed."
     )
     return "\n".join(lines)

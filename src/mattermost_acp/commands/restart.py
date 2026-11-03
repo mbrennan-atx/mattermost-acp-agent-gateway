@@ -1,4 +1,4 @@
-"""Restart the grok-discord process cleanly.
+"""Restart the Mattermost gateway process cleanly.
 
 Strategy (under systemd with Restart=always):
   1. Caller writes a pending-restart marker (thread + session to bump).
@@ -80,7 +80,7 @@ async def restart_gateway(
                 await stop_coro()
             except Exception:
                 logger.exception("stop_coro failed during restart")
-        # Brief pause so Discord HTTP for the ack can finish.
+        # Brief pause so Mattermost HTTP for the ack can finish.
         await asyncio.sleep(0.3)
         logger.info("Exiting for clean restart (pid=%s)", os.getpid())
         os._exit(0)

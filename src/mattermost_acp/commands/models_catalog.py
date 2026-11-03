@@ -1,4 +1,4 @@
-"""Model catalog for Discord ``/model`` — mirrors CLI ``grok models``.
+"""Grok model catalog for Mattermost ``/model`` — mirrors CLI ``grok models``.
 
 Listing is gateway-local (shell out to ``grok models``). Switching is a
 gateway-owned ACP RPC (``session/set_model`` via ``SessionService.switch_model``)
@@ -22,7 +22,7 @@ _MODEL_LINE = re.compile(
     re.I,
 )
 _CACHE_TTL_S = 120.0
-_AUTOCOMPLETE_LIMIT = 25  # Discord hard cap
+_AUTOCOMPLETE_LIMIT = 25  # UI result limit
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,7 @@ def parse_grok_models_output(text: str) -> ModelCatalog:
 
 
 def format_catalog(catalog: ModelCatalog, *, query: str | None = None) -> str:
-    """Discord markdown list of models (optionally filtered)."""
+    """Mattermost markdown list of models (optionally filtered)."""
     models = catalog.models
     q = (query or "").strip().lower()
     if q:
@@ -119,7 +119,7 @@ def format_catalog(catalog: ModelCatalog, *, query: str | None = None) -> str:
 def filter_for_autocomplete(
     catalog: ModelCatalog, current: str, *, limit: int = _AUTOCOMPLETE_LIMIT
 ) -> list[str]:
-    """Return up to 25 model ids for Discord autocomplete."""
+    """Return up to 25 model ids for Mattermost autocomplete."""
     cur = (current or "").strip().lower()
     ids = catalog.ids
     if not cur:

@@ -1,4 +1,4 @@
-"""Reasoning-effort helpers for Discord ``/model`` and ``/effort``."""
+"""Reasoning-effort helpers for Mattermost ``/model`` and ``/effort``."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ EFFORT_LEVELS: tuple[str, ...] = (
 
 EFFORT_LEVEL_SET: frozenset[str] = frozenset(EFFORT_LEVELS)
 
-# Discord slash Choices (keep short; omit rarely used none/minimal/max if crowded
+# Mattermost slash Choices (keep short; omit rarely used none/minimal/max if crowded
 # — still accept them as free text / trailing token).
 EFFORT_SLASH_CHOICES: tuple[str, ...] = (
     "low",

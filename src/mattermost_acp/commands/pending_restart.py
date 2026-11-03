@@ -1,7 +1,7 @@
 """Persist which chat thread requested a gateway restart.
 
 Survives process death so the next process can post a success bump and
-re-warm the Grok ACP session that was in that thread.
+re-warm the native ACP session that was in that thread.
 """
 
 from __future__ import annotations

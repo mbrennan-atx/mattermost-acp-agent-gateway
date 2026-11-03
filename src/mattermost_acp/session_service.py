@@ -1,4 +1,4 @@
-"""Thread-scoped Grok sessions on top of AcpBroker + ThreadStore."""
+"""Thread-scoped agent sessions on top of AcpBroker + ThreadStore."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def discover_session_model(
 ) -> str | None:
     """Read ``current_model_id`` from the on-disk Grok session summary.
 
-    Discord's sqlite store only learns a model after ``/model``. The live ACP
+    Mattermost's sqlite store only learns a model after ``/model``. The live ACP
     session can be on something else (process default, prior switch the store
     never recorded). ``summary.json`` is the agent's own record.
     """

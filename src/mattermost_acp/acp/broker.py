@@ -456,7 +456,7 @@ class AcpBroker:
         self._remember_config(session_id, result)
 
     async def session_load(self, session_id: str, cwd: str | Path) -> None:
-        """Load session; discard replayed history updates for Discord."""
+        """Load session; discard replayed history updates for Mattermost."""
         # Cursor cannot load a new, unpersisted chat already live in this process.
         if self.backend == "cursor" and session_id in self._cursor_live_sessions:
             return

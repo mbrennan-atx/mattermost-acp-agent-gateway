@@ -366,7 +366,7 @@ def main() -> None:
             f"WorkingDirectory={json.dumps(str(cwd).replace('%', '%%'))}\n"
             f"EnvironmentFile={json.dumps(str(env_path).replace('%', '%%'))}\n"
             f"ExecStart={json.dumps(str(executable).replace('%', '%%'))}\n"
-            "Restart=on-failure\nKillMode=mixed\n[Install]\nWantedBy=default.target\n"
+            "Restart=always\nKillMode=mixed\n[Install]\nWantedBy=default.target\n"
         )
     roster["agents"].append(
         {

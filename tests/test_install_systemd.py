@@ -17,6 +17,7 @@ def test_preview_has_no_tunnel_or_sync(tmp_path):
         check=True,
     )
     assert "ExecStart=" in result.stdout
+    assert "Restart=always" in result.stdout
     assert 'EnvironmentFile="' + str(env) in result.stdout
     assert "ssh" not in result.stdout
     assert "tunnel.service" not in result.stdout
