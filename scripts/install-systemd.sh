@@ -38,10 +38,10 @@ def quote(value):
     return json.dumps(value.replace('%', '%%'))
 
 values = {
-    '__USER__': quote(getpass.getuser()),
-    '__HOME__': quote(Path.home()),
-    '__INSTALL_DIR__': quote(root),
-    '__ENV_FILE__': quote(a.env_file.expanduser().absolute()),
+    '__USER__': getpass.getuser(),
+    '__HOME__': str(Path.home()).replace('%', '%%'),
+    '__INSTALL_DIR__': str(root).replace('%', '%%'),
+    '__ENV_FILE__': str(a.env_file.expanduser().absolute()).replace('%', '%%'),
     '__EXECUTABLE__': quote(root / '.venv/bin/mattermost-acp-gateway'),
     '__SSH_KEY__': quote(a.ssh_key.expanduser().absolute()) if a.ssh_key else '',
     '__SSH_HOST__': quote(a.tunnel_host or ''),
@@ -49,6 +49,9 @@ values = {
     '__LOCAL_PORT__': str(a.local_port),
     '__REMOTE_PORT__': str(a.remote_port),
 }
+for value in values.values():
+    if any(char in value for char in '\n\r\0'):
+        p.error('unit values must be single-line text')
 names = ['mattermost-acp-gateway.service']
 if a.tunnel_host:
     names.append('mattermost-acp-tunnel.service')

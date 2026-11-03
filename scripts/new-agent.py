@@ -363,8 +363,8 @@ def main() -> None:
         unit_stream.write(
             "[Unit]\nDescription=Mattermost ACP assistant\nAfter=network.target\n"
             "[Service]\nType=simple\n"
-            f"WorkingDirectory={json.dumps(str(cwd).replace('%', '%%'))}\n"
-            f"EnvironmentFile={json.dumps(str(env_path).replace('%', '%%'))}\n"
+            f"WorkingDirectory={str(cwd).replace('%', '%%')}\n"
+            f"EnvironmentFile={str(env_path).replace('%', '%%')}\n"
             f"ExecStart={json.dumps(str(executable).replace('%', '%%'))}\n"
             "Restart=always\nKillMode=mixed\n[Install]\nWantedBy=default.target\n"
         )

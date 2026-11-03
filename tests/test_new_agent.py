@@ -36,6 +36,7 @@ def configured(tmp_path, monkeypatch):
     executable = checkout / ".venv/bin/mattermost-acp-gateway"
     executable.parent.mkdir(parents=True)
     executable.touch()
+    executable.chmod(0o755)
     monkeypatch.setattr(new_agent, "ROOT", checkout)
     argv = [
         "new-agent",
@@ -100,3 +101,20 @@ def test_apply_grants_admin_only_by_explicit_flag(configured, monkeypatch, admin
     assert values["MATTERMOST_ROSTER_FILE"] == str(config / "roster.json")
     assert env.stat().st_mode & 0o777 == 0o600
     assert json.loads((config / "roster.json").read_text())["agents"][0]["user_id"] == "assistant"
+
+    # The unit must be accepted by systemd itself, including space-containing paths.
+    import shutil
+    import subprocess
+
+    if shutil.which("systemd-analyze"):
+        unit = home / ".config/systemd/user/mattermost-acp-gateway-arbitrary.service"
+        proc = subprocess.Popen(
+            ["systemd-analyze", "verify", str(unit)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _, errors = proc.communicate(timeout=15)
+        assert proc.returncode == 0, errors
+        assert "ignoring" not in errors.lower()
+        assert "invalid" not in errors.lower()
