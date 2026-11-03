@@ -112,3 +112,28 @@ def test_symlink_outside_manifest_is_rejected(tmp_path):
     git(source, "commit", "-m", "Unsafe fixture")
     with pytest.raises(ReleaseError):
         exporter.export(source, tmp_path / "candidate")
+
+
+def test_public_documentation_links_resolve_inside_manifest():
+    """Catch removed/renamed documentation and utility targets before export."""
+    import re
+    from urllib.parse import unquote, urlsplit
+
+    root = SCRIPTS.parent
+    selected = set((root / "release/public-files.txt").read_text().splitlines())
+    failures = []
+    for name in sorted(selected):
+        if not name.endswith(".md"):
+            continue
+        document = root / name
+        for target in re.findall(r"\[[^\]\n]*\]\(([^)\n]+)\)", document.read_text()):
+            target = target.strip().removeprefix("<").removesuffix(">")
+            parsed = urlsplit(target)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            resolved = (document.parent / unquote(parsed.path)).resolve()
+            if not resolved.is_relative_to(root):
+                failures.append(name + ": target outside candidate")
+            elif resolved.relative_to(root).as_posix() not in selected:
+                failures.append(name + ": target absent from manifest")
+    assert not failures, "\n".join(failures)
