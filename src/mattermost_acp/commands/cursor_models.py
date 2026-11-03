@@ -3,8 +3,8 @@
 from mattermost_acp.acp.broker import AcpError
 
 
-def model_effort(model: str) -> str | None:
-    if "[" not in model or not model.endswith("]"):
+def model_effort(model: str | None) -> str | None:
+    if not model or "[" not in model or not model.endswith("]"):
         return None
     for item in model.split("[", 1)[1][:-1].split(","):
         key, _, value = item.partition("=")

@@ -1,7 +1,14 @@
 """End-to-end wiring of one turn: status post, model stamp, answer assembly."""
 
+import pytest
+from fake_agent import spawn_fake_agent_process
+
 from mattermost_acp.acp import SessionUpdate, TurnResult
+from mattermost_acp.acp.broker import AcpBroker
+from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.mm.gateway import MattermostGateway
+from mattermost_acp.session_service import SessionService
+from mattermost_acp.store import ThreadStore
 
 
 class _Cfg:
@@ -141,3 +148,56 @@ async def test_turn_falls_back_to_broker_answer_text() -> None:
     )
     answers = [msg for _c, msg, _r in client.created[1:]]
     assert answers == ["> *Model: Grok 4.6 · Effort: high*\n\nfallback body"]
+
+
+@pytest.mark.parametrize("harness", ["grok", "claude", "codex", "cursor"])
+async def test_single_assistant_root_reply_and_new_root_without_persona(tmp_path, harness):
+    """Exercise posted-message routing through real session storage and ACP pipes."""
+    cfg = _Cfg()
+    cfg.harness = harness
+    cfg.all_channels = False
+    cfg.channel_ids = frozenset({"example-channel"})
+    cfg.exclude_channel_ids = frozenset()
+    cfg.allow_user_ids = frozenset({"example-owner"})
+    cfg.peer_channel_id = None
+    cfg.text_slash = True
+    cfg.fleet_file = None
+    cfg.role_file = None
+    client = _Client()
+    client.user_id = "example-assistant"
+    client.username = "arbitrary-helper"
+    broker = AcpBroker(process_factory=spawn_fake_agent_process, backend=harness)
+    store = ThreadStore(tmp_path / "external state" / "threads.db", harness=harness)
+    await store.open()
+    sessions = SessionService(
+        broker, store, default_cwd=tmp_path, grok_home=tmp_path / "native-home",
+        inject_channel_context=False
+    )
+    gateway = MattermostGateway(cfg, client, sessions)
+    try:
+        async def post(post_id, root_id, message):
+            await gateway.handle_posted(PostedEvent(
+                post_id=post_id, root_id=root_id, channel_id="example-channel",
+                user_id="example-owner", message=message,
+            ))
+
+        await post("first-root", "", "first question")
+        first = await store.get("first-root")
+        assert first is not None
+        await post("reply", "first-root", "follow-up question")
+        reply = await store.get("first-root")
+        assert reply.session_id == first.session_id
+        assert await store.get("reply") is None
+        await post("second-root", "", "independent question")
+        second = await store.get("second-root")
+        assert second is not None and second.session_id != first.session_id
+        assert first.harness == second.harness == harness
+        answers = [(text, root) for _, text, root in client.created if "Hello " in text]
+        assert len(answers) == 3
+        assert [root for _, root in answers] == ["first-root", "first-root", "second-root"]
+        assert all(word in answers[i][0] for i, word in enumerate(
+            ["first question", "follow-up question", "independent question"]
+        ))
+    finally:
+        await broker.stop()
+        await store.close()
