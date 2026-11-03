@@ -47,6 +47,10 @@ class FakeAcpAgent:
             )
             return out
 
+        if method == "authenticate":
+            result({})
+            return out
+
         if method == "session/new":
             sid = self._sid()
             self.sessions[sid] = []
@@ -246,6 +250,8 @@ for line in sys.stdin:
         sys.stdout.flush()
     if method == "initialize":
         reply({"protocolVersion":1,"agentCapabilities":{"loadSession":True,"sessionCapabilities":{"resume":{},"close":{}}}})
+    elif method == "authenticate":
+        reply({})
     elif method == "session/new":
         s = sid(); sessions[s]=[]; reply({"sessionId": s})
     elif method == "session/resume":
