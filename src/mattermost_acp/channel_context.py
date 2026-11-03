@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
+
+from mattermost_acp.deployment import config_root, resolve_path
 
 MATTERMOST_SESSION_RULES = """\
 # Channel: Mattermost (mattermost-acp-gateway)
@@ -40,6 +43,15 @@ Implications:
 
 def session_meta_rules() -> dict[str, Any]:
     """ACP ``session/new`` ``_meta`` fragment."""
+    raw = os.environ.get("MATTERMOST_SESSION_RULES_FILE", "").strip()
+    if raw:
+        try:
+            rules = resolve_path(raw, config_root()).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            raise ValueError("Selected session instruction file is unreadable") from None
+        if not rules.strip():
+            raise ValueError("Selected session instruction file is empty")
+        return {"rules": rules}
     return {"rules": MATTERMOST_SESSION_RULES}
 
 

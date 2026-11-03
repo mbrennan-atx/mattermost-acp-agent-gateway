@@ -6,7 +6,7 @@ import os
 import shutil
 
 from mattermost_acp import deployment
-from mattermost_acp.channel_context import load_role_text
+from mattermost_acp.channel_context import load_role_text, session_meta_rules
 from mattermost_acp.config import Config
 
 
@@ -19,6 +19,7 @@ def check() -> None:
     if not 0 <= config.slash_port <= 65535:
         raise ValueError("MATTERMOST_SLASH_PORT is out of range")
     load_role_text(config.fleet_file, config.role_file)
+    session_meta_rules()
     for kind, setting in (
         ("roster", "MATTERMOST_ROSTER_FILE"),
         ("profiles", "MATTERMOST_HARNESS_PROFILES_FILE"),

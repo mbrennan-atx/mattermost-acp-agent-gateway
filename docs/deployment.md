@@ -33,6 +33,13 @@ executable, not a shell command line.
 
 ## Personas and fleet inventory
 
+`MATTERMOST_SESSION_RULES_FILE` optionally replaces the common ACP session rules
+with an operator-owned file, relative to the config root. Its bytes are preserved
+without truncation or whitespace changes. Use it when migrating prior transport
+instructions or adding operator-specific session guidance. Keep the gateway's
+model/title protocol directives in any replacement that needs those features.
+Without this setting, the built-in provider-neutral transport rules apply.
+
 Instruction text is independent of harness selection. Shared instructions are
 read first, then the role. Each input is stripped and capped at 4,000 characters,
 then joined with a blank line. This preserves the existing prompt composition;

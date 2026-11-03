@@ -54,3 +54,16 @@ def test_selected_instruction_failure_is_explicit(tmp_path):
     first.write_text("  " + "a" * 5000 + "  ")
     second.write_text("  role  ")
     assert load_role_text(first, second) == "a" * 4000 + "\n\nrole"
+
+
+def test_private_session_rules_preserve_exact_bytes(tmp_path, monkeypatch):
+    import pytest
+
+    monkeypatch.setenv("MATTERMOST_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setenv("MATTERMOST_SESSION_RULES_FILE", "transport.md")
+    text = "\nPrivate operator instructions.  \n"
+    (tmp_path / "transport.md").write_text(text)
+    assert session_meta_rules() == {"rules": text}
+    (tmp_path / "transport.md").unlink()
+    with pytest.raises(ValueError, match="Selected session instruction"):
+        session_meta_rules()
