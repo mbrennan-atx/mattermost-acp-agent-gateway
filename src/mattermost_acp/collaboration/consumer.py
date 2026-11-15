@@ -155,12 +155,16 @@ class CollaborationConsumer:
                             ):
                                 continue
                             current = await self.hub.request("GET", "/messages/" + item["id"])
-                            if current.get("claim") != key[1] or current["state"] not in {
-                                "running",
-                                "cancelling",
-                                "unconfirmed",
-                                "interrupted",
-                            }:
+                            if current.get("claim") != key[1] or (
+                                current["state"]
+                                not in {
+                                    "running",
+                                    "cancelling",
+                                    "unconfirmed",
+                                    "interrupted",
+                                }
+                                and not current.get("execution_pending")
+                            ):
                                 continue
                             if current["state"] not in {"running", "cancelling"} or current.get(
                                 "evidence", {}
@@ -277,7 +281,9 @@ class CollaborationConsumer:
             and terminal.get("native_dispatched", True)
         ):
             if not cancelled_retry:
-                await self.update(state, "evidence", evidence=self.foreground(state, terminal))
+                await self.update(
+                    state, "execution_settled", evidence=self.foreground(state, terminal)
+                )
             if self.ownership.get(key) is report and key not in self.reserving:
                 self.release_ownership(key)
 
@@ -793,7 +799,8 @@ class CollaborationConsumer:
             if target.get("claim") != item["parent_claim"]:
                 await self.update(item, "done", "Cancellation target claim changed")
                 return
-            if target["state"] != "cancelling":
+            execution_only = bool(target.get("execution_cancelling"))
+            if target["state"] != "cancelling" and not execution_only:
                 await self.update(item, "done", "Project request has settled")
                 return
             key = (target["id"], target.get("claim"))
@@ -813,8 +820,9 @@ class CollaborationConsumer:
                     {
                         "instance": target.get("instance"),
                         "claim": target.get("claim"),
-                        "state": "cancelled",
+                        "state": "execution_settled" if execution_only else "cancelled",
                         "result": "No native dispatch was reserved",
+                        "evidence": {"not_dispatched": True},
                     },
                 )
                 continue
@@ -827,8 +835,13 @@ class CollaborationConsumer:
                 and terminal.get("execution_id") == target.get("evidence", {}).get("execution_id")
                 and terminal["completed_at"] >= started
                 and not terminal.get("pending")
+                and not self.ownership_pending(key, terminal)
                 and terminal.get("native_dispatched", True)
-                and (terminal["stop_reason"] != "end_turn" or target.get("late_result"))
+                and (
+                    terminal["stop_reason"] != "end_turn"
+                    or target.get("late_result")
+                    or execution_only
+                )
             ):
                 state = {"cancelled": "cancelled", "end_turn": "done"}.get(
                     terminal["stop_reason"], "failed"
@@ -842,7 +855,7 @@ class CollaborationConsumer:
                     {
                         "instance": target.get("instance"),
                         "claim": target.get("claim"),
-                        "state": state,
+                        "state": "execution_settled" if execution_only else state,
                         "result": target.get("late_result") or evidence["foreground_answer"],
                         "evidence": evidence,
                     },

@@ -483,8 +483,9 @@ class CollaborationStore:
 
     def active_claims(self, actor, instance):
         rows = self.db.execute(
-            "SELECT data FROM messages WHERE recipient=? AND state IN "
-            "('running','cancelling','unconfirmed','interrupted')",
+            "SELECT data FROM messages WHERE recipient=? AND (state IN "
+            "('running','cancelling','unconfirmed','interrupted') "
+            "OR json_extract(data,'$.execution_pending')=1)",
             (actor,),
         ).fetchall()
         return [item for row in rows if (item := json.loads(row[0])).get("instance") == instance]
@@ -520,8 +521,9 @@ class CollaborationStore:
                         continue
                     active = self.db.execute(
                         "SELECT count(*) FROM messages WHERE project=? "
-                        "AND kind IN ('ask','work') AND state IN "
-                        "('running','unconfirmed','interrupted','cancelling')",
+                        "AND kind IN ('ask','work') AND (state IN "
+                        "('running','unconfirmed','interrupted','cancelling') "
+                        "OR json_extract(data,'$.execution_pending')=1)",
                         (project["id"],),
                     ).fetchone()[0]
                     if active >= project["limits"]["max_workers"]:
@@ -533,7 +535,8 @@ class CollaborationStore:
                         )
                         sibling = self.db.execute(
                             "SELECT data FROM messages WHERE project=? AND kind IN ('ask','work') "
-                            "AND state IN ('running','unconfirmed','interrupted','cancelling')",
+                            "AND (state IN ('running','unconfirmed','interrupted','cancelling') "
+                            "OR json_extract(data,'$.execution_pending')=1)",
                             (project["id"],),
                         ).fetchall()
                         if (
@@ -553,8 +556,9 @@ class CollaborationStore:
                         item["kind"] == "work"
                         and self.db.execute(
                             "SELECT 1 FROM messages WHERE project=? AND recipient=? "
-                            "AND kind IN ('ask','work') AND state IN "
-                            "('running','unconfirmed','interrupted','cancelling')",
+                            "AND kind IN ('ask','work') AND (state IN "
+                            "('running','unconfirmed','interrupted','cancelling') "
+                            "OR json_extract(data,'$.execution_pending')=1)",
                             (project["id"], actor),
                         ).fetchone()
                     ):
@@ -605,7 +609,30 @@ class CollaborationStore:
                 or (claim is not None and claim != item.get("claim"))
             ):
                 raise PermissionError("Stale or foreign worker instance")
-            if state == "evidence":
+            if state in {"evidence", "execution_settled"}:
+                if state == "execution_settled":
+                    if item["state"] not in TERMINAL:
+                        raise ValueError("Native settlement requires a terminal correlated result")
+                    receipt = evidence or {}
+                    reserved = item.get("evidence", {})
+                    completed = receipt.get("completed_at")
+                    if receipt.get("not_dispatched") and reserved.get("session_id"):
+                        raise ValueError("A reserved session requires native settlement evidence")
+                    if not receipt.get("not_dispatched") and (
+                        not reserved.get("session_id")
+                        or not reserved.get("execution_id")
+                        or receipt.get("session_id") != reserved.get("session_id")
+                        or receipt.get("execution_id") != reserved.get("execution_id")
+                        or not receipt.get("native_dispatched")
+                        or not receipt.get("stop_reason")
+                        or receipt.get("pending")
+                        or type(completed) not in {int, float}
+                        or not math.isfinite(completed)
+                        or completed < reserved.get("dispatch_started", float("inf"))
+                    ):
+                        raise ValueError("Native settlement must match the reserved execution")
+                    item["execution_pending"] = False
+                    item["execution_cancelling"] = False
                 item["evidence"].update(evidence or {})
                 self.save_message(item)
                 if item["kind"] in WORK:
@@ -618,6 +645,8 @@ class CollaborationStore:
                             continue
                         delivery.setdefault("result_evidence", {}).update(evidence or {})
                         self.save_message(delivery)
+                if state == "execution_settled":
+                    self.finish_cancellation(item["project"], actor)
                 return item
             if item["state"] in TERMINAL:
                 if state == item["state"] and result == item.get("result", ""):
@@ -631,6 +660,7 @@ class CollaborationStore:
                     return item
                 item["evidence"].update(evidence or {})
                 item["evidence"]["dispatch_started"] = self.clock()
+                item["execution_pending"] = True
                 item["lease_until"] = self.clock() + 45
             elif state == "heartbeat":
                 item["lease_until"] = self.clock() + 45
@@ -645,9 +675,11 @@ class CollaborationStore:
                     completed=self.clock(),
                 )
                 item["evidence"]["not_dispatched"] = True
+                item["execution_pending"] = False
             elif state == "queued" and item["state"] == "running":
                 item.setdefault("delivery_history", []).append(item["evidence"])
                 item["evidence"] = {}
+                item["execution_pending"] = False
                 item.update(state="queued", not_before=self.clock() + 2)
             elif state in {"unconfirmed", "interrupted"}:
                 item["recovery"] = text(result, "recovery")
@@ -756,6 +788,7 @@ class CollaborationStore:
                 self.save_project(project)
             item.setdefault("delivery_history", []).append(item["evidence"])
             item["evidence"] = {}
+            item["execution_pending"] = False
             item.update(
                 state="queued",
                 reconciliation=text(reconciliation, "reconciliation"),
@@ -780,6 +813,24 @@ class CollaborationStore:
                 item = json.loads(row[0])
                 if item["kind"] not in WORK and item["kind"] != "result":
                     continue
+                if (
+                    item["state"] in TERMINAL
+                    and item.get(
+                        "execution_pending",
+                        bool(
+                            item.get("evidence", {}).get("session_id")
+                            and item.get("evidence", {}).get("dispatch_started") is not None
+                        ),
+                    )
+                    and not (
+                        item["recipient"] == project["owner"]
+                        and not project.get("owner_in_discussion")
+                    )
+                ):
+                    # The correlated result is complete, but its reserved native
+                    # execution remains cancellable until verified settlement.
+                    item["execution_cancelling"] = True
+                    self.save_message(item)
                 if item["state"] in {"queued", "open"} or (
                     item["state"] not in TERMINAL
                     and item["recipient"] == project["owner"]
@@ -789,8 +840,11 @@ class CollaborationStore:
                     # its existing work. Origin /stop separately cancels that turn.
                     item["state"] = "cancelled"
                     self.save_message(item)
-                elif item["state"] in {"running", "unconfirmed", "interrupted"}:
-                    item["state"] = "cancelling"
+                elif item["state"] in {"running", "unconfirmed", "interrupted"} or item.get(
+                    "execution_cancelling"
+                ):
+                    if item["state"] not in TERMINAL:
+                        item["state"] = "cancelling"
                     self.save_message(item)
                     control = {
                         "id": identifier(),
@@ -818,7 +872,9 @@ class CollaborationStore:
         if (
             project["status"] == "cancelling"
             and not self.db.execute(
-                "SELECT 1 FROM messages WHERE project=? AND state='cancelling'", (pid,)
+                "SELECT 1 FROM messages WHERE project=? AND (state='cancelling' "
+                "OR json_extract(data,'$.execution_cancelling')=1) LIMIT 1",
+                (pid,),
             ).fetchone()
         ):
             project["status"] = "cancelled"

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from test_collaboration import active_gateway, api_fixture, ask, close_api, project
-from test_collaboration_continuation_review import child_result, retained_parent
+from test_collaboration_continuation_review import child_result, retained_parent, terminal
 from test_collaboration_dispatch_review import close_reports, idle_report, native_gateway
 from test_collaboration_regressions import (
     maintenance_client,
@@ -171,6 +171,189 @@ async def test_early_reply_keeps_native_owner_until_background_finishes(
         await consumer.close()
         await close_reports(gateway)
         await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("pending", ["foreground", "tool", "worker"])
+async def test_project_cancel_stops_native_execution_after_early_result(tmp_path, pending):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, _writer = native_gateway(tmp_path)
+    broker.capabilities.steering = False
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.get = AsyncMock(
+        return_value=SimpleNamespace(session_id="existing-native")
+    )
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    entered, release = asyncio.Event(), asyncio.Event()
+    handling = cancelling = None
+
+    def background_update(completed=False):
+        if pending == "worker":
+            return SessionUpdate(
+                "existing-native",
+                "subagent_activity",
+                raw={"worker_id": "early-worker", "state": "completed" if completed else "running"},
+            )
+        return SessionUpdate(
+            "existing-native",
+            "tool_call_update" if completed else "tool_call",
+            tool_call_id="early-tool",
+            tool_status="completed" if completed else "in_progress",
+        )
+
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        unrelated = project(store)
+        untouched = ask(store, unrelated["id"], recipient="gamma")
+
+        async def native(_thread, _prompt, **options):
+            assert await options["before_prompt"]("existing-native")
+            if pending != "foreground":
+                await options["on_update"](background_update())
+            store.reply(
+                request["id"],
+                "beta",
+                "Explicit early result",
+                evidence={"artifact": "https://example.com/proof"},
+                claim=claimed["claim"],
+            )
+            entered.set()
+            if pending == "foreground":
+                await release.wait()
+                return TurnResult("existing-native", "cancelled", "Native execution stopped", "")
+            return TurnResult("existing-native", "end_turn", "Native foreground completed", "")
+
+        async def cancel(_thread, **options):
+            assert options["expected_session"] == "existing-native"
+            assert options["guard"]()
+            if pending == "foreground":
+                release.set()
+            else:
+                gateway._observe_background_update(background_update(completed=True))
+
+        gateway.sessions.run_turn = AsyncMock(side_effect=native)
+        gateway.sessions.cancel = AsyncMock(side_effect=cancel)
+        handling = asyncio.create_task(consumer.handle(claimed))
+        await asyncio.wait_for(entered.wait(), 2)
+        if pending != "foreground":
+            async with asyncio.timeout(2):
+                while "discussion" not in gateway._last_terminal:
+                    await asyncio.sleep(0)
+        assert store.get_message(request["id"], "beta")["state"] == "done"
+        store.cancel(p["id"], "alpha")
+        assert store.show(p["id"], "alpha")["status"] == "cancelling"
+        control = store.claim_next("beta", consumer.instance)
+        assert control and control["kind"] == "cancel"
+        assert control["parent_claim"] == claimed["claim"]
+        cancelling = asyncio.create_task(consumer.handle(control))
+        await asyncio.wait_for(asyncio.gather(handling, cancelling), 4)
+        gateway.sessions.cancel.assert_awaited_once()
+        settled = store.get_message(request["id"], "beta")
+        assert settled["state"] == "done" and settled["result"] == "Explicit early result"
+        assert settled["evidence"]["artifact"] == "https://example.com/proof"
+        assert not settled["execution_pending"] and not settled["execution_cancelling"]
+        assert store.show(p["id"], "alpha")["status"] == "cancelled"
+        assert store.show(unrelated["id"], "alpha")["status"] == "active"
+        assert store.get_message(untouched["id"], "gamma")["state"] == "queued"
+        assert not consumer.owns_thread("discussion")
+        assert (
+            len([m for m in store.show(p["id"], "alpha")["messages"] if m["kind"] == "result"]) == 1
+        )
+    finally:
+        release.set()
+        tasks = [task for task in [handling, cancelling] if task]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await consumer.close()
+        await close_reports(gateway)
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["session", "execution", "pending", "started", "no_dispatch", "nan"]
+)
+async def test_native_settlement_cannot_clear_early_result_cancellation_with_invalid_receipt(
+    tmp_path, mismatch
+):
+    async with retained_parent(tmp_path) as (store, _clients, _gateway, consumer, p, parent, _old):
+        store.reply(parent["id"], "beta", "Explicit early result", claim=parent["claim"])
+        store.cancel(p["id"], "alpha")
+        evidence = terminal()
+        if mismatch == "session":
+            evidence["session_id"] = "another-session"
+        elif mismatch == "execution":
+            evidence["execution_id"] = "another-execution"
+        elif mismatch == "pending":
+            evidence["pending"] = True
+        elif mismatch == "started":
+            evidence["completed_at"] = 0
+        elif mismatch == "no_dispatch":
+            evidence["not_dispatched"] = True
+        else:
+            evidence["completed_at"] = float("nan")
+        with pytest.raises(ValueError, match="settlement"):
+            store.update(
+                parent["id"],
+                "beta",
+                consumer.instance,
+                "execution_settled",
+                evidence=evidence,
+                claim=parent["claim"],
+            )
+        unresolved = store.get_message(parent["id"], "beta")
+        assert unresolved["execution_pending"] and unresolved["execution_cancelling"]
+        assert unresolved["result"] == "Explicit early result"
+        assert store.show(p["id"], "alpha")["status"] == "cancelling"
+        store.update(
+            parent["id"],
+            "beta",
+            consumer.instance,
+            "execution_settled",
+            evidence=terminal(),
+            claim=parent["claim"],
+        )
+        assert store.show(p["id"], "alpha")["status"] == "cancelled"
+        assert store.get_message(parent["id"], "beta")["state"] == "done"
+
+
+async def test_early_result_retains_worker_slot_and_admission_claim_until_native_settlement(
+    tmp_path,
+):
+    async with retained_parent(tmp_path) as (store, _clients, _gateway, consumer, p, parent, _old):
+        p["limits"]["max_workers"] = 1
+        with store.transaction():
+            store.save_project(p)
+        store.reply(parent["id"], "beta", "Explicit early result", claim=parent["claim"])
+        next_request = ask(store, p["id"], recipient="gamma", key="next-worker")
+        assert store.claim_next("gamma", "another-worker") is None
+        assert [item["id"] for item in store.active_claims("beta", consumer.instance)] == [
+            parent["id"]
+        ]
+        store.update(
+            parent["id"],
+            "beta",
+            consumer.instance,
+            "execution_settled",
+            evidence=terminal(),
+            claim=parent["claim"],
+        )
+        assert store.active_claims("beta", consumer.instance) == []
+        assert store.claim_next("gamma", "another-worker")["id"] == next_request["id"]
+
+
+async def test_admission_cannot_forget_unobserved_native_execution_after_early_reply(tmp_path):
+    async with retained_parent(tmp_path) as (store, _clients, _gateway, consumer, _p, parent, _old):
+        store.reply(parent["id"], "beta", "Explicit early result", claim=parent["claim"])
+        consumer.ownership.pop((parent["id"], parent["claim"]))
+        consumer.claim_uncertain = True
+        with pytest.raises(RuntimeError, match="native reconciliation"):
+            await consumer.set_admission("sealed")
+        assert consumer.claim_uncertain
+        assert store.get_message(parent["id"], "beta")["execution_pending"]
 
 
 async def test_old_worker_cleanup_preserves_new_claim_owner_and_cancellation_fence(tmp_path):
