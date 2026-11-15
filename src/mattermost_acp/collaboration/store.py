@@ -453,7 +453,7 @@ class CollaborationStore:
                     item["evidence"].update(evidence)
             elif state == "queued" and item["state"] == "running":
                 item.setdefault("delivery_history", []).append(item["evidence"])
-                item["evidence"] = {}
+                item["evidence"] = dict(item.get("result_evidence", {}))
                 item.update(state="queued", not_before=self.clock() + 2)
             elif state in {"unconfirmed", "interrupted"}:
                 item["recovery"] = text(result, "recovery")
@@ -498,7 +498,7 @@ class CollaborationStore:
             ):
                 raise PermissionError("Stale reply claim")
             result = text(result, "result")
-            evidence = evidence or {}
+            evidence = {**item["evidence"], **(evidence or {})}
             if state not in {"done", "failed", "blocked"}:
                 raise ValueError("Invalid result state")
             if item["state"] in TERMINAL:
@@ -507,6 +507,8 @@ class CollaborationStore:
                 raise ValueError("Conflicting repeated result")
             if item["state"] == "cancelling":
                 item["late_result"] = result
+                item["late_state"] = state
+                item["late_evidence"] = evidence
                 self.save_message(item)
                 return item
             if item["state"] not in {"running", "unconfirmed", "interrupted"}:
@@ -528,6 +530,7 @@ class CollaborationStore:
                 "created": self.clock(),
                 "attempt": 0,
                 "evidence": evidence,
+                "result_evidence": evidence,
                 "result_state": state,
             }
             self.save_message(delivery)
@@ -548,7 +551,7 @@ class CollaborationStore:
             project["dispatched"] += 1
             self.save_project(project)
             item.setdefault("delivery_history", []).append(item["evidence"])
-            item["evidence"] = {}
+            item["evidence"] = dict(item.get("result_evidence", {}))
             item.update(
                 state="queued",
                 reconciliation=text(reconciliation, "reconciliation"),

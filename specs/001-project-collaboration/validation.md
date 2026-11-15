@@ -28,3 +28,10 @@ SC-001 through SC-003 require that live evidence. Local tests establish implemen
 - Ruff and build passed. The wheel was built from the source archive and both passed private release policy, with 51 wheel and 141 source entries.
 - Convergence checked 13 functional requirements, three success criteria, eight plan components and five constitution principles. No new implementation gap remains. T015-T017 retain final review, hosted CI, immutable installation and live acceptance.
 - First full-branch review and synthesis used gpt-6.1-sol/high. All supported findings were addressed, including the synthesis's ordinary-user-turn ownership and recipient-label findings. A fresh full-branch review of this committed source is required before push.
+
+## Lifecycle regression checks
+
+- Python 3.12.15 with locked dependencies: 380 passed, one optional fixture skipped, 43.72 seconds.
+- Successful requests now require an explicit correlated reply, including quiet native goals. Foreground output remains evidence rather than completion.
+- Additional contracts cover a pending-work check under the native-thread lock, background activity becoming pending again, running-request native cancellation, and peer evidence surviving result requeue.
+- All nine supported findings from the second Sol review were addressed. Final-source review and hosted CI remain required.

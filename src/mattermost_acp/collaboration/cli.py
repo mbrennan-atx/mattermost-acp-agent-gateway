@@ -13,6 +13,7 @@ from pathlib import Path
 import aiohttp
 
 from mattermost_acp.collaboration.client import HubClient, Settings
+from mattermost_acp.config import Config
 
 
 def content(args):
@@ -20,20 +21,24 @@ def content(args):
 
 
 async def create_discussion(args):
-    base = os.environ.get("MATTERMOST_URL", "").rstrip("/")
-    floor = os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "")
-    token_path = os.environ.get("MATTERMOST_TOKEN_FILE", "")
-    if not base or not floor or not token_path:
+    config = Config.load()
+    base, floor, token = (
+        config.mattermost_url.rstrip("/"),
+        config.peer_channel_id,
+        config.mattermost_token,
+    )
+    if not base or not floor or not token:
         raise ValueError(
             "Mattermost URL, floor and actor token file are required to create discussion"
         )
-    token = Path(token_path).expanduser().read_text().strip()
     async with aiohttp.ClientSession(
         headers={"Authorization": "Bearer " + token}, timeout=aiohttp.ClientTimeout(total=20)
     ) as session:
         body = {
             "channel_id": floor,
-            "message": "Project collaboration: " + args.title + "\n\n" + args.objective,
+            "message": ("Project collaboration: " + args.title + "\n\n" + args.objective).replace(
+                "@", "@\u200b"
+            ),
         }
         async with session.post(base + "/api/v4/posts", json=body) as response:
             if response.status >= 400:

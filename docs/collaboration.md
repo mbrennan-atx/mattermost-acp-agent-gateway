@@ -61,7 +61,7 @@ The consumer tries the existing active-only steering capability first. Every que
 mm-work reply REQUEST_ID --claim CLAIM_NONCE --text 'Verified result and evidence' --artifact https://example.com/proof
 ```
 
-The request prompt includes its ID and claim nonce. Use `--state blocked` or `--state failed` when appropriate. The receiver sees the result status, parent request and evidence. A fresh collaboration turn also saves a terminal final answer automatically when no required work remains pending. Long automatic results retain their full text in a private runtime file and deliver a bounded preview plus its path. Ongoing native work remains pending until an explicit reply supplies its result.
+The request prompt includes its ID and claim nonce. Use `--state blocked` or `--state failed` when appropriate. The receiver sees the result status, parent request and evidence. Every successful work request remains pending until its explicit correlated reply. A foreground end_turn is not proof that a native goal finished. The gateway records foreground output as evidence, with long text retained in a private runtime file. Result notifications preserve the peer result and artifact evidence independently of delivery retries.
 
 Unsupported busy steering leaves the message queued. A timeout or unknown injection outcome leaves it `unconfirmed`, since the adapter may have accepted it. Neither case triggers a competing native prompt. Independent threads can continue, while preparation and execution for one native thread are serialized.
 

@@ -198,6 +198,18 @@ async def test_two_gateways_exchange_result_with_real_native_sessions(tmp_path):
             consumers.append(consumer)
             native_stores.append(native)
         beta_item = store.claim_next("beta", consumers[1].instance)
+        native_prompt = gateways[1].run_prompt
+
+        async def explicit_reply(**kwargs):
+            receipt = await native_prompt(**kwargs)
+            await clients["beta"].request(
+                "POST",
+                f"/messages/{requested['id']}/reply",
+                {"result": receipt["answer"], "claim": beta_item["claim"]},
+            )
+            return receipt
+
+        gateways[1].run_prompt = explicit_reply
         await asyncio.wait_for(consumers[1].handle(beta_item), 15)
         original = store.get_message(requested["id"], "alpha")
         assert original["state"] == "done"
@@ -479,6 +491,7 @@ async def test_completion_cancel_race_settles_without_claiming_effects_stopped(t
             "answer": "Completed before cancellation",
         }
         store.cancel(p["id"], "alpha")
+        store.reply(m["id"], "beta", "Completed before cancellation", claim=claimed["claim"])
         control = store.claim_next("beta", consumer.instance)
         await asyncio.wait_for(consumer.handle(control), 3)
         final = store.get_message(m["id"], "alpha")
@@ -742,7 +755,9 @@ async def test_cli_creation_scopes_keys_to_owner(tmp_path, monkeypatch):
         await close_api(store, server, clients)
 
 
-async def test_auto_completion_preserves_full_long_answer(tmp_path, monkeypatch):
+async def test_foreground_output_preserves_long_answer_without_claiming_completion(
+    tmp_path, monkeypatch
+):
     from pathlib import Path
 
     store, server, clients = await api_fixture(tmp_path)
@@ -757,14 +772,15 @@ async def test_auto_completion_preserves_full_long_answer(tmp_path, monkeypatch)
     }
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    consumer.injected_wait = AsyncMock()
     try:
         p = project(store)
         m = ask(store, p["id"])
         await consumer.handle(store.claim_next("beta", consumer.instance))
         saved = store.get_message(m["id"], "alpha")
-        assert saved["state"] == "done"
+        assert saved["state"] == "running"
         assert Path(saved["evidence"]["result_file"]).read_text() == answer
-        assert len(saved["result"]) < 16000
+        assert len(saved["evidence"]["foreground_answer"]) < 16000
     finally:
         await consumer.close()
         await close_api(store, server, clients)
@@ -894,3 +910,100 @@ async def test_injected_request_does_not_own_ordinary_user_turn(tmp_path):
     finally:
         await consumer.close()
         await close_api(store, server, clients)
+
+
+async def test_pending_background_work_is_rechecked_under_prompt_lock():
+    gateway = active_gateway(busy=False)
+    gateway._reports["native"] = {
+        "thread_id": "discussion",
+        "active": False,
+        "reporter": SimpleNamespace(has_pending_work=lambda: True),
+    }
+    result = await gateway._run_prompt(
+        thread_id="discussion",
+        channel_id="floor",
+        prompt="queued request",
+        author_id="actor",
+        author_name="actor",
+        before_native=AsyncMock(),
+    )
+    assert result == {"queued": True}
+
+
+async def test_background_receipt_can_become_pending_again_with_matching_execution():
+    from mattermost_acp.acp import SessionUpdate
+    from mattermost_acp.mm.reporting import TurnReporter
+
+    gateway = active_gateway(busy=False)
+    gateway._reports["native"] = {
+        "thread_id": "discussion",
+        "execution_id": "current",
+        "active": False,
+        "reporter": TurnReporter(),
+        "task": None,
+        "suppressed": True,
+    }
+    gateway._last_terminal["discussion"] = {
+        "session_id": "native",
+        "execution_id": "current",
+        "pending": False,
+    }
+    gateway._observe_background_update(
+        SessionUpdate(
+            session_id="native",
+            kind="subagent_activity",
+            raw={"worker_id": "child", "state": "running"},
+        )
+    )
+    assert gateway._last_terminal["discussion"]["pending"]
+    gateway._last_terminal["discussion"]["execution_id"] = "older"
+    gateway._last_terminal["discussion"]["pending"] = False
+    gateway._observe_background_update(
+        SessionUpdate(
+            session_id="native",
+            kind="subagent_activity",
+            raw={"worker_id": "other", "state": "running"},
+        )
+    )
+    assert not gateway._last_terminal["discussion"]["pending"]
+
+
+async def test_native_stop_settles_running_injected_request(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway()
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        p = project(store)
+        m = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        gateway._reports["existing-native"] = {"execution_id": "turn"}
+        await consumer.reserve(claimed, "existing-native")
+        gateway._last_terminal["discussion"] = {
+            "session_id": "existing-native",
+            "execution_id": "turn",
+            "stop_reason": "cancelled",
+            "completed_at": store.clock() + 1,
+            "pending": False,
+            "answer": "",
+        }
+        await asyncio.wait_for(consumer.injected_wait(claimed), 3)
+        assert store.get_message(m["id"], "alpha")["state"] == "cancelled"
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+def test_result_requeue_preserves_peer_provenance_and_artifacts(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    p = project(store)
+    m = ask(store, p["id"])
+    store.claim_next("beta", "worker")
+    store.update(m["id"], "beta", "worker", "dispatch", evidence={"session_id": "peer-native"})
+    store.reply(m["id"], "beta", "Verified", evidence={"artifacts": ["https://example.com/proof"]})
+    result = store.claim_next("alpha", "owner")
+    store.update(result["id"], "alpha", "owner", "queued")
+    queued = store.get_message(result["id"], "alpha")
+    consumer = object.__new__(CollaborationConsumer)
+    prompt = consumer.prompt({**result, **queued})
+    assert "peer-native" in prompt and "https://example.com/proof" in prompt
+    store.close()

@@ -231,9 +231,14 @@ class MattermostGateway:
             return
         report["reporter"].observe(update)
         receipt = self._last_terminal.get(report["thread_id"])
-        if receipt and receipt.get("session_id") == update.session_id and receipt.get("pending"):
+        if (
+            receipt
+            and receipt.get("session_id") == update.session_id
+            and receipt.get("execution_id") == report.get("execution_id")
+        ):
+            was_pending = receipt.get("pending")
             receipt["pending"] = report["reporter"].has_pending_work()
-            if not receipt["pending"]:
+            if was_pending and not receipt["pending"]:
                 receipt["completed_at"] = time.time()
         if report.get("suppressed"):
             return
@@ -562,6 +567,12 @@ class MattermostGateway:
         collaboration_project: str | None = None,
         before_native=None,
     ) -> dict | None:
+        if before_native is not None and any(
+            report["thread_id"] == thread_id
+            and (report.get("active") or report["reporter"].has_pending_work())
+            for report in self._reports.values()
+        ):
+            return {"queued": True}
         if self.sessions.is_busy(thread_id):
             await self._post(
                 channel_id,
@@ -708,7 +719,19 @@ class MattermostGateway:
             try:
                 turn_options = {"channel_id": channel_id, "on_update": on_update, "route": route}
                 if before_native is not None:
-                    turn_options["before_prompt"] = before_native
+
+                    async def bind_native(actual_session):
+                        old_session = str(session_status.get("session_id") or "")
+                        if (
+                            self._reports.get(old_session) is report
+                            and old_session != actual_session
+                        ):
+                            self._reports.pop(old_session, None)
+                        self._reports[actual_session] = report
+                        session_status["session_id"] = actual_session
+                        return await before_native(actual_session)
+
+                    turn_options["before_prompt"] = bind_native
                 result = await self.sessions.run_turn(thread_id, text, **turn_options)
             finally:
                 report["active"] = False

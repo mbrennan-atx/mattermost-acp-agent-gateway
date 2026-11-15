@@ -70,6 +70,8 @@ class CollaborationConsumer:
     def active(self, thread):
         if self.gateway.sessions.is_busy(thread):
             return True
+        if any(report and report.get("thread_id") == thread for report in self.ownership.values()):
+            return True
         return any(
             report["thread_id"] == thread
             and (report.get("active") or report["reporter"].has_pending_work())
@@ -95,8 +97,7 @@ class CollaborationConsumer:
             terminal = self.gateway._last_terminal.get(item["binding"]["thread_id"])
             receipt = state.get("evidence", {})
             if (
-                state["state"] == "cancelling"
-                and receipt.get("session_id")
+                receipt.get("session_id")
                 and terminal
                 and terminal.get("session_id") == receipt["session_id"]
                 and terminal.get("execution_id") == receipt.get("execution_id")
@@ -144,7 +145,7 @@ class CollaborationConsumer:
             f"From: {item['sender']}\nKind: {item['kind']}\n"
             f"Claim: {item.get('claim', '')}\nParent request: {item.get('parent') or ''}\n"
             f"Result status: {item.get('result_state', 'pending')}\n"
-            f"Evidence: {json.dumps(item.get('evidence', {}))}\n"
+            f"Evidence: {json.dumps(item.get('result_evidence', item.get('evidence', {})))}\n"
             f"Objective: {item['objective']}\n{instructions}\n\n{item['text']}"
         )
 
@@ -217,6 +218,7 @@ class CollaborationConsumer:
             if outcome not in {None, "promptRequired"}:
                 await self.update(item, "unconfirmed", "Unknown native delivery outcome")
                 return
+            self.ownership.pop((item["id"], item.get("claim")), None)
             if self.active(thread):
                 await self.update(item, "queued")
                 return
@@ -236,34 +238,21 @@ class CollaborationConsumer:
                 return
             if result is None:
                 await self.update(item, "interrupted", "No confirmed native terminal receipt")
+            elif result.get("queued"):
+                await self.update(item, "queued")
             elif result.get("pending"):
-                await self.update(item, "heartbeat", evidence=result)
+                await self.update(item, "heartbeat", evidence=self.foreground(item, result))
                 await self.injected_wait(item)
             elif result["stop_reason"] == "cancelled":
                 await self.update(item, "cancelled", "Native stop=cancelled", result)
             else:
                 state = "done" if result["stop_reason"] == "end_turn" else "failed"
-                answer = result["answer"] or "No substantive answer"
-                evidence = {
-                    "session_id": result["session_id"],
-                    "model": result["model"],
-                    "stop_reason": result["stop_reason"],
-                    "delivery": "continuation",
-                }
-                if len(answer) > 8000:
-                    folder = Path.home() / ".local/state/mattermost-acp-collaboration/results"
-                    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    path = folder / (item["id"] + ".txt")
-                    path.write_text(answer)
-                    path.chmod(0o600)
-                    evidence["result_file"] = str(path)
-                    answer = answer[:8000] + "\nFull result saved at " + str(path)
-                await self.update(
-                    item,
-                    state,
-                    answer,
-                    evidence,
-                )
+                evidence = self.foreground(item, result)
+                if item["kind"] in {"ask", "work"} and state == "done":
+                    await self.update(item, "heartbeat", evidence=evidence)
+                    await self.injected_wait(item)
+                else:
+                    await self.update(item, state, evidence["foreground_answer"], evidence)
         except asyncio.CancelledError:
             try:
                 await self.update(
@@ -283,6 +272,28 @@ class CollaborationConsumer:
         finally:
             renewal.cancel()
             await asyncio.gather(renewal, return_exceptions=True)
+            for mid in [item["id"], item.get("parent") if item["kind"] == "cancel" else None]:
+                if mid:
+                    try:
+                        settled = await self.hub.request("GET", f"/messages/{mid}")
+                        if settled["state"] in {"done", "failed", "blocked", "cancelled", "queued"}:
+                            self.ownership.pop((mid, settled.get("claim")), None)
+                    except Exception:
+                        pass
+
+    def foreground(self, item, result):
+        evidence = {key: value for key, value in result.items() if key != "answer"}
+        answer = result.get("answer") or "No substantive answer"
+        if len(answer) > 8000:
+            folder = Path.home() / ".local/state/mattermost-acp-collaboration/results"
+            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path = folder / (item["id"] + ".txt")
+            path.write_text(answer)
+            path.chmod(0o600)
+            evidence["result_file"] = str(path)
+            answer = answer[:8000] + "\nFull foreground output saved at " + str(path)
+        evidence["foreground_answer"] = answer
+        return evidence
 
     async def reserve(self, item, session):
         report = self.gateway._reports.get(session)
@@ -325,10 +336,14 @@ class CollaborationConsumer:
                 and terminal.get("execution_id") == target.get("evidence", {}).get("execution_id")
                 and terminal["completed_at"] >= started
                 and not terminal.get("pending")
+                and (terminal["stop_reason"] != "end_turn" or target.get("late_result"))
             ):
                 state = {"cancelled": "cancelled", "end_turn": "done"}.get(
                     terminal["stop_reason"], "failed"
                 )
+                if terminal["stop_reason"] == "end_turn":
+                    state = target.get("late_state", state)
+                evidence = self.foreground(target, terminal)
                 await self.hub.request(
                     "POST",
                     f"/messages/{target['id']}/update",
@@ -336,8 +351,8 @@ class CollaborationConsumer:
                         "instance": target.get("instance"),
                         "claim": target.get("claim"),
                         "state": state,
-                        "result": terminal["answer"] or "Native turn ended",
-                        "evidence": terminal,
+                        "result": target.get("late_result") or evidence["foreground_answer"],
+                        "evidence": evidence,
                     },
                 )
                 continue
