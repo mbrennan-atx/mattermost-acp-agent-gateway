@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from mattermost_acp.collaboration.client import HubClient, Settings
+from mattermost_acp.collaboration.store import text
 
 
 def content(args):
@@ -29,8 +30,8 @@ async def execute(args, hub):
             set(args.members.split(",") if args.members else await hub.request("GET", "/actors"))
         )
         body = {
-            "title": args.title,
-            "objective": args.objective,
+            "title": text(args.title, "title", 200),
+            "objective": text(args.objective, "objective"),
             "members": members,
             "origin_thread_id": args.origin_thread,
             "origin_channel_id": args.origin_channel,
@@ -38,12 +39,12 @@ async def execute(args, hub):
                 name: getattr(args, name)
                 for name in ("max_workers", "max_turns", "max_depth", "max_seconds")
             },
-            "key": args.key,
+            "key": text(args.key, "project idempotency key", 200),
             "channel_id": os.environ.get("MATTERMOST_PEER_CHANNEL_ID", ""),
         }
         # A retry with the same key reuses the first discussion and project.
         for existing in await hub.request("GET", "/projects"):
-            if existing.get("key") == args.key and existing["owner"] == actor:
+            if existing.get("key") == body["key"] and existing["owner"] == actor:
                 if any(
                     existing[name] != body[name]
                     for name in (

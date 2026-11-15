@@ -12,8 +12,49 @@ from test_collaboration_regressions import (
     sidecar_project,
 )
 
+from mattermost_acp.collaboration.cli import execute, parser
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
+
+
+@pytest.mark.parametrize("field", ["title", "objective"])
+async def test_cli_creation_retry_normalizes_surrounding_field_whitespace(
+    tmp_path, monkeypatch, field
+):
+    post = AsyncMock(return_value={"id": "created-root", "channel_id": "floor"})
+    store, server, client = await creation_api(tmp_path / "hub.db", post)
+    monkeypatch.setenv("MATTERMOST_PEER_CHANNEL_ID", "floor")
+    values = {"title": "Build investigation", "objective": "Verify the dependency"}
+    values[field] = " " + values[field] + " "
+    args = parser().parse_args(
+        [
+            "create",
+            "--title",
+            values["title"],
+            "--objective",
+            values["objective"],
+            "--members",
+            "alpha,beta",
+            "--origin-thread",
+            "origin",
+            "--origin-channel",
+            "home",
+            "--key",
+            "same-project",
+        ]
+    )
+    try:
+        first = await execute(args, client)
+        repeated = await execute(args, client)
+        assert repeated["id"] == first["id"]
+        assert repeated[field] == values[field].strip()
+        post.assert_awaited_once()
+        setattr(args, field, "Changed substantive content")
+        with pytest.raises(ValueError, match="Conflicting project creation key"):
+            await execute(args, client)
+        assert len(store.list_projects("alpha")) == 1
+    finally:
+        await close_creation(store, server, client)
 
 
 async def test_original_owner_ask_does_not_borrow_its_sidecars_native_parent(tmp_path):
