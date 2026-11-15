@@ -106,6 +106,8 @@ class Config:
     log_file: Path | None
     attachments_dir: Path
     attachments_max_bytes: int
+    collab_sidecar: bool = False
+    collab_origin_actor: str = ""
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -132,8 +134,7 @@ class Config:
         token = os.environ.get("MATTERMOST_TOKEN", "").strip() or _read_token(token_file)
         if not token:
             raise ValueError(
-                "MATTERMOST_TOKEN is required (or MATTERMOST_TOKEN_FILE "
-                f"at {token_file})"
+                f"MATTERMOST_TOKEN is required (or MATTERMOST_TOKEN_FILE at {token_file})"
             )
 
         raw_channels = _csv(os.environ.get("MATTERMOST_CHANNEL_ID")) | _csv(
@@ -141,20 +142,14 @@ class Config:
         )
         # `all` / `*` / `any` — or an empty value — means every channel this
         # account can see, including channels created after startup.
-        all_channels = not raw_channels or any(
-            c.lower() in WILDCARD_CHANNELS for c in raw_channels
-        )
-        channel_ids = frozenset(
-            c for c in raw_channels if c.lower() not in WILDCARD_CHANNELS
-        )
-        auto_join = _truthy(
-            os.environ.get("MATTERMOST_AUTO_JOIN_CHANNELS"), default=all_channels
-        )
+        all_channels = not raw_channels or any(c.lower() in WILDCARD_CHANNELS for c in raw_channels)
+        channel_ids = frozenset(c for c in raw_channels if c.lower() not in WILDCARD_CHANNELS)
+        auto_join = _truthy(os.environ.get("MATTERMOST_AUTO_JOIN_CHANNELS"), default=all_channels)
         # Channels this account must never join or answer in, even in `all`
         # mode. Used to keep one harness out of another harness's channel.
-        exclude_channel_ids = _csv(
-            os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_ID")
-        ) | _csv(os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_IDS"))
+        exclude_channel_ids = _csv(os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_ID")) | _csv(
+            os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_IDS")
+        )
 
         team_raw = os.environ.get("MATTERMOST_TEAM_ID", "").strip()
         team_id = team_raw or None
@@ -191,9 +186,7 @@ class Config:
         status_done_tool_lines = max(
             0, int(os.environ.get("MATTERMOST_STATUS_DONE_TOOL_LINES", "0"))
         )
-        status_progress_lines = max(
-            0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3"))
-        )
+        status_progress_lines = max(0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3")))
 
         return cls(
             mattermost_url=url,
@@ -216,12 +209,8 @@ class Config:
             max_parallel_turns=max(1, max_parallel),
             show_thoughts=_truthy(_env("AGENT_SHOW_THOUGHTS"), default=False),
             text_slash=_truthy(_env("AGENT_TEXT_SLASH"), default=True),
-            auto_rename_threads=_truthy(
-                _env("AGENT_AUTO_RENAME_THREADS"), default=True
-            ),
-            inject_channel_context=_truthy(
-                _env("AGENT_INJECT_CHANNEL_CONTEXT"), default=True
-            ),
+            auto_rename_threads=_truthy(_env("AGENT_AUTO_RENAME_THREADS"), default=True),
+            inject_channel_context=_truthy(_env("AGENT_INJECT_CHANNEL_CONTEXT"), default=True),
             post_max_lines=post_max_lines,
             status_tool_lines=status_tool_lines,
             status_done_tool_lines=status_done_tool_lines,
@@ -229,11 +218,12 @@ class Config:
             slash_tokens=_csv(os.environ.get("MATTERMOST_SLASH_TOKEN"))
             | _csv(os.environ.get("MATTERMOST_SLASH_TOKENS"))
             | _token_file_csv(os.environ.get("MATTERMOST_SLASH_TOKEN_FILE")),
-            slash_host=os.environ.get("MATTERMOST_SLASH_HOST", "127.0.0.1").strip()
-            or "127.0.0.1",
+            slash_host=os.environ.get("MATTERMOST_SLASH_HOST", "127.0.0.1").strip() or "127.0.0.1",
             slash_port=slash_port,
             db_path=db,
             log_file=log_file,
             attachments_dir=attachments_dir,
             attachments_max_bytes=int(attachments_max_mb * 1024 * 1024),
+            collab_sidecar=_truthy(os.environ.get("MATTERMOST_COLLAB_SIDECAR")),
+            collab_origin_actor=os.environ.get("MATTERMOST_COLLAB_ORIGIN_ACTOR", "").strip(),
         )

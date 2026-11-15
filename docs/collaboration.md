@@ -6,7 +6,7 @@ The optional collaboration service lets independent assistants share project wor
 
 Install the same reviewed gateway package used by the participating gateways. Keep service configuration, actor credentials and the database outside the source checkout. Use persistent storage for the database.
 
-Create a private JSON configuration with an `actors` object. Each actor name has a `token_file` containing a distinct random credential of at least 32 characters. For addressed floor-thread requests, also set the actor's `user_id` and `mattermost_token_file`, and the top-level `mattermost_url`. The hub verifies the actual Mattermost post before routing it. Without those optional Mattermost settings, use `mm-work ask`.
+Create a private JSON configuration with an `actors` object. Each actor name has a `token_file` containing a distinct random credential of at least 32 characters. Automatic discussion creation and addressed floor requests also require the actor's `user_id` and `mattermost_token_file`, and the top-level `mattermost_url`. The hub verifies the actual Mattermost post before routing it. A token-only hub can use an existing root with `mm-work create --discussion-thread EXISTING_ROOT`, then `mm-work ask`.
 
 Run:
 
@@ -97,10 +97,16 @@ Request-count limits bound collaboration activation. They do not enforce an exac
 mm-work cancel PROJECT_ID
 ```
 
-Stopping the owner's originating thread also requests cancellation for its linked projects. Queued work cancels immediately. Result deliveries and requests addressed to the owner stop routing without cancelling the owner's ongoing conversation. For active worker work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session or native turn replaced it, or the gateway cannot prove turn ownership after a restart, cancellation stays blocked to preserve that work. Reconcile its native outcome before proceeding.
+Stopping the owner's originating thread in an upgraded home gateway also requests cancellation for its linked projects. A legacy home gateway with separate project sidecars requires `mm-work cancel`; its `/stop` does not propagate. Queued work cancels immediately. Result deliveries and requests addressed to the owner stop routing without cancelling the owner's ongoing conversation. For active worker work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session or native turn replaced it, or the gateway cannot prove turn ownership after a restart, cancellation stays blocked to preserve that work. Reconcile its native outcome before proceeding.
 
 A native result racing cancellation is retained as completed work. Conflicting repeated results are rejected. It does not establish that effects were prevented. Cancellation controls requeue after transport interruption. Session and execution guards are checked immediately before writing native controls, so session replacement cannot redirect a reserved cancellation or injection. The project remains `cancelling` while any execution lacks terminal evidence; the state makes that uncertainty visible. Cancellation of one project preserves unrelated sessions and projects.
 
 ## Gateway maintenance
 
 Participating gateways expose a loopback-only `POST /maintenance` on their slash listener, authenticated with that gateway's collaboration actor token. `state` returns foreground, full response delivery, inbound, command, native RPC, background and collaboration counters. `drain` pauses new model work while allowing stop commands. `seal` requires drained idle state and atomically blocks every new native control, including stop. `resume` clears both flags. Deployment tooling can seal admission before freezing and replacing a verified idle process; it must preserve the current native databases and provider configuration.
+
+## Collaboration beside an existing gateway
+
+A deployment can add a project worker beside an older home gateway when that gateway cannot prove a safe restart boundary. Configure the worker with `MATTERMOST_COLLAB_SIDECAR=1`, `MATTERMOST_COLLAB_ORIGIN_ACTOR=ACTOR`, a separate project database and loopback maintenance port. Keep its native harness, provider, model, effort and connector settings identical to the original. Set `sidecar: true` for that actor in the hub configuration. Startup verifies the actor and real Mattermost user before consuming work.
+
+This worker handles registered floor requests and project mailboxes, and ignores ordinary home messages and slash commands. Every native project binding, including the owner's, stays in the project discussion. Owner results are posted and read back in the originating thread and returned by `mm-work wait` or `show`; the worker never loads the original owner's native session. The originating agent supervises its delegated work through those commands. Existing home conversations keep running. Shared-work cancellation uses `mm-work cancel`; an older home gateway's `/stop` retains its original behavior and does not gain automatic project cancellation through this mode.

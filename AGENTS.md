@@ -24,6 +24,7 @@ This repository contains the generic Mattermost ACP gateway. Read this file befo
 
 - Build immutable candidate releases outside running installations. Never run dependency synchronization inside a pinned live release or overwrite its files.
 - Inspect effective service overrides and actual runtime settings. Preserve credentials, provider/model pins, connectors, identities and the newest state.
-- Activate gateways only at verified idle boundaries. Account for pending native goals, tools and workers, not just foreground turns. Use a separate finalizer for the gateway executing its own upgrade.
+- Activate gateways only at verified idle boundaries. Account for pending native goals, tools, workers and accepted inbound/control requests, not just foreground turns. When a legacy gateway cannot prove these boundaries, add an independent project sidecar and preserve the original process. Never treat inferred legacy idleness as permission to terminate it.
+- Sidecars require distinct project databases and maintenance listeners. Preserve actual provider/CLI/connector selectors, verify the hub actor against the Mattermost user, and keep every native project binding in the project discussion. Owner results are verified Mattermost posts and CLI receipts; a sidecar must never resume the original owner's native session.
 - Rehearse rollback using the previous executable and current state. Do not restore historical runtime databases or replay completed work.
 - Verify real delivery, session continuity and cancellation after activation. Read back any published deployment metadata before claiming success.

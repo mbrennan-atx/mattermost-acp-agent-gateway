@@ -117,12 +117,14 @@ class CollaborationStore:
         """Persist intent before external posting; uncertain posts need reconciliation."""
         key = text(body.get("key"), "project idempotency key", 200)
         canonical = {k: v for k, v in body.items() if k != "thread_id"}
+        canonical.setdefault("owner_in_discussion", False)
         with self.transaction():
             row = self.db.execute(
                 "SELECT data FROM creations WHERE actor=? AND key=?", (actor, key)
             ).fetchone()
             if row:
                 intent = json.loads(row[0])
+                intent["body"].setdefault("owner_in_discussion", False)
                 if intent["body"] != canonical:
                     raise ValueError("Conflicting project creation key")
                 return intent, False
@@ -157,6 +159,7 @@ class CollaborationStore:
             return project
 
     def create_project(self, actor, body):
+        body = {"owner_in_discussion": False, **body}
         key = body.get("key")
         fingerprint = hashlib.sha256(
             json.dumps({k: v for k, v in body.items() if k != "key"}, sort_keys=True).encode()
@@ -203,15 +206,17 @@ class CollaborationStore:
             "dispatched": 0,
             "cost_coverage": "unknown",
             "bindings": {},
+            "owner_in_discussion": bool(body.get("owner_in_discussion", False)),
             "key": key,
             "fingerprint": fingerprint,
         }
         for member in members:
             item["bindings"][member] = {"thread_id": thread, "channel_id": channel}
-        item["bindings"][actor] = {
-            "thread_id": item["origin_thread_id"],
-            "channel_id": item["origin_channel_id"],
-        }
+        if not item["owner_in_discussion"]:
+            item["bindings"][actor] = {
+                "thread_id": item["origin_thread_id"],
+                "channel_id": item["origin_channel_id"],
+            }
         with self.transaction():
             for member, binding in item["bindings"].items():
                 self.check_binding(item, member, binding)
@@ -404,12 +409,13 @@ class CollaborationStore:
                     item["recovery"] = "Worker lease expired; reconcile before retry"
                     self.save_message(item)
 
-    def claim_next(self, actor, instance):
+    def claim_next(self, actor, instance, *, controls_only=False):
         with self.transaction():
             self.expire()
             rows = self.db.execute(
                 "SELECT data FROM messages WHERE recipient=? AND state='queued' "
-                "ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'result' THEN 1 "
+                + ("AND kind='cancel' " if controls_only else "")
+                + "ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'result' THEN 1 "
                 "ELSE 2 END,created,id",
                 (actor,),
             ).fetchall()
@@ -486,6 +492,9 @@ class CollaborationStore:
                     **item,
                     "project_title": project["title"],
                     "objective": project["objective"],
+                    "project_owner": project["owner"],
+                    "origin_thread_id": project["origin_thread_id"],
+                    "origin_channel_id": project["origin_channel_id"],
                 }
             return None
 
@@ -534,6 +543,15 @@ class CollaborationStore:
                 item["lease_until"] = self.clock() + 45
                 if evidence:
                     item["evidence"].update(evidence)
+            elif state == "queued" and item["state"] == "cancelling":
+                # Queue fallback is an explicit assertion that native dispatch
+                # did not occur. Cancellation wins that race without a stop RPC.
+                item.update(
+                    state="cancelled",
+                    result="Cancelled before native dispatch",
+                    completed=self.clock(),
+                )
+                item["evidence"]["not_dispatched"] = True
             elif state == "queued" and item["state"] == "running":
                 item.setdefault("delivery_history", []).append(item["evidence"])
                 item["evidence"] = dict(item.get("result_evidence", {}))

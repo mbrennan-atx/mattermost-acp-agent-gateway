@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpError, SessionUpdate
+from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.attachments import (
     RemoteFile,
     format_attachment_note,
@@ -122,10 +123,13 @@ class MattermostGateway:
         from mattermost_acp.collaboration.consumer import CollaborationConsumer
 
         settings = Settings.load()
+        if getattr(self.config, "collab_sidecar", False) and settings is None:
+            raise ValueError("A collaboration sidecar requires a configured hub")
         if settings is not None:
             self.collaboration = CollaborationConsumer(self, settings)
             self.collaboration.start()
-        self._track_control(self._handle_pending_restart_bump(), "post-restart-bump")
+        if not getattr(self.config, "collab_sidecar", False):
+            self._track_control(self._handle_pending_restart_bump(), "post-restart-bump")
         logger.info(
             "Gateway online as %s (%s) harness=%s home=%s peer=%s",
             self.client.username,
@@ -135,12 +139,14 @@ class MattermostGateway:
             self.config.peer_channel_id or "-",
         )
         await self._ensure_peer_membership()
-        if self.config.auto_join_channels:
+        if self.config.auto_join_channels and not getattr(self.config, "collab_sidecar", False):
             asyncio.create_task(self._join_all_public_channels(), name="auto-join")
         async for payload in self.client.events(stop=self._stop):
             event = payload.get("event")
             if event == "channel_created":
-                if self.config.auto_join_channels:
+                if self.config.auto_join_channels and not getattr(
+                    self.config, "collab_sidecar", False
+                ):
                     asyncio.create_task(self._join_new_channel(payload), name="auto-join-new")
                 continue
             if event != "posted":
@@ -225,7 +231,7 @@ class MattermostGateway:
 
     def _observe_background_update(self, update: SessionUpdate) -> None:
         report = self._reports.get(update.session_id)
-        if report is None or report["active"]:
+        if report is None:
             return
         if update.kind not in {
             "agent_message_chunk",
@@ -233,6 +239,12 @@ class MattermostGateway:
             "tool_call_update",
             "subagent_activity",
         }:
+            return
+        previous = report.get("previous")
+        while previous is not None:
+            previous["reporter"].observe(update)
+            previous = previous.get("previous")
+        if report["active"]:
             return
         report["reporter"].observe(update)
         receipt = self._last_terminal.get(report["thread_id"])
@@ -330,6 +342,8 @@ class MattermostGateway:
         ):
             if await self.collaboration.mention(posted):
                 return
+        if getattr(self.config, "collab_sidecar", False):
+            return
         _kind, reason = classify_wake(
             channel_id=posted.channel_id,
             author_id=posted.user_id,
@@ -388,6 +402,8 @@ class MattermostGateway:
         )
 
     async def handle_slash(self, req: SlashRequest) -> dict[str, str]:
+        if getattr(self.config, "collab_sidecar", False):
+            return ephemeral("Use mm-work for shared project work.")
         if self.sealed or (self.draining and req.command != "stop"):
             return ephemeral("Gateway updating. Retry the command shortly.")
         if not self.allowed(req.user_id):
@@ -509,13 +525,25 @@ class MattermostGateway:
             return
         if cmd == "stop":
             self._stop_reports(thread_id)
-            ok = await self.sessions.cancel(thread_id)
+            ok = False
+            native_error = None
+            try:
+                ok = await self.sessions.cancel(thread_id)
+            except Exception as exc:
+                native_error = type(exc).__name__
+            project_error = False
             if self.collaboration is not None:
                 try:
                     await self.collaboration.cancel_thread(thread_id)
                 except Exception:
-                    logger.warning("Project cancellation unavailable; stopping native work")
-            await reply("⏹ Cancelled." if ok else "Nothing to cancel.")
+                    project_error = True
+                    logger.warning("Project cancellation unconfirmed; retry intent retained")
+            answer = "⏹ Cancelled." if ok else "Nothing to cancel."
+            if native_error:
+                answer = f"Native stop was not confirmed ({native_error})."
+            if project_error:
+                answer += " Project cancellation is unconfirmed; retry remains queued."
+            await reply(answer)
             return
         if cmd in {"new", "clear"}:
             self._stop_reports(thread_id)
@@ -599,12 +627,33 @@ class MattermostGateway:
         async with lock:
             if self.draining and kwargs.get("before_native") is not None:
                 return {"queued": True}
-            return await self._run_prompt(thread_id=thread_id, **kwargs)
+            try:
+                return await self._run_prompt(thread_id=thread_id, **kwargs)
+            finally:
+                for report in self.live_reports():
+                    if report["thread_id"] == thread_id and not report.get("active"):
+                        report["foreground_complete"] = True
+
+    def live_reports(self):
+        seen = set()
+        for report in self._reports.values():
+            while report is not None and id(report) not in seen:
+                seen.add(id(report))
+                yield report
+                report = report.get("previous")
+
+    def background_pending(self, thread_id, *, exclude=None):
+        return any(
+            report is not exclude
+            and report["thread_id"] == thread_id
+            and (report.get("active") or report["reporter"].has_pending_work())
+            for report in self.live_reports()
+        )
 
     def maintenance_state(self):
         pending = sum(
             bool(report.get("active") or report["reporter"].has_pending_work())
-            for report in self._reports.values()
+            for report in self.live_reports()
         )
         state = {
             "draining": self.draining,
@@ -615,10 +664,28 @@ class MattermostGateway:
             "commands": self._active_controls + len(self._slash_tasks),
             "native_rpc": len(getattr(self.sessions.broker, "_pending", {})),
             "background": pending,
-            "collaboration": len(self.collaboration.workers) if self.collaboration else 0,
+            "collaboration": (
+                len(self.collaboration.workers)
+                + len(getattr(self.collaboration, "pending_stops", ()))
+            )
+            if self.collaboration
+            else 0,
+            "sidecar": getattr(self.config, "collab_sidecar", False),
+            "actor": getattr(self.collaboration, "actor", ""),
+            "harness": self.config.harness,
+            "db_path": str(getattr(self.config, "db_path", "")),
         }
         state["idle"] = not any(
-            value for key, value in state.items() if key not in {"draining", "sealed"}
+            state[key]
+            for key in {
+                "foreground",
+                "responses",
+                "inbound",
+                "commands",
+                "native_rpc",
+                "background",
+                "collaboration",
+            }
         )
         return state
 
@@ -636,11 +703,7 @@ class MattermostGateway:
         collaboration_project: str | None = None,
         before_native=None,
     ) -> dict | None:
-        if before_native is not None and any(
-            report["thread_id"] == thread_id
-            and (report.get("active") or report["reporter"].has_pending_work())
-            for report in self._reports.values()
-        ):
+        if before_native is not None and self.background_pending(thread_id):
             return {"queued": True}
         if self.sessions.is_busy(thread_id):
             await self._post(
@@ -740,6 +803,10 @@ class MattermostGateway:
             try:
                 status.observe(update)
                 reporter.observe(update)
+                prior = report.get("previous")
+                while prior is not None:
+                    prior["reporter"].observe(update)
+                    prior = prior.get("previous")
                 if update.kind == "agent_message_chunk":
                     if not update.text:
                         return
@@ -766,6 +833,8 @@ class MattermostGateway:
 
         session_id = str(session_status.get("session_id") or "")
         previous = self._reports.get(session_id)
+        if before_native is not None and self.background_pending(thread_id):
+            return {"queued": True}
         if previous and previous.get("task"):
             previous["task"].cancel()
         report = {
@@ -775,6 +844,8 @@ class MattermostGateway:
             "thread_id": thread_id,
             "channel_id": channel_id,
             "active": True,
+            "foreground_complete": False,
+            "previous": previous if previous and self.background_pending(thread_id) else None,
             "task": None,
         }
         if session_id:
@@ -790,6 +861,11 @@ class MattermostGateway:
                 if before_native is not None:
 
                     async def bind_native(actual_session):
+                        if (
+                            self.background_pending(thread_id, exclude=report)
+                            or reporter.has_pending_work()
+                        ):
+                            raise NativeDispatchChanged("Background work resumed before dispatch")
                         old_session = str(session_status.get("session_id") or "")
                         if (
                             self._reports.get(old_session) is report
@@ -801,6 +877,11 @@ class MattermostGateway:
                         return await before_native(actual_session)
 
                     turn_options["before_prompt"] = bind_native
+                    turn_options["dispatch_guard"] = lambda: (
+                        not self.background_pending(thread_id, exclude=report)
+                        and not reporter.has_pending_work()
+                        and not report.get("cancel_requested")
+                    )
                 result = await self.sessions.run_turn(thread_id, text, **turn_options)
             finally:
                 report["active"] = False
@@ -810,6 +891,12 @@ class MattermostGateway:
                         await progress_task
                     except asyncio.CancelledError:
                         pass
+        except NativeDispatchChanged:
+            actual_session = str(session_status.get("session_id") or "")
+            if self._reports.get(actual_session) is report and previous is not None:
+                self._reports.pop(actual_session, None)
+                self._reports[session_id] = previous
+            return {"queued": True}
         except AcpError as exc:
             logger.warning("ACP error thread=%s: %s", thread_id, exc)
             await _publish_status(status.render(phase="failed"), force=True)

@@ -638,3 +638,324 @@ async def test_created_discussion_readback_failure_retries_verification_without_
         assert verify.await_count == 2
     finally:
         await close_creation(store, server, client)
+
+
+async def test_cancel_during_dispatch_reservation_rejects_stale_success(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway()
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        owned = {"active": True, "collaboration_project": p["id"], "execution_id": "execution"}
+        gateway._reports["existing-native"] = owned
+        original = consumer.update
+
+        async def delayed(item, state, *args, **kwargs):
+            receipt = await original(item, state, *args, **kwargs)
+            if state == "dispatch":
+                entered.set()
+                await release.wait()
+            return receipt
+
+        consumer.update = delayed
+        reservation = asyncio.create_task(consumer.reserve(claimed, "existing-native"))
+        await entered.wait()
+        store.cancel(p["id"], "alpha")
+        control_item = store.claim_next("beta", consumer.instance)
+        cancellation = asyncio.create_task(consumer.handle_cancel(control_item))
+        for _ in range(100):
+            if owned.get("cancel_requested"):
+                break
+            await asyncio.sleep(0.001)
+        assert owned["cancel_requested"]
+        assert not cancellation.done()
+        release.set()
+        assert not await reservation
+        await asyncio.wait_for(cancellation, 3)
+        assert store.get_message(request["id"], "alpha")["state"] == "cancelled"
+        gateway.sessions.cancel.assert_not_awaited()
+    finally:
+        release.set()
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("invalidate", ["epoch", "cancel"])
+async def test_fresh_dispatch_fences_changes_during_awaited_reservation(tmp_path, invalidate):
+    broker, writer = memory_broker()
+    sessions = SessionService(broker, SimpleNamespace(), default_cwd=tmp_path)
+    sessions.ensure_session = AsyncMock(return_value="native")
+    permitted = True
+
+    async def reserve(_session):
+        nonlocal permitted
+        if invalidate == "epoch":
+            sessions._advance_native("thread")
+        else:
+            permitted = False
+        await asyncio.sleep(0)
+        return True
+
+    with pytest.raises(NativeDispatchChanged):
+        await sessions.run_turn(
+            "thread", "New work", before_prompt=reserve, dispatch_guard=lambda: permitted
+        )
+    assert writer.messages == []
+
+
+async def test_old_worker_callback_preserves_new_claim(tmp_path):
+    gateway = active_gateway()
+    consumer = CollaborationConsumer(gateway, Settings("http://127.0.0.1:18781", "x" * 32))
+    older, newer = object(), object()
+    consumer.workers[("request", "old")] = older
+    consumer.workers[("request", "new")] = newer
+    consumer.finish_worker(("request", "old"), older)
+    assert consumer.workers == {("request", "new"): newer}
+    consumer.finish_worker(("request", "new"), older)
+    assert consumer.workers[("request", "new")] is newer
+    consumer.workers.clear()
+    await consumer.close()
+
+
+async def test_drain_consumes_only_cancellation_controls(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway()
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        store.claim_next("beta", consumer.instance)
+        store.cancel(p["id"], "alpha")
+        gateway.draining = True
+        control_item = await consumer.hub.request(
+            "GET", "/mailbox?instance=" + consumer.instance + "&controls_only=1"
+        )
+        assert control_item["kind"] == "cancel"
+        await consumer.handle(control_item)
+        assert store.get_message(request["id"], "alpha")["state"] == "cancelled"
+        unrelated = project(store)
+        queued = ask(store, unrelated["id"])
+        assert store.claim_next("beta", consumer.instance, controls_only=True) is None
+        assert store.get_message(queued["id"], "alpha")["state"] == "queued"
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_origin_stop_retries_persistently_even_when_local_cancel_fails(tmp_path):
+    gateway = active_gateway()
+    gateway.config.db_path = tmp_path / "projects.db"
+    consumer = CollaborationConsumer(gateway, Settings("http://127.0.0.1:18781", "x" * 32))
+    gateway.collaboration = consumer
+    gateway.sessions.cancel.side_effect = RuntimeError("adapter unavailable")
+    consumer.hub.request = AsyncMock(side_effect=OSError("hub unavailable"))
+    try:
+        await gateway.dispatch_command(
+            thread_id="origin",
+            channel_id="home",
+            cmd="stop",
+            arg="",
+            user_id="human",
+            user_name="human",
+        )
+        assert consumer.pending_stops == {"origin"}
+        assert json.loads(consumer.stops_path.read_text()) == ["origin"]
+        assert "Project cancellation is unconfirmed" in gateway.client.posts[-1][1]
+        restarted = CollaborationConsumer(gateway, consumer.hub.settings)
+        try:
+            assert restarted.pending_stops == {"origin"}
+            restarted.hub.request = AsyncMock(return_value={"cancelled": 1})
+            await restarted.cancel_thread("origin")
+            assert restarted.pending_stops == set()
+            assert json.loads(restarted.stops_path.read_text()) == []
+        finally:
+            await restarted.close()
+    finally:
+        await consumer.close()
+
+
+async def test_reply_binding_is_refused_before_native_dispatch(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        gateway.client.get_post = AsyncMock(return_value={"channel_id": "floor", "root_id": "root"})
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(request["id"], "alpha")["state"] == "failed"
+        gateway.sessions.hint.assert_not_awaited()
+        gateway.run_prompt.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+def test_hub_origin_rejects_fragments(monkeypatch):
+    monkeypatch.setenv("MATTERMOST_COLLAB_URL", "http://127.0.0.1:18781#section")
+    with pytest.raises(ValueError):
+        Settings.load()
+
+
+async def test_early_reply_survives_inactive_report_until_receipt_is_written(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway()
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        owned = {"active": False, "foreground_complete": False, "execution_id": "execution"}
+        gateway._reports["existing-native"] = owned
+        await consumer.reserve(claimed, "existing-native")
+        store.reply(request["id"], "beta", "Explicit result", claim=claimed["claim"])
+        observer = asyncio.create_task(consumer.injected_wait(claimed))
+        await asyncio.sleep(1.1)
+        assert not observer.done()
+        gateway._last_terminal["discussion"] = {
+            "session_id": "existing-native",
+            "execution_id": "execution",
+            "model": "actual-model",
+            "answer": "Final evidence",
+            "completed_at": store.clock(),
+            "stop_reason": "end_turn",
+            "pending": False,
+        }
+        owned["foreground_complete"] = True
+        await asyncio.wait_for(observer, 2)
+        assert (
+            store.get_message(request["id"], "alpha")["evidence"]["foreground_answer"]
+            == "Final evidence"
+        )
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("readback", ["valid", "wrong_root", "wrong_body"])
+async def test_sidecar_owner_result_posts_verified_origin_without_native_session(
+    tmp_path, readback
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.collab_sidecar = True
+    consumer = CollaborationConsumer(gateway, clients["alpha"].settings)
+    posted = {}
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", "worker")
+        store.reply(request["id"], "beta", "Verified peer answer", claim=claimed["claim"])
+
+        async def create(channel, message, root_id=None):
+            posted.update(id="notification", channel_id=channel, message=message, root_id=root_id)
+            return dict(posted)
+
+        async def read(post_id):
+            if post_id == "origin":
+                return {"id": "origin", "channel_id": "home", "root_id": ""}
+            result = dict(posted)
+            if readback == "wrong_root":
+                result["root_id"] = "another-root"
+            elif readback == "wrong_body":
+                result["message"] = "truncated"
+            return result
+
+        gateway.client.create_post = AsyncMock(side_effect=create)
+        gateway.client.get_post = AsyncMock(side_effect=read)
+        delivery = store.claim_next("alpha", consumer.instance)
+        await consumer.handle(delivery)
+        settled = store.get_message(delivery["id"], "alpha")
+        assert settled["state"] == ("done" if readback == "valid" else "unconfirmed")
+        assert settled["evidence"]["result_post_id"] == "notification"
+        gateway.sessions.store.get.assert_not_awaited()
+        gateway.sessions.hint.assert_not_awaited()
+        gateway.run_prompt.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+def test_sidecar_owner_native_binding_stays_on_discussion(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta"})
+    try:
+        p = store.create_project(
+            "alpha",
+            {
+                "title": "Shared work",
+                "objective": "Test",
+                "members": ["alpha", "beta"],
+                "channel_id": "floor",
+                "thread_id": "discussion",
+                "origin_channel_id": "home",
+                "origin_thread_id": "origin",
+                "owner_in_discussion": True,
+            },
+        )
+        request = ask(store, p["id"], sender="beta", recipient="alpha")
+        claimed = store.claim_next("alpha", "sidecar")
+        assert claimed["id"] == request["id"]
+        assert claimed["binding"]["thread_id"] == "discussion"
+        assert claimed["origin_thread_id"] == "origin"
+    finally:
+        store.close()
+
+
+async def test_background_reopening_during_preparation_preserves_old_report():
+    gateway = active_gateway(busy=False)
+    pending = False
+    previous = {
+        "thread_id": "discussion",
+        "active": False,
+        "task": None,
+        "reporter": SimpleNamespace(has_pending_work=lambda: pending),
+    }
+    gateway._reports["existing-native"] = previous
+
+    async def prepare(*args, **kwargs):
+        nonlocal pending
+        pending = True
+        await asyncio.sleep(0)
+
+    gateway.sessions.ensure_session = prepare
+    gateway.sessions.status = AsyncMock(return_value={"session_id": "existing-native"})
+    gateway.sessions.run_turn = AsyncMock()
+    result = await gateway._run_prompt(
+        thread_id="discussion",
+        channel_id="floor",
+        prompt="New project request",
+        author_id="actor",
+        author_name="actor",
+        before_native=AsyncMock(),
+    )
+    assert result == {"queued": True}
+    assert gateway._reports["existing-native"] is previous
+    gateway.sessions.run_turn.assert_not_awaited()
+
+
+@pytest.mark.parametrize("mismatch", ["actor", "user", "mode"])
+async def test_sidecar_identity_mismatch_never_claims_work(tmp_path, monkeypatch, mismatch):
+    gateway = active_gateway(busy=False)
+    gateway.config.collab_sidecar = True
+    gateway.config.collab_origin_actor = "beta"
+    gateway.config.db_path = tmp_path / "project.db"
+    consumer = CollaborationConsumer(gateway, Settings("http://127.0.0.1:18781", "x" * 32))
+    identity = {"actor": "beta", "user_id": "beta-user", "sidecar": True}
+    identity[{"actor": "actor", "user": "user_id", "mode": "sidecar"}[mismatch]] = (
+        False if mismatch == "mode" else "wrong"
+    )
+    consumer.hub.request = AsyncMock(return_value=identity)
+
+    async def stop_retry(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr("mattermost_acp.collaboration.consumer.asyncio.sleep", stop_retry)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await consumer.run()
+        consumer.hub.request.assert_awaited_once_with("GET", "/identity")
+    finally:
+        await consumer.close()

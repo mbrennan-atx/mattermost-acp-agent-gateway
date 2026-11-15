@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
+import os
 import shlex
 import sys
 import uuid
@@ -25,6 +27,22 @@ class CollaborationConsumer:
         self.workers: dict[str, asyncio.Task] = {}
         self.closing = False
         self.ownership = {}
+        self.reserving = set()
+        self.cancelled_claims = set()
+        self.actor = ""
+        self.sidecar = getattr(gateway.config, "collab_sidecar", False)
+        self.stops_path = Path(
+            getattr(
+                gateway.config,
+                "db_path",
+                Path.home()
+                / ".local/state/mattermost-acp-collaboration"
+                / hashlib.sha256(settings.token.encode()).hexdigest()[:16],
+            )
+        ).with_suffix(".stops.json")
+        self.pending_stops = (
+            set(json.loads(self.stops_path.read_text())) if self.stops_path.exists() else set()
+        )
 
     def start(self):
         self.task = asyncio.create_task(self.run(), name="collaboration-mailbox")
@@ -42,23 +60,44 @@ class CollaborationConsumer:
     async def run(self):
         while not self.closing:
             try:
-                if self.gateway.draining:
+                if not self.actor:
+                    identity = await self.hub.request("GET", "/identity")
+                    if self.sidecar and (
+                        identity["actor"] != getattr(self.gateway.config, "collab_origin_actor", "")
+                        or identity.get("user_id") != self.gateway.client.user_id
+                    ):
+                        raise ValueError("Collaboration actor does not match the sidecar identity")
+                    self.actor = identity["actor"]
+                    if bool(identity.get("sidecar")) != self.sidecar:
+                        self.actor = ""
+                        raise ValueError("Hub and consumer delivery modes do not match")
+                for thread in list(self.pending_stops):
+                    await self.cancel_thread(thread)
+                if self.gateway.sealed:
                     await asyncio.sleep(0.25)
                     continue
-                item = await self.hub.request("GET", f"/mailbox?instance={self.instance}&wait=20")
+                controls = "&controls_only=1" if self.gateway.draining else ""
+                item = await self.hub.request(
+                    "GET", f"/mailbox?instance={self.instance}&wait=20" + controls
+                )
                 if item:
                     task = asyncio.create_task(
                         self.handle(item), name="collaboration-" + item["id"]
                     )
-                    self.workers[item["id"]] = task
+                    key = (item["id"], item.get("claim"))
+                    self.workers[key] = task
                     task.add_done_callback(
-                        lambda _task, mid=item["id"]: self.workers.pop(mid, None)
+                        lambda completed, key=key: self.finish_worker(key, completed)
                     )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("Collaboration mailbox unavailable; durable requests retained")
                 await asyncio.sleep(2)
+
+    def finish_worker(self, key, completed):
+        if self.workers.get(key) is completed:
+            self.workers.pop(key)
 
     async def update(self, item, state, result="", evidence=None):
         return await self.hub.request(
@@ -81,7 +120,7 @@ class CollaborationConsumer:
         return any(
             report["thread_id"] == thread
             and (report.get("active") or report["reporter"].has_pending_work())
-            for report in self.gateway._reports.values()
+            for report in self.gateway.live_reports()
         )
 
     async def heartbeat(self, item):
@@ -113,7 +152,7 @@ class CollaborationConsumer:
                     owned = self.ownership.get((item["id"], item.get("claim")))
                     if (
                         owned
-                        and owned.get("active")
+                        and not owned.get("foreground_complete", not owned.get("active"))
                         and self.gateway._reports.get(receipt.get("session_id")) is owned
                     ):
                         # A correlated reply can precede the foreground RPC.
@@ -184,7 +223,7 @@ class CollaborationConsumer:
     async def handle(self, item):
         renewal = asyncio.create_task(self.heartbeat(item))
         try:
-            if self.gateway.draining:
+            if self.gateway.sealed or (self.gateway.draining and item["kind"] != "cancel"):
                 await self.update(item, "queued")
                 return
             if item["kind"] == "cancel":
@@ -196,6 +235,13 @@ class CollaborationConsumer:
                 return
             if current["state"] != "running" or current.get("claim") != item.get("claim"):
                 return
+            if (
+                self.sidecar
+                and item["kind"] == "result"
+                and item["recipient"] == item.get("project_owner")
+            ):
+                await self.post_result(item)
+                return
             # A new claim is explicit reconciliation. Old uncertain reservations
             # must not occupy the thread indefinitely after that reconciliation.
             for key in list(self.ownership):
@@ -205,7 +251,7 @@ class CollaborationConsumer:
             thread = binding["thread_id"]
             # Verify the declared discussion/binding before creating native work.
             post = await self.gateway.client.get_post(thread)
-            if post.get("channel_id") != binding["channel_id"]:
+            if post.get("channel_id") != binding["channel_id"] or post.get("root_id"):
                 await self.update(
                     item, "failed", "Project binding does not match the thread channel"
                 )
@@ -242,6 +288,7 @@ class CollaborationConsumer:
                         guard=lambda: (
                             self.gateway._reports.get(record.session_id)
                             is self.ownership.get((item["id"], item.get("claim")))
+                            and (item["id"], item.get("claim")) not in self.cancelled_claims
                         ),
                     )
                 except NativeDispatchChanged:
@@ -357,20 +404,33 @@ class CollaborationConsumer:
         epoch = getattr(self.gateway.sessions, "native_epoch", lambda _thread: 0)(
             item["binding"]["thread_id"]
         )
-        receipt = await self.update(
-            item,
-            "dispatch",
-            evidence={
-                "session_id": session,
-                "execution_id": (report or {}).get("execution_id"),
-                "native_epoch": epoch,
-            },
-        )
-        accepted = receipt["state"] == "running" and receipt.get("claim") == item.get("claim")
-        if accepted:
-            item["native_epoch"] = epoch
-            self.ownership[(item["id"], item.get("claim"))] = report
-        return accepted
+        key = (item["id"], item.get("claim"))
+        self.reserving.add(key)
+        self.ownership[key] = report
+        try:
+            receipt = await self.update(
+                item,
+                "dispatch",
+                evidence={
+                    "session_id": session,
+                    "execution_id": (report or {}).get("execution_id"),
+                    "native_epoch": epoch,
+                },
+            )
+            accepted = (
+                receipt["state"] == "running"
+                and receipt.get("claim") == item.get("claim")
+                and key not in self.cancelled_claims
+            )
+            if accepted:
+                item["native_epoch"] = epoch
+            else:
+                self.ownership.pop(key, None)
+                if receipt["state"] == "cancelling" or key in self.cancelled_claims:
+                    await self.update(item, "cancelled", "Cancelled before native dispatch")
+            return accepted
+        finally:
+            self.reserving.discard(key)
 
     async def handle_cancel(self, item):
         for _ in range(20):
@@ -378,6 +438,14 @@ class CollaborationConsumer:
             if target["state"] != "cancelling":
                 await self.update(item, "done", "Project request has settled")
                 return
+            key = (target["id"], target.get("claim"))
+            self.cancelled_claims.add(key)
+            owned = self.ownership.get(key)
+            if owned and owned.get("collaboration_project") == target["project"]:
+                owned["cancel_requested"] = True
+            if (target["id"], target.get("claim")) in self.reserving:
+                await asyncio.sleep(1)
+                continue
             binding = target.get("binding", item["binding"])
             expected = target.get("evidence", {}).get("session_id")
             if not expected:
@@ -456,7 +524,58 @@ class CollaborationConsumer:
         await self.update(item, "queued")
 
     async def cancel_thread(self, thread):
-        return await self.hub.request("POST", "/cancel-thread", {"thread_id": thread})
+        self.pending_stops.add(thread)
+        try:
+            self.save_stops()
+        except OSError:
+            logger.warning("Project stop intent retained in memory; persistence unavailable")
+        result = await self.hub.request("POST", "/cancel-thread", {"thread_id": thread})
+        self.pending_stops.discard(thread)
+        try:
+            self.save_stops()
+        except OSError:
+            logger.warning("Confirmed project stop could not clear its durable retry")
+        return result
+
+    def save_stops(self):
+        self.stops_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = self.stops_path.with_name(self.stops_path.name + "." + self.instance)
+        with temporary.open("w") as stream:
+            temporary.chmod(0o600)
+            json.dump(sorted(self.pending_stops), stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self.stops_path)
+
+    async def post_result(self, item):
+        thread, channel = item["origin_thread_id"], item["origin_channel_id"]
+        root = await self.gateway.client.get_post(thread)
+        if root.get("channel_id") != channel or root.get("root_id"):
+            await self.update(item, "failed", "Origin is not a root in its recorded channel")
+            return
+        body = (
+            f"Project {item['project_title']}: {item['sender']} "
+            f"returned {item.get('result_state', 'done')}.\n\n"
+            + item["text"][:8000]
+            + f"\n\nRequest: `{item['parent']}`. "
+            + f"Full result and evidence: `mm-work show {item['project']}`."
+        ).replace("@", "@\u200b")
+        await self.update(
+            item, "dispatch", evidence={"delivery": "posted", "origin_thread_id": thread}
+        )
+        post = await self.gateway.client.create_post(channel, body, root_id=thread)
+        await self.update(item, "heartbeat", evidence={"result_post_id": post["id"]})
+        verified = await self.gateway.client.get_post(post["id"])
+        if (
+            verified.get("root_id") != thread
+            or verified.get("channel_id") != channel
+            or verified.get("message") != body
+        ):
+            await self.update(item, "unconfirmed", "Result notification read-back failed")
+            return
+        await self.update(
+            item, "done", item["text"], {"delivery": "posted", "result_post_id": post["id"]}
+        )
 
     async def mention(self, posted):
         try:

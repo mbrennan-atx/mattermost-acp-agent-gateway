@@ -48,6 +48,8 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
     app = web.Application()
 
     async def slash(request: web.Request) -> web.Response:
+        if getattr(config, "collab_sidecar", False):
+            raise web.HTTPNotFound()
         form = dict(await request.post())
         safe_keys = sorted(k for k in form if k != "token")
         logger.info(

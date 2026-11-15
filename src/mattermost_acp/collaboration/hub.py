@@ -33,6 +33,7 @@ def load_actors(path: Path) -> dict:
             "user_id": settings.get("user_id", ""),
             "mattermost_url": config.get("mattermost_url", ""),
             "mattermost_token_file": settings.get("mattermost_token_file", ""),
+            "sidecar": bool(settings.get("sidecar", False)),
         }
     return loaded
 
@@ -86,11 +87,14 @@ def build_app(
         actor = request["actor"]
         if request.method == "GET":
             return web.json_response(store.list_projects(actor))
-        return web.json_response(store.create_project(actor, await request.json()))
+        body = await request.json()
+        body["owner_in_discussion"] = bool(actors[actor].get("sidecar"))
+        return web.json_response(store.create_project(actor, body))
 
     async def creations(request):
         actor = request["actor"]
         body = await request.json()
+        body["owner_in_discussion"] = bool(actors[actor].get("sidecar"))
         async with creation_lock:
             intent, fresh = store.prepare_creation(actor, body)
             explicit = body.get("thread_id")
@@ -220,7 +224,9 @@ def build_app(
         deadline = asyncio.get_running_loop().time() + wait
         while True:
             changed.clear()
-            item = store.claim_next(request["actor"], instance)
+            item = store.claim_next(
+                request["actor"], instance, controls_only=request.query.get("controls_only") == "1"
+            )
             if item is not None or asyncio.get_running_loop().time() >= deadline:
                 return web.json_response(item)
             try:
@@ -314,7 +320,13 @@ def build_app(
         return web.json_response(sorted(actors))
 
     async def identity(request):
-        return web.json_response({"actor": request["actor"]})
+        return web.json_response(
+            {
+                "actor": request["actor"],
+                "user_id": actors[request["actor"]].get("user_id", ""),
+                "sidecar": bool(actors[request["actor"]].get("sidecar")),
+            }
+        )
 
     app.router.add_get("/actors", directory)
     app.router.add_get("/identity", identity)

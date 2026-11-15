@@ -43,3 +43,10 @@ SC-001 through SC-003 require that live evidence. Local tests establish implemen
 - Evidence enrichment updates the existing result delivery without duplicating it. Foreground observation continues after an injected early reply until its actual receipt is available.
 - Maintenance reports all seven activity counters and atomically seals drained idle admission. Startup recovery and delayed harness-control tasks are included.
 - Final committed-source review, hosted CI, export/install parity and live activation remain pending.
+
+## Sidecar delivery and race convergence
+
+- The next rollout adds independent project sidecars alongside legacy home gateways. It does not replace original processes or load original owner sessions. Native project bindings stay on the discussion; owner results require origin-post read-back.
+- Python 3.12.15 with locked dependencies: 429 full-suite tests pass, one optional adapter fixture skipped, 50.73 seconds; Ruff passes. 49 focused regression tests pass. New checks cover cancellation during delayed reservation, guarded fresh dispatch after epoch/cancel changes, cancellation during drain, attempt-safe worker callbacks, durable origin-stop retry after local failure, reply-root rejection, inactive early-result observation, background reopening during preparation, actor/user/mode mismatch and verified sidecar result delivery.
+- Shared cancellation for this deployment uses `mm-work cancel`; legacy home `/stop` does not gain project propagation. Original provider/CLI/connector settings are inherited, with distinct project databases and maintenance listeners.
+- All 11 supported findings from the guarded-controls review have fixes. Full-branch review of this source, final CI and live acceptance remain required.

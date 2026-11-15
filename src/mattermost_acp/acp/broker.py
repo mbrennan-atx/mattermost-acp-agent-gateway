@@ -596,6 +596,7 @@ class AcpBroker:
         text: str,
         *,
         on_update: Callable[[SessionUpdate], Awaitable[None]] | None = None,
+        guard=None,
     ) -> TurnResult:
         """Run one prompt turn; buffer answer text; invoke on_update for status.
 
@@ -634,6 +635,7 @@ class AcpBroker:
                         "prompt": [{"type": "text", "text": text}],
                     },
                     timeout=hard_max_s,
+                    **({"guard": guard} if guard is not None else {}),
                 )
             )
 

@@ -33,6 +33,7 @@ class Settings:
             or parsed.password
             or parsed.path
             or parsed.query
+            or parsed.fragment
         ):
             raise ValueError("Collaboration URL must be a plain loopback HTTP origin")
         path = os.environ.get("MATTERMOST_COLLAB_TOKEN_FILE", "")

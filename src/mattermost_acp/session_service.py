@@ -281,6 +281,7 @@ class SessionService:
         on_update: UpdateCallback | None = None,
         route: RouteRequest | None = None,
         before_prompt=None,
+        dispatch_guard=None,
     ) -> TurnResult:
         if thread_id in self._busy:
             raise RuntimeError("This thread already has a turn in progress. Use /stop.")
@@ -293,6 +294,7 @@ class SessionService:
                 session_id = await self.ensure_session(
                     thread_id, channel_id=channel_id, route=route
                 )
+                epoch = self.native_epoch(thread_id)
                 if before_prompt is not None and not await before_prompt(session_id):
                     return TurnResult(
                         session_id=session_id,
@@ -300,7 +302,22 @@ class SessionService:
                         answer_text="Cancelled before native dispatch",
                         thought_text="",
                     )
-                result = await self.broker.prompt_turn(session_id, prompt, on_update=on_update)
+                guarded = before_prompt is not None or dispatch_guard is not None
+                result = await self.broker.prompt_turn(
+                    session_id,
+                    prompt,
+                    on_update=on_update,
+                    **(
+                        {
+                            "guard": lambda: (
+                                self.native_epoch(thread_id) == epoch
+                                and (dispatch_guard is None or dispatch_guard())
+                            )
+                        }
+                        if guarded
+                        else {}
+                    ),
+                )
                 if result.model_id:
                     record = await self.store.get(thread_id)
                     cwd = record.cwd if record else str(self.default_cwd)
