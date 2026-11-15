@@ -230,6 +230,7 @@ class AcpBroker:
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._session_queues: dict[str, list[asyncio.Queue[SessionUpdate | None]]] = {}
+        self.prompt_subscriptions: set[str] = set()
         self._capabilities = AcpCapabilities()
         self.subagents = SubagentTracker()
         self.update_observer: Callable[[SessionUpdate], None] | None = None
@@ -610,6 +611,7 @@ class AcpBroker:
         async with self._turn_lock(session_id):
             q: asyncio.Queue[SessionUpdate | None] = asyncio.Queue()
             self._session_queues.setdefault(session_id, []).append(q)
+            self.prompt_subscriptions.add(session_id)
             for snapshot in self.subagents.snapshots(session_id):
                 q.put_nowait(snapshot)
 
@@ -723,6 +725,7 @@ class AcpBroker:
 
                 result = await prompt_task
             finally:
+                self.prompt_subscriptions.discard(session_id)
                 queues = self._session_queues.get(session_id, [])
                 if q in queues:
                     queues.remove(q)

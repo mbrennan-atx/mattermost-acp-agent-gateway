@@ -50,3 +50,10 @@ SC-001 through SC-003 require that live evidence. Local tests establish implemen
 - Python 3.12.15 with locked dependencies: 429 full-suite tests pass, one optional adapter fixture skipped, 50.73 seconds; Ruff passes. 49 focused regression tests pass. New checks cover cancellation during delayed reservation, guarded fresh dispatch after epoch/cancel changes, cancellation during drain, attempt-safe worker callbacks, durable origin-stop retry after local failure, reply-root rejection, inactive early-result observation, background reopening during preparation, actor/user/mode mismatch and verified sidecar result delivery.
 - Shared cancellation for this deployment uses `mm-work cancel`; legacy home `/stop` does not gain project propagation. Original provider/CLI/connector settings are inherited, with distinct project databases and maintenance listeners.
 - All 11 supported findings from the guarded-controls review have fixes. Full-branch review of this source, final CI and live acceptance remain required.
+
+## Sidecar isolation convergence
+
+- Python 3.12.15 with locked dependencies: 441 tests pass, one optional adapter fixture skipped, 51.47 seconds. Ruff passes.
+- All nine supported sidecar-source review findings are fixed. 61 focused regressions cover native cancellation for owner project work, updates before foreground subscription, uncertain ownership in maintenance, nested owner continuation, request ownership under the thread lock, discussion-only bindings with workspaces, installed CLI module invocation, offline message expiry and bounded terminal previews with durable full-output artifacts.
+- Ordinary turns retain no terminal answer cache. Project and pending-goal receipts remain while needed and are released after ownership/background work settles.
+- Full-branch review of this committed source, exact-source CI, immutable build/install parity and live acceptance remain required.

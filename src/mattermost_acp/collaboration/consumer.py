@@ -24,9 +24,10 @@ class CollaborationConsumer:
         self.hub = HubClient(settings)
         self.instance = uuid.uuid4().hex
         self.task = None
-        self.workers: dict[str, asyncio.Task] = {}
+        self.workers: dict[tuple[str, str | None], asyncio.Task] = {}
         self.closing = False
         self.ownership = {}
+        self.ownership_threads = {}
         self.reserving = set()
         self.cancelled_claims = set()
         self.actor = ""
@@ -115,13 +116,24 @@ class CollaborationConsumer:
     def active(self, thread):
         if self.gateway.sessions.is_busy(thread):
             return True
-        if any(report and report.get("thread_id") == thread for report in self.ownership.values()):
+        if self.owns_thread(thread):
             return True
         return any(
             report["thread_id"] == thread
             and (report.get("active") or report["reporter"].has_pending_work())
             for report in self.gateway.live_reports()
         )
+
+    def owns_thread(self, thread):
+        return thread in self.ownership_threads.values() or any(
+            report and report.get("thread_id") == thread for report in self.ownership.values()
+        )
+
+    def release_ownership(self, key):
+        report = self.ownership.pop(key, None)
+        thread = self.ownership_threads.pop(key, None) or (report or {}).get("thread_id")
+        if thread and not self.owns_thread(thread) and not self.gateway.background_pending(thread):
+            self.gateway._last_terminal.pop(thread, None)
 
     async def heartbeat(self, item):
         while True:
@@ -208,7 +220,7 @@ class CollaborationConsumer:
                 "then continue authorized work or report the verified outcome. This delivery "
                 "requires no acknowledgement or reply to the sender. "
             )
-        command = shlex.quote(str(Path(sys.executable).parent / "mm-work"))
+        command = shlex.quote(sys.executable) + " -m mattermost_acp.collaboration.cli"
         instructions = instructions.replace("mm-work ", command + " ")
         return (
             f"Project collaboration: {item['project_title']}\n"
@@ -239,6 +251,7 @@ class CollaborationConsumer:
                 self.sidecar
                 and item["kind"] == "result"
                 and item["recipient"] == item.get("project_owner")
+                and not item.get("depth")
             ):
                 await self.post_result(item)
                 return
@@ -246,8 +259,16 @@ class CollaborationConsumer:
             # must not occupy the thread indefinitely after that reconciliation.
             for key in list(self.ownership):
                 if key[0] == item["id"] and key[1] != item.get("claim"):
-                    self.ownership.pop(key)
+                    self.release_ownership(key)
             binding = item["binding"]
+            if self.sidecar and (
+                binding["thread_id"] != item.get("project_thread_id")
+                or binding["channel_id"] != item.get("project_channel_id")
+            ):
+                await self.update(
+                    item, "failed", "Sidecar work must stay in its project discussion"
+                )
+                return
             thread = binding["thread_id"]
             # Verify the declared discussion/binding before creating native work.
             post = await self.gateway.client.get_post(thread)
@@ -292,7 +313,7 @@ class CollaborationConsumer:
                         ),
                     )
                 except NativeDispatchChanged:
-                    self.ownership.pop((item["id"], item.get("claim")), None)
+                    self.release_ownership((item["id"], item.get("claim")))
                     await self.update(item, "queued")
                     return
                 except Exception:
@@ -318,7 +339,7 @@ class CollaborationConsumer:
             if outcome not in {None, "promptRequired"}:
                 await self.update(item, "unconfirmed", "Unknown native delivery outcome")
                 return
-            self.ownership.pop((item["id"], item.get("claim")), None)
+            self.release_ownership((item["id"], item.get("claim")))
             if self.active(thread):
                 await self.update(item, "queued")
                 return
@@ -379,11 +400,13 @@ class CollaborationConsumer:
                     try:
                         settled = await self.hub.request("GET", f"/messages/{mid}")
                         if settled["state"] in {"done", "failed", "blocked", "cancelled", "queued"}:
-                            self.ownership.pop((mid, settled.get("claim")), None)
+                            self.release_ownership((mid, settled.get("claim")))
+                            self.cancelled_claims.discard((mid, settled.get("claim")))
                     except Exception:
                         pass
 
-    def foreground(self, item, result):
+    @staticmethod
+    def foreground(item, result):
         evidence = {key: value for key, value in result.items() if key != "answer"}
         answer = result.get("answer") or "No substantive answer"
         if len(answer) > 8000:
@@ -407,6 +430,7 @@ class CollaborationConsumer:
         key = (item["id"], item.get("claim"))
         self.reserving.add(key)
         self.ownership[key] = report
+        self.ownership_threads[key] = item["binding"]["thread_id"]
         try:
             receipt = await self.update(
                 item,
@@ -425,7 +449,7 @@ class CollaborationConsumer:
             if accepted:
                 item["native_epoch"] = epoch
             else:
-                self.ownership.pop(key, None)
+                self.release_ownership(key)
                 if receipt["state"] == "cancelling" or key in self.cancelled_claims:
                     await self.update(item, "cancelled", "Cancelled before native dispatch")
             return accepted

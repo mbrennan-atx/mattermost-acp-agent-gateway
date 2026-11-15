@@ -245,6 +245,10 @@ class MattermostGateway:
             previous["reporter"].observe(update)
             previous = previous.get("previous")
         if report["active"]:
+            if update.session_id not in getattr(
+                self.sessions.broker, "prompt_subscriptions", set()
+            ):
+                report["reporter"].observe(update)
             return
         report["reporter"].observe(update)
         receipt = self._last_terminal.get(report["thread_id"])
@@ -257,6 +261,10 @@ class MattermostGateway:
             receipt["pending"] = report["reporter"].has_pending_work()
             if was_pending and not receipt["pending"]:
                 receipt["completed_at"] = time.time()
+                if self.collaboration is None or not self.collaboration.owns_thread(
+                    report["thread_id"]
+                ):
+                    self._last_terminal.pop(report["thread_id"], None)
         if report.get("suppressed"):
             return
         if report.get("task") is None or report["task"].done():
@@ -627,6 +635,12 @@ class MattermostGateway:
         async with lock:
             if self.draining and kwargs.get("before_native") is not None:
                 return {"queued": True}
+            if (
+                kwargs.get("before_native") is not None
+                and self.collaboration is not None
+                and self.collaboration.owns_thread(thread_id)
+            ):
+                return {"queued": True}
             try:
                 return await self._run_prompt(thread_id=thread_id, **kwargs)
             finally:
@@ -667,6 +681,7 @@ class MattermostGateway:
             "collaboration": (
                 len(self.collaboration.workers)
                 + len(getattr(self.collaboration, "pending_stops", ()))
+                + len(getattr(self.collaboration, "ownership", ()))
             )
             if self.collaboration
             else 0,
@@ -941,7 +956,21 @@ class MattermostGateway:
             "pending": reporter.has_pending_work(),
             "completed_at": time.time(),
         }
-        self._last_terminal[thread_id] = receipt
+        if (
+            reporter.has_pending_work()
+            or before_native is not None
+            or (self.collaboration is not None and self.collaboration.owns_thread(thread_id))
+        ):
+            # Keep a bounded preview and durable full output while ownership is unresolved.
+            if len(public_answer) > 8000:
+                from mattermost_acp.collaboration.consumer import CollaborationConsumer
+
+                evidence = CollaborationConsumer.foreground(
+                    {"id": report["execution_id"], "claim": "terminal"}, receipt
+                )
+                receipt["result_file"] = evidence["result_file"]
+                receipt["answer"] = public_answer[:8000]
+            self._last_terminal[thread_id] = receipt
 
         if self.config.show_thoughts and result.thought_text:
             answer = f"_{result.thought_text.strip()}_\n\n{answer}".strip()

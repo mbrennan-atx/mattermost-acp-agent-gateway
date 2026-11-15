@@ -224,6 +224,14 @@ class CollaborationStore:
         return item
 
     def check_binding(self, project, actor, binding):
+        if (
+            actor in getattr(self, "sidecar_actors", set())
+            or (actor == project["owner"] and project.get("owner_in_discussion"))
+        ) and (
+            binding["thread_id"] != project["thread_id"]
+            or binding["channel_id"] != project["channel_id"]
+        ):
+            raise ValueError("Sidecar bindings must stay in the project discussion")
         for other in self.list_projects(actor):
             if other["id"] == project["id"] or other["status"] == "cancelled":
                 continue
@@ -493,6 +501,8 @@ class CollaborationStore:
                     "project_title": project["title"],
                     "objective": project["objective"],
                     "project_owner": project["owner"],
+                    "project_thread_id": project["thread_id"],
+                    "project_channel_id": project["channel_id"],
                     "origin_thread_id": project["origin_thread_id"],
                     "origin_channel_id": project["origin_channel_id"],
                 }
@@ -685,7 +695,13 @@ class CollaborationStore:
                     continue
                 if item["state"] in {"queued", "open"} or (
                     item["state"] not in TERMINAL
-                    and (item["kind"] == "result" or item["recipient"] == project["owner"])
+                    and (
+                        item["kind"] == "result"
+                        or (
+                            item["recipient"] == project["owner"]
+                            and not project.get("owner_in_discussion")
+                        )
+                    )
                 ):
                     # Stop routing into the owner's conversation without stopping
                     # its existing work. Origin /stop separately cancels that turn.

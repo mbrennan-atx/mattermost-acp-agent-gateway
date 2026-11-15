@@ -48,6 +48,7 @@ def build_app(
     verify_creation=None,
 ) -> web.Application:
     changed = asyncio.Event()
+    store.sidecar_actors = {name for name, settings in actors.items() if settings.get("sidecar")}
     creation_lock = asyncio.Lock()
 
     @web.middleware
@@ -236,6 +237,7 @@ def build_app(
                 pass
 
     async def message(request):
+        store.expire()
         return web.json_response(store.get_message(request.match_info["mid"], request["actor"]))
 
     async def cancel_thread(request):
