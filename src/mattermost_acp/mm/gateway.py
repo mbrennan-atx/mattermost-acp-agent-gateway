@@ -700,7 +700,8 @@ class MattermostGateway:
                     break
                 seen.add(id(previous))
                 if (
-                    previous.get("active") or previous["reporter"].has_pending_work()
+                    previous.get("active")
+                    or previous["reporter"].has_pending_work()
                     or id(previous) in owned
                 ):
                     current = previous
@@ -835,6 +836,16 @@ class MattermostGateway:
                     raise ValueError("Existing native session uses a different workspace")
                 options["cwd"] = Path(workspace)
             await self.sessions.ensure_session(thread_id, **options)
+        except NativeDispatchChanged:
+            logger.warning("Workspace verification refused native preparation")
+            if before_native is not None:
+                return {"queued": True, "native_dispatched": False}
+            await self._post(
+                channel_id,
+                "Workspace verification failed. Resolve the settings before retrying.",
+                root_id=thread_id,
+            )
+            return None
         except Exception:
             if workspace:
                 logger.warning("Project workspace preparation failed; no native work started")

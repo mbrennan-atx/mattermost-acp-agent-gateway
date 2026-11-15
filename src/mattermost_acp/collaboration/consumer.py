@@ -216,7 +216,7 @@ class CollaborationConsumer:
             self.gateway._last_terminal.pop(thread, None)
 
     async def reconcile_ownership(self):
-        for key, report in list(self.ownership.items()):
+        for key in list(self.ownership):
             if key in self.workers or key in self.reserving:
                 continue
             state = await self.hub.request("GET", "/messages/" + key[0])
@@ -224,40 +224,61 @@ class CollaborationConsumer:
                 continue
             if state["state"] not in {"done", "failed", "blocked", "cancelled"}:
                 continue
-            thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
-            terminal = self.gateway._last_terminal.get(thread)
-            evidence = state.get("evidence", {})
-            cancelled_retry = (
-                state["state"] == "cancelled"
-                and state.get("instance") is None
-                and bool(state.get("reconciliation"))
-            )
-            if cancelled_retry and report is not None and terminal:
-                evidence = next(
-                    (
-                        prior
-                        for prior in reversed(state.get("delivery_history", []))
-                        if prior.get("execution_id") == report.get("execution_id")
-                        and prior.get("session_id") == terminal.get("session_id")
-                    ),
-                    evidence,
-                )
-            if (
+            await self.settle_ownership(key, state)
+
+    def ownership_pending(self, key, terminal=None):
+        report = self.ownership.get(key)
+        thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
+        reporter = (report or {}).get("reporter")
+        return bool(
+            (terminal or {}).get("pending")
+            or (
                 report is not None
-                and report.get("foreground_complete")
-                and not report.get("active")
-                and not self.gateway.sessions.is_busy(thread)
-                and not report["reporter"].has_pending_work()
-                and terminal
-                and terminal.get("session_id") == evidence.get("session_id")
-                and terminal.get("execution_id") == evidence.get("execution_id")
-                and terminal.get("completed_at", float("-inf"))
-                >= evidence.get("dispatch_started", float("inf"))
-                and not terminal.get("pending")
-                and terminal.get("native_dispatched", True)
-            ):
-                if not cancelled_retry:
-                    await self.update(state, "evidence", evidence=self.foreground(state, terminal))
+                and (
+                    report.get("active")
+                    or not report.get("foreground_complete", not report.get("active"))
+                    or (reporter is not None and reporter.has_pending_work())
+                    or self.gateway.sessions.is_busy(thread)
+                )
+            )
+        )
+
+    async def settle_ownership(self, key, state):
+        report = self.ownership.get(key)
+        if state.get("claim") != key[1] or key in self.reserving:
+            return
+        thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
+        terminal = self.gateway._last_terminal.get(thread)
+        evidence = state.get("evidence", {})
+        cancelled_retry = (
+            state["state"] == "cancelled"
+            and state.get("instance") is None
+            and bool(state.get("reconciliation"))
+        )
+        if cancelled_retry and report is not None and terminal:
+            evidence = next(
+                (
+                    prior
+                    for prior in reversed(state.get("delivery_history", []))
+                    if prior.get("execution_id") == report.get("execution_id")
+                    and prior.get("session_id") == terminal.get("session_id")
+                ),
+                evidence,
+            )
+        if (
+            report is not None
+            and report.get("foreground_complete")
+            and not self.ownership_pending(key, terminal)
+            and terminal
+            and terminal.get("session_id") == evidence.get("session_id")
+            and terminal.get("execution_id") == evidence.get("execution_id")
+            and terminal.get("completed_at", float("-inf"))
+            >= evidence.get("dispatch_started", float("inf"))
+            and terminal.get("native_dispatched", True)
+        ):
+            if not cancelled_retry:
+                await self.update(state, "evidence", evidence=self.foreground(state, terminal))
+            if self.ownership.get(key) is report and key not in self.reserving:
                 self.release_ownership(key)
 
     async def continuation(self, item):
@@ -394,9 +415,14 @@ class CollaborationConsumer:
         while True:
             await asyncio.sleep(1)
             state = await self.hub.request("GET", f"/messages/{item['id']}")
+            key = (item["id"], item.get("claim"))
+            if state.get("claim") != key[1]:
+                return
             terminal = self.gateway._last_terminal.get(item["binding"]["thread_id"])
             receipt = state.get("evidence", {})
             if state["state"] not in {"running", "cancelling"}:
+                if self.ownership_pending(key, terminal):
+                    continue
                 if (
                     state["state"] in {"done", "failed", "blocked", "cancelled"}
                     and terminal
@@ -631,6 +657,8 @@ class CollaborationConsumer:
             if current["state"] in {"done", "failed", "blocked", "cancelled"}:
                 if result and not result.get("queued"):
                     await self.update(item, "evidence", evidence=self.foreground(item, result))
+                    if self.ownership_pending((item["id"], item.get("claim")), result):
+                        await self.injected_wait(item)
                 return
             if result is None:
                 await self.update(item, "interrupted", "No confirmed native terminal receipt")
@@ -668,13 +696,22 @@ class CollaborationConsumer:
         finally:
             renewal.cancel()
             await asyncio.gather(renewal, return_exceptions=True)
-            for mid in [item["id"], item.get("parent") if item["kind"] == "cancel" else None]:
+            cleanup = [(item["id"], item.get("claim"))]
+            if item["kind"] == "cancel" and "parent_claim" in item:
+                cleanup.append((item["parent"], item["parent_claim"]))
+            for mid, claim in cleanup:
                 if mid:
                     try:
                         settled = await self.hub.request("GET", f"/messages/{mid}")
-                        if settled["state"] in {"done", "failed", "blocked", "cancelled", "queued"}:
-                            self.release_ownership((mid, settled.get("claim")))
-                            self.cancelled_claims.discard((mid, settled.get("claim")))
+                        if settled.get("claim") != claim:
+                            continue
+                        key = (mid, claim)
+                        if settled["state"] == "queued":
+                            self.release_ownership(key)
+                        elif settled["state"] in {"done", "failed", "blocked", "cancelled"}:
+                            await self.settle_ownership(key, settled)
+                        if key not in self.ownership:
+                            self.cancelled_claims.discard(key)
                     except Exception:
                         pass
 
@@ -732,6 +769,10 @@ class CollaborationConsumer:
     async def handle_cancel(self, item):
         for _ in range(20):
             target = await self.hub.request("GET", f"/messages/{item['parent']}")
+            item.setdefault("parent_claim", target.get("claim"))
+            if target.get("claim") != item["parent_claim"]:
+                await self.update(item, "done", "Cancellation target claim changed")
+                return
             if target["state"] != "cancelling":
                 await self.update(item, "done", "Project request has settled")
                 return
@@ -910,10 +951,8 @@ class CollaborationConsumer:
                     },
                 )
             )
-        except HubError as exc:
-            if str(exc).startswith("Collaboration HTTP 409:"):
-                # A registered project's rejected request must not bypass its
-                # limits by falling through to an ordinary addressed wake.
-                logger.warning("Project mention rejected; ordinary wake suppressed")
-                return True
-            return False
+        except HubError:
+            # Only a successful unregistered-discussion response permits normal
+            # wake fallback. Rejection or uncertainty cannot authorize new work.
+            logger.warning("Project mention could not be admitted; ordinary wake suppressed")
+            return True

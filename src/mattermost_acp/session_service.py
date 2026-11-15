@@ -129,9 +129,11 @@ class SessionService:
         inject_channel_context: bool = True,
         busy_marker: Path | None = None,
         router: ModelRouter | None = None,
+        workspace_guard: Callable[[str, Path, str | None], Awaitable[None]] | None = None,
     ) -> None:
         self.broker = broker
         self.router = router
+        self.workspace_guard = workspace_guard
         self.busy_marker = busy_marker
         self.store = store
         self.default_cwd = default_cwd
@@ -189,10 +191,18 @@ class SessionService:
         channel_id: str | None = None,
         route: RouteRequest | None = None,
     ) -> str:
-        await self.broker.start()
         record = await self.store.get(thread_id)
         work_cwd = Path(record.cwd) if record else (cwd or self.default_cwd)
         work_cwd = work_cwd.expanduser().resolve()
+
+        if self.workspace_guard is not None:
+            prior_session = (
+                record.session_id
+                if record is not None and record.harness in {None, self.store.harness}
+                else None
+            )
+            await self.workspace_guard(thread_id, work_cwd, prior_session)
+        await self.broker.start()
 
         if record is not None and record.harness not in {None, self.store.harness}:
             logger.info(
@@ -483,11 +493,14 @@ class SessionService:
         channel_id: str | None = None,
     ) -> str:
         """Close current ACP session (if any) and start fresh."""
-        self._advance_native(thread_id)
-        await self.broker.start()
         record = await self.store.get(thread_id)
         work_cwd = Path(record.cwd) if record else (cwd or self.default_cwd)
         work_cwd = work_cwd.expanduser().resolve()
+
+        if self.workspace_guard is not None:
+            await self.workspace_guard(thread_id, work_cwd, record.session_id if record else None)
+        self._advance_native(thread_id)
+        await self.broker.start()
 
         if record is not None:
             try:

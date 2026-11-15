@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from logging.handlers import RotatingFileHandler
 
 from mattermost_acp.acp import AcpBroker
+from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.config import Config
 from mattermost_acp.harness_switch import busy_path
 from mattermost_acp.mm.client import MattermostClient
@@ -32,6 +34,45 @@ def _setup_logging(log_file) -> None:
         fh = RotatingFileHandler(log_file, maxBytes=10_000_000, backupCount=5)
         fh.setFormatter(fmt)
         root.addHandler(fh)
+
+
+def build_workspace_guard(command, *, timeout_s=15):
+    """Run an optional trusted executable before native session admission."""
+    if not command:
+        return None
+
+    async def verify(thread_id, cwd, prior_session):
+        process = None
+        try:
+            async with asyncio.timeout(timeout_s):
+                process = await asyncio.create_subprocess_exec(
+                    command,
+                    thread_id,
+                    str(cwd),
+                    prior_session or "",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=os.name == "posix",
+                )
+                if await process.wait():
+                    raise NativeDispatchChanged("Workspace verification refused native preparation")
+        except BaseException as exc:
+            if process is not None and process.returncode is None:
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise NativeDispatchChanged(
+                "Workspace verification refused native preparation"
+            ) from exc
+
+    return verify
 
 
 async def _amain() -> None:
@@ -59,6 +100,7 @@ async def _amain() -> None:
         inject_channel_context=config.inject_channel_context,
         busy_marker=busy_path(config.db_path),
         router=load_router_from_env(),
+        workspace_guard=build_workspace_guard(config.workspace_guard_command),
     )
 
     client = MattermostClient(config.mattermost_url, config.mattermost_token)

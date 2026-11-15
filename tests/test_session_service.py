@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
@@ -13,6 +15,7 @@ from fake_agent import spawn_fake_agent_process
 
 from mattermost_acp.acp.broker import AcpBroker, AcpError, NativeDispatchChanged
 from mattermost_acp.commands.models_catalog import ModelCatalog, ModelInfo
+from mattermost_acp.main import build_workspace_guard
 from mattermost_acp.session_service import SessionService, discover_session_model
 from mattermost_acp.store import ThreadStore
 
@@ -46,10 +49,12 @@ async def test_compaction_fences_previous_project_cancellation(service):
     old_epoch = service.native_epoch("compact-thread")
     entered, release = asyncio.Event(), asyncio.Event()
     original_prompt = service.broker.prompt_turn
+
     async def compact(session, prompt):
         entered.set()
         await release.wait()
         return await original_prompt(session, prompt)
+
     service.broker.prompt_turn = compact
     task = asyncio.create_task(service._compact_history("compact-thread", sid))
     try:
@@ -64,6 +69,115 @@ async def test_compaction_fences_previous_project_cancellation(service):
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_workspace_guard_precedes_native_start_and_resume(service):
+    events = []
+    start = service.broker.start
+
+    async def tracked_start():
+        events.append("start")
+        await start()
+
+    async def guard(thread, cwd, prior):
+        events.append((thread, cwd, prior))
+
+    service.broker.start = tracked_start
+    service.workspace_guard = guard
+    sid = await service.ensure_session("guarded")
+    assert events[0] == ("guarded", service.default_cwd.resolve(), None)
+    events.clear()
+    assert await service.ensure_session("guarded") == sid
+    assert events[0] == ("guarded", service.default_cwd.resolve(), sid)
+    assert events[1] == "start"
+
+
+@pytest.mark.parametrize("operation", ["create", "resume", "replace"])
+async def test_workspace_refusal_preserves_native_and_stored_session(service, operation):
+    if operation != "create":
+        await service.ensure_session("guarded")
+    record = await service.store.get("guarded")
+    epoch = service.native_epoch("guarded")
+
+    async def refuse(*args):
+        raise NativeDispatchChanged("Workspace settings changed")
+
+    service.workspace_guard = refuse
+    names = ["start", "session_new", "session_load", "session_resume", "session_close", "cancel"]
+    with ExitStack() as stack:
+        methods = [
+            stack.enter_context(patch.object(service.broker, name, new_callable=AsyncMock))
+            for name in names
+        ]
+        with pytest.raises(NativeDispatchChanged):
+            if operation == "replace":
+                await service.new_session("guarded")
+            else:
+                await service.ensure_session("guarded")
+        for method in methods:
+            method.assert_not_awaited()
+    assert await service.store.get("guarded") == record
+    assert service.native_epoch("guarded") == epoch
+
+
+def guard_program(tmp_path, body):
+    script = tmp_path / "guard with spaces"
+    script.write_text(f"#!{sys.executable}\n" + body)
+    script.chmod(0o700)
+    return str(script)
+
+
+async def test_workspace_executable_receives_literal_arguments_without_a_shell(tmp_path):
+    output = tmp_path / "arguments.json"
+    marker = tmp_path / "unexpected"
+    command = guard_program(
+        tmp_path,
+        "import json,sys\nfrom pathlib import Path\n"
+        f"Path({str(output)!r}).write_text(json.dumps(sys.argv[1:]))\n",
+    )
+    guard = build_workspace_guard(command)
+    cwd = tmp_path / ("workspace $(touch " + str(marker) + ")")
+    await guard("thread-$VALUE", cwd, None)
+    assert json.loads(output.read_text()) == ["thread-$VALUE", str(cwd), ""]
+    assert not marker.exists()
+    await guard("thread-$VALUE", cwd, "previous-native-session")
+    assert json.loads(output.read_text())[-1] == "previous-native-session"
+    assert build_workspace_guard(None) is None
+
+
+async def test_failed_workspace_executable_returns_only_a_safe_refusal(tmp_path):
+    command = guard_program(tmp_path, "import sys\nprint('untrusted output')\nsys.exit(4)\n")
+    with pytest.raises(NativeDispatchChanged, match="Workspace verification refused"):
+        await build_workspace_guard(command)("thread", tmp_path, None)
+
+
+@pytest.mark.parametrize("finish", ["timeout", "cancel"])
+async def test_interrupted_workspace_guard_stops_its_owned_process_group(tmp_path, finish):
+    pid_file = tmp_path / "child.pid"
+    body = (
+        "import subprocess,sys,time\nfrom pathlib import Path\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])\n"
+        f"Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        "time.sleep(30)\n"
+    )
+    guard = build_workspace_guard(
+        guard_program(tmp_path, body), timeout_s=0.3 if finish == "timeout" else 5
+    )
+    task = asyncio.create_task(guard("thread", tmp_path, None))
+    async with asyncio.timeout(2):
+        while not pid_file.exists():
+            await asyncio.sleep(0.005)
+    pid = int(pid_file.read_text())
+    if finish == "cancel":
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError if finish == "cancel" else NativeDispatchChanged):
+        await task
+    async with asyncio.timeout(2):
+        while True:
+            state = Path(f"/proc/{pid}/stat")
+            if not state.exists() or state.read_text().split()[2] == "Z":
+                break
+            await asyncio.sleep(0.005)
 
 
 @pytest.mark.asyncio
@@ -86,9 +200,7 @@ async def test_ensure_session_pins_configured_default(tmp_path: Path) -> None:
     broker = AcpBroker(process_factory=spawn_fake_agent_process)
     store = ThreadStore(tmp_path / "t.db")
     await store.open()
-    svc = SessionService(
-        broker, store, default_cwd=tmp_path, default_model="grok-4.6"
-    )
+    svc = SessionService(broker, store, default_cwd=tmp_path, default_model="grok-4.6")
     try:
         await svc.ensure_session("1")
         record = await store.get("1")
@@ -106,9 +218,7 @@ async def test_ensure_session_pins_catalog_default_when_unconfigured(
     broker = AcpBroker(process_factory=spawn_fake_agent_process)
     store = ThreadStore(tmp_path / "t.db")
     await store.open()
-    svc = SessionService(
-        broker, store, default_cwd=tmp_path, grok_command="grok"
-    )
+    svc = SessionService(broker, store, default_cwd=tmp_path, grok_command="grok")
     catalog = ModelCatalog(
         default_id="grok-4.6",
         models=[ModelInfo(id="grok-4.6", is_default=True)],
@@ -161,9 +271,7 @@ async def test_resume_discovers_live_model_when_store_blank(
     store = ThreadStore(tmp_path / "t.db")
     await store.open()
     grok_home = tmp_path / "grok-home"
-    svc = SessionService(
-        broker, store, default_cwd=cwd, grok_home=grok_home
-    )
+    svc = SessionService(broker, store, default_cwd=cwd, grok_home=grok_home)
     try:
         sid = await svc.ensure_session("3", cwd=cwd)
         record = await store.get("3")
@@ -227,7 +335,8 @@ async def test_scope_change_switches_current_thread_and_sets_default(
     service: SessionService,
 ) -> None:
     await service.ensure_session("70", channel_id="800")
-    await service.switch_model("70",
+    await service.switch_model(
+        "70",
         "hub-claude-opus-5",
         scope="channel",
         channel_id="800",
@@ -248,13 +357,15 @@ async def test_thread_override_wins_when_setting_channel_default(
     service: SessionService,
 ) -> None:
     await service.ensure_session("80", channel_id="900")
-    await service.switch_model("80",
+    await service.switch_model(
+        "80",
         "hub-claude-opus-5",
         effort="high",
         scope="thread",
         channel_id="900",
     )
-    result = await service.switch_model("80",
+    result = await service.switch_model(
+        "80",
         "hub-gpt-5.6-sol",
         effort="low",
         scope="channel",
@@ -285,9 +396,7 @@ def test_discover_session_model_reads_summary(tmp_path: Path) -> None:
     (dest / "summary.json").write_text(
         json.dumps({"current_model_id": "gpt-5.6-sol"}), encoding="utf-8"
     )
-    assert (
-        discover_session_model(sid, cwd, grok_home=tmp_path) == "gpt-5.6-sol"
-    )
+    assert discover_session_model(sid, cwd, grok_home=tmp_path) == "gpt-5.6-sol"
     assert discover_session_model("missing", cwd, grok_home=tmp_path) is None
 
 

@@ -645,6 +645,7 @@ async def test_injected_explicit_reply_waits_for_its_foreground_evidence(tmp_pat
                         "pending": False,
                     }
                     owned["active"] = False
+                    gateway.sessions.is_busy = lambda _thread: False
             return await original_request(*args, **kwargs)
 
         consumer.hub.request = receipt
@@ -1125,6 +1126,7 @@ async def test_early_reply_survives_inactive_report_until_receipt_is_written(tmp
             "pending": False,
         }
         owned["foreground_complete"] = True
+        gateway.sessions.is_busy = lambda _thread: False
         await asyncio.wait_for(observer, 2)
         assert (
             store.get_message(request["id"], "alpha")["evidence"]["foreground_answer"]

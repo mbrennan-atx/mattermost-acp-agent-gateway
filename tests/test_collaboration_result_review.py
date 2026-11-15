@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from test_collaboration import active_gateway, api_fixture, ask, close_api, project
 from test_collaboration_continuation_review import child_result, retained_parent
-from test_collaboration_dispatch_review import close_reports, native_gateway
+from test_collaboration_dispatch_review import close_reports, idle_report, native_gateway
 from test_collaboration_regressions import (
     maintenance_client,
     maintenance_gateway,
@@ -25,6 +25,215 @@ from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.session_service import SessionService
+
+
+@pytest.mark.parametrize("delivery", ["foreground", "injected"])
+@pytest.mark.parametrize("background", ["tool", "worker"])
+async def test_early_reply_keeps_native_owner_until_background_finishes(
+    tmp_path, delivery, background
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, _writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.get = AsyncMock(
+        return_value=SimpleNamespace(session_id="existing-native")
+    )
+    broker.capabilities.steering = delivery == "injected"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    handling = None
+    observed_terminal = asyncio.Event()
+    actual_request = consumer.hub.request
+
+    def update(completed=False):
+        if background == "worker":
+            return SessionUpdate(
+                "existing-native",
+                "subagent_activity",
+                raw={"worker_id": "child", "state": "completed" if completed else "running"},
+            )
+        return SessionUpdate(
+            "existing-native",
+            "tool_call_update" if completed else "tool_call",
+            tool_call_id="background-tool",
+            tool_status="completed" if completed else "in_progress",
+        )
+
+    async def observe(method, path, body=None):
+        result = await actual_request(method, path, body)
+        if method == "GET" and path == "/messages/" + claimed["id"] and result["state"] == "done":
+            observed_terminal.set()
+        return result
+
+    consumer.hub.request = observe
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+
+        async def native(_thread, _prompt, **options):
+            assert await options["before_prompt"]("existing-native")
+            await options["on_update"](update())
+            store.reply(request["id"], "beta", "Explicit early result", claim=claimed["claim"])
+            return TurnResult("existing-native", "end_turn", "Completed authorized work", "")
+
+        async def inject(_thread, _prompt, **_options):
+            gateway._observe_background_update(update())
+            gateway._last_terminal["discussion"] = {
+                "session_id": "existing-native",
+                "execution_id": owned["execution_id"],
+                "answer": "Completed authorized work",
+                "stop_reason": "end_turn",
+                "pending": True,
+                "native_dispatched": True,
+                "completed_at": store.clock(),
+            }
+            return "injected"
+
+        gateway.sessions.run_turn = AsyncMock(side_effect=native)
+        if delivery == "injected":
+            owned = idle_report()
+            owned["collaboration_project"] = p["id"]
+            gateway._reports["existing-native"] = owned
+            gateway.sessions.hint = AsyncMock(side_effect=inject)
+        handling = asyncio.create_task(consumer.handle(claimed))
+        if delivery == "injected":
+            async with asyncio.timeout(2):
+                while (
+                    store.get_message(request["id"], "beta")["evidence"].get("delivery")
+                    != "injected"
+                ):
+                    await asyncio.sleep(0)
+            store.reply(request["id"], "beta", "Explicit early result", claim=claimed["claim"])
+        await asyncio.wait_for(observed_terminal.wait(), 2)
+        assert not handling.done() and consumer.owns_thread("discussion")
+        assert consumer.ownership[(request["id"], claimed["claim"])]["reporter"].has_pending_work()
+        await gateway.run_prompt(
+            thread_id="discussion", channel_id="floor", prompt="User follow-up"
+        )
+        assert gateway.sessions.run_turn.await_count == (1 if delivery == "foreground" else 0)
+        gateway._observe_background_update(update(completed=True))
+        await asyncio.wait_for(handling, 3)
+        assert not consumer.owns_thread("discussion")
+        settled = store.get_message(request["id"], "beta")
+        assert settled["result"] == "Explicit early result"
+        assert settled["evidence"]["foreground_answer"] == "Completed authorized work"
+        assert not settled["evidence"]["pending"]
+    finally:
+        if handling and not handling.done():
+            handling.cancel()
+            await asyncio.gather(handling, return_exceptions=True)
+        await consumer.close()
+        await close_reports(gateway)
+        await close_api(store, server, clients)
+
+
+async def test_old_worker_cleanup_preserves_new_claim_owner_and_cancellation_fence(tmp_path):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, _p, parent, old):
+        entered, release = asyncio.Event(), asyncio.Event()
+        actual_request = consumer.hub.request
+        delayed = False
+
+        async def delayed_read(method, path, body=None):
+            nonlocal delayed
+            if method == "GET" and path == "/messages/" + parent["id"] and not delayed:
+                delayed = True
+                entered.set()
+                await release.wait()
+            return await actual_request(method, path, body)
+
+        consumer.hub.request = delayed_read
+        handling = asyncio.create_task(consumer.handle(dict(parent)))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            store.update(
+                parent["id"], "beta", consumer.instance, "unconfirmed", "Old delivery lost"
+            )
+            store.retry(parent["id"], "beta", "Old execution reconciled")
+            fresh = store.claim_next("beta", consumer.instance)
+            assert fresh["claim"] != parent["claim"]
+            consumer.release_ownership((parent["id"], parent["claim"]))
+            current = idle_report()
+            current.update(
+                execution_id="new-execution",
+                collaboration_project=old["collaboration_project"],
+                active=True,
+                foreground_complete=False,
+            )
+            current["reporter"].active_tools.add("pending-new-work")
+            gateway._reports["existing-native"] = current
+            assert await consumer.reserve(fresh, "existing-native")
+            store.reply(fresh["id"], "beta", "New early result", claim=fresh["claim"])
+            key = (fresh["id"], fresh["claim"])
+            consumer.cancelled_claims.add(key)
+            release.set()
+            await asyncio.wait_for(handling, 3)
+            assert consumer.ownership[key] is current
+            assert key in consumer.cancelled_claims and consumer.owns_thread("discussion")
+            assert current["reporter"].has_pending_work()
+            gateway.run_prompt.assert_not_awaited()
+        finally:
+            release.set()
+            if not handling.done():
+                handling.cancel()
+                await asyncio.gather(handling, return_exceptions=True)
+
+
+@pytest.mark.parametrize("reused", [False, True])
+async def test_duplicate_floor_ask_after_cancellation_cannot_wake_new_native_work(tmp_path, reused):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.allow_user_ids = frozenset({"alpha-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    posted = PostedEvent(
+        post_id="post-1",
+        channel_id="floor",
+        user_id="alpha-user",
+        message="@beta ASK: Verify the dependency",
+        root_id="discussion",
+    )
+    body = {
+        "post_id": posted.post_id,
+        "author_id": posted.user_id,
+        "channel_id": posted.channel_id,
+        "thread_id": posted.root_id,
+        "text": posted.message,
+    }
+    try:
+        p = project(store)
+        admitted = await clients["beta"].request("POST", "/mentions", body)
+        store.cancel(p["id"], "alpha")
+        if reused:
+            store.create_project(
+                "alpha",
+                {
+                    "title": "Next project",
+                    "objective": "Use the same discussion",
+                    "members": ["alpha", "beta", "gamma"],
+                    "channel_id": "floor",
+                    "thread_id": "discussion",
+                    "origin_channel_id": "home",
+                    "origin_thread_id": "origin",
+                },
+            )
+        duplicate = await clients["beta"].request("POST", "/mentions", body)
+        assert duplicate["id"] == admitted["id"] and duplicate["state"] == "cancelled"
+        await gateway.handle_posted(posted)
+        gateway.run_prompt.assert_not_awaited()
+        all_messages = [
+            m
+            for item in store.list_projects("alpha")
+            for m in store.show(item["id"], "alpha")["messages"]
+        ]
+        assert len(all_messages) == 1 and all_messages[0]["id"] == admitted["id"]
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
 
 
 @pytest.mark.parametrize("missing", [None, "completed_at", "dispatch_started"])
@@ -64,7 +273,7 @@ async def test_late_reply_cannot_reconcile_with_receipt_before_new_injection(tmp
         assert final["evidence"]["foreground_answer"] == "Output after the new injection"
 
 
-@pytest.mark.parametrize("limit", ["dispatch", "depth"])
+@pytest.mark.parametrize("limit", ["dispatch", "depth", "membership"])
 async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wake(tmp_path, limit):
     store, server, clients = await api_fixture(tmp_path)
     gateway = active_gateway(busy=False)
@@ -76,10 +285,24 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
     consumer = CollaborationConsumer(gateway, clients["beta"].settings)
     gateway.collaboration = consumer
     try:
-        p = project(store, **({"max_turns": 1} if limit == "dispatch" else {"max_depth": 1}))
+        if limit == "membership":
+            p = store.create_project(
+                "alpha",
+                {
+                    "title": "Restricted participants",
+                    "objective": "Verify project admission",
+                    "members": ["alpha", "gamma"],
+                    "channel_id": "floor",
+                    "thread_id": "discussion",
+                    "origin_channel_id": "home",
+                    "origin_thread_id": "origin",
+                },
+            )
+        else:
+            p = project(store, **({"max_turns": 1} if limit == "dispatch" else {"max_depth": 1}))
         if limit == "dispatch":
             ask(store, p["id"])
-        else:
+        elif limit == "depth":
             ask(store, p["id"])
             store.claim_next("beta", "peer-parent-worker")
             ask(store, p["id"], sender="beta", recipient="alpha")
@@ -91,7 +314,7 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
             message="@beta ASK: Verify the dependency",
             root_id="discussion",
         )
-        with pytest.raises(HubError, match="HTTP 409"):
+        with pytest.raises(HubError, match="HTTP 403" if limit == "membership" else "HTTP 409"):
             await clients["beta"].request(
                 "POST",
                 "/mentions",

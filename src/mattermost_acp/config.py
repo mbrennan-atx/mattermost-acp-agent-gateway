@@ -108,6 +108,7 @@ class Config:
     attachments_max_bytes: int
     collab_sidecar: bool = False
     collab_origin_actor: str = ""
+    workspace_guard_command: str | None = None
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -204,6 +205,8 @@ class Config:
             role_file=_optional_path(os.environ.get("MATTERMOST_ROLE_FILE")),
             harness=harness,
             grok_command=command,
+            workspace_guard_command=os.environ.get("AGENT_WORKSPACE_GUARD_COMMAND", "").strip()
+            or None,
             grok_model=model,
             grok_cwd=cwd,
             always_approve=_truthy(_env("AGENT_ALWAYS_APPROVE"), default=True),

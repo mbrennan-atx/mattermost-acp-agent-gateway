@@ -650,7 +650,7 @@ class CollaborationStore:
                         item.update(
                             state=state,
                             result=result,
-                            evidence=evidence,
+                            evidence={**item["evidence"], **(evidence or {})},
                             completion_during_cancellation=True,
                             completed=self.clock(),
                         )
@@ -665,7 +665,10 @@ class CollaborationStore:
                         mid, actor, result, state=state, evidence=evidence, claim=claim
                     )
                 item.update(
-                    state=state, result=result, evidence=evidence or {}, completed=self.clock()
+                    state=state,
+                    result=result,
+                    evidence={**item["evidence"], **(evidence or {})},
+                    completed=self.clock(),
                 )
             else:
                 raise ValueError("Invalid delivery transition")
@@ -785,6 +788,7 @@ class CollaborationStore:
                         "kind": "cancel",
                         "text": "Cancel project work",
                         "parent": item["id"],
+                        "parent_claim": item.get("claim"),
                         "dependencies": [],
                         "depth": 0,
                         "key": "cancel:" + item["id"],
@@ -825,15 +829,19 @@ class CollaborationStore:
             return [self.cancel(row[0], actor) for row in rows]
 
     def mention(self, actor, channel, thread, recipient, body, key):
-        for project in self.list_projects(actor):
-            if (
-                project["channel_id"] == channel
-                and project["thread_id"] == thread
-                and project["status"] == "active"
-            ):
-                return self.send(
-                    project["id"],
-                    actor,
-                    {"recipient": recipient, "kind": "ask", "text": body, "key": key},
-                )
+        projects = [
+            project
+            for project in self.list_projects(actor)
+            if project["channel_id"] == channel and project["thread_id"] == thread
+        ]
+        request = {"recipient": recipient, "kind": "ask", "text": body, "key": key}
+        for project in projects:
+            if self.db.execute(
+                "SELECT 1 FROM messages WHERE project=? AND sender=? AND key=?",
+                (project["id"], actor, key),
+            ).fetchone():
+                return self.send(project["id"], actor, request)
+        if projects:
+            selected = next((p for p in projects if p["status"] == "active"), projects[0])
+            return self.send(selected["id"], actor, request)
         return None
