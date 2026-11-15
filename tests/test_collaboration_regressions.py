@@ -453,6 +453,7 @@ def maintenance_gateway():
     gateway.collaboration = SimpleNamespace(
         hub=SimpleNamespace(settings=SimpleNamespace(token="synthetic-maintenance-token")),
         workers={},
+        set_admission=AsyncMock(),
     )
     return gateway
 

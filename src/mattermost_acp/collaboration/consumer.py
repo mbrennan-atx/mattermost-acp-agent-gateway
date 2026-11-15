@@ -31,6 +31,13 @@ class CollaborationConsumer:
         self.ownership_threads = {}
         self.reserving = set()
         self.cancelled_claims = set()
+        self.claiming = False
+        self.claim_settled = asyncio.Event()
+        self.claim_settled.set()
+        self.claim_uncertain = False
+        self.admission_pending = 0
+        self.admission_lock = asyncio.Lock()
+        self.poll_paused = False
         self.actor = ""
         self.sidecar = getattr(gateway.config, "collab_sidecar", False)
         self.stops_path = Path(
@@ -41,7 +48,8 @@ class CollaborationConsumer:
                 / ".local/state/mattermost-acp-collaboration"
                 / hashlib.sha256(settings.token.encode()).hexdigest()[:16],
             )
-        ).with_suffix(".stops.json")
+        )
+        self.stops_path = self.stops_path.with_name(self.stops_path.name + ".stops.json")
         self.pending_stops = (
             json.loads(self.stops_path.read_text()) if self.stops_path.exists() else {}
         )
@@ -86,13 +94,20 @@ class CollaborationConsumer:
                 for thread in list(self.pending_stops):
                     await self.cancel_thread(thread, retry=True)
                 await self.reconcile_ownership()
-                if self.gateway.sealed:
+                if self.gateway.sealed or self.poll_paused:
                     await asyncio.sleep(0.25)
                     continue
                 controls = "&controls_only=1" if self.gateway.draining else ""
-                item = await self.hub.request(
-                    "GET", f"/mailbox?instance={self.instance}&wait=20" + controls
-                )
+                self.claiming = True
+                self.claim_settled.clear()
+                try:
+                    wait = 0 if self.gateway.draining else 20
+                    item = await self.hub.request(
+                        "GET", f"/mailbox?instance={self.instance}&wait={wait}" + controls
+                    )
+                except BaseException:
+                    self.claim_uncertain = True
+                    raise
                 if item:
                     task = asyncio.create_task(
                         self.handle(item), name="collaboration-" + item["id"]
@@ -102,11 +117,60 @@ class CollaborationConsumer:
                     task.add_done_callback(
                         lambda completed, key=key: self.finish_worker(key, completed)
                     )
+                self.claiming = False
+                self.claim_settled.set()
+                if self.gateway.draining:
+                    await asyncio.sleep(0.25)
             except asyncio.CancelledError:
+                self.claiming = False
+                self.claim_settled.set()
                 raise
             except Exception:
+                self.claiming = False
+                self.claim_settled.set()
                 logger.warning("Collaboration mailbox unavailable; durable requests retained")
                 await asyncio.sleep(2)
+
+    async def set_admission(self, mode):
+        """Fence hub claims before settling local mailbox uncertainty."""
+        self.admission_pending += 1
+        try:
+            async with self.admission_lock:
+                self.poll_paused = True
+                # An unstarted consumer has never submitted a mailbox request.
+                if self.task is None and not self.claim_uncertain:
+                    return
+                async with asyncio.timeout(3):
+                    claims = await self.hub.request(
+                        "POST", "/mailbox/admission", {"instance": self.instance, "mode": mode}
+                    )
+                    if mode != "normal":
+                        await self.claim_settled.wait()
+                        for item in claims:
+                            key = (item["id"], item.get("claim"))
+                            if (
+                                key in self.workers
+                                or key in self.ownership
+                                or key in self.reserving
+                            ):
+                                continue
+                            current = await self.hub.request("GET", "/messages/" + item["id"])
+                            if current.get("claim") != key[1] or current["state"] not in {
+                                "running", "cancelling", "unconfirmed", "interrupted"
+                            }:
+                                continue
+                            if current["state"] not in {"running", "cancelling"} or current.get(
+                                "evidence", {}
+                            ).get("session_id"):
+                                raise RuntimeError("Mailbox claim requires native reconciliation")
+                            await self.update(current, "queued")
+                        self.claim_uncertain = False
+        except BaseException:
+            self.claim_uncertain = True
+            raise
+        finally:
+            self.poll_paused = False
+            self.admission_pending -= 1
 
     def finish_worker(self, key, completed):
         if self.workers.get(key) is completed:
@@ -144,6 +208,7 @@ class CollaborationConsumer:
     def release_ownership(self, key):
         report = self.ownership.pop(key, None)
         thread = self.ownership_threads.pop(key, None) or (report or {}).get("thread_id")
+        self.gateway.prune_reports()
         if thread and not self.owns_thread(thread) and not self.gateway.background_pending(thread):
             self.gateway._last_terminal.pop(thread, None)
 
@@ -217,7 +282,7 @@ class CollaborationConsumer:
         }
         return info if self.continuation_idle(info) else None
 
-    def continuation_idle(self, info):
+    def continuation_idle(self, info, *, reserved=False):
         report = info["report"]
         return (
             not self.gateway.sessions.is_busy(info["thread"])
@@ -226,6 +291,7 @@ class CollaborationConsumer:
             and not report["reporter"].has_pending_work()
             and all(
                 self.ownership.get((parent["id"], parent.get("claim"))) is report
+                and (reserved or (parent["id"], parent.get("claim")) not in self.reserving)
                 and (parent["id"], parent.get("claim")) not in self.cancelled_claims
                 for parent in info["parents"]
             )
@@ -234,43 +300,64 @@ class CollaborationConsumer:
     async def reserve_continuation(self, item, session, info):
         keys = {(parent["id"], parent.get("claim")) for parent in info["parents"]}
         self.reserving.update(keys)
-        try:
-            if session != info["session"]:
-                raise NativeDispatchChanged("Continuation native session changed")
-            if not await self.reserve(item, session):
-                return False
-            report = self.ownership[(item["id"], item.get("claim"))]
-            epoch = item["native_epoch"]
-            for parent in info["parents"]:
-                key = (parent["id"], parent.get("claim"))
-                if self.ownership.get(key) is not info["report"]:
-                    raise NativeDispatchChanged("Continuation ownership changed")
-                self.ownership[key] = report
-                evidence = {
-                    "session_id": session,
-                    "execution_id": report["execution_id"],
-                    "native_epoch": epoch,
-                }
-                try:
-                    receipt = await self.update(parent, "dispatch", evidence=evidence)
-                except HubError:
-                    settled = await self.hub.request("GET", "/messages/" + parent["id"])
-                    if settled.get("claim") == key[1] and settled["state"] in {
-                        "done",
-                        "failed",
-                        "blocked",
-                        "cancelled",
-                    }:
-                        self.release_ownership(key)
-                        continue
-                    raise
-                if receipt["state"] == "cancelling":
-                    await self.update(parent, "heartbeat", evidence=evidence)
-                if receipt["state"] != "running" or key in self.cancelled_claims:
-                    report["cancel_requested"] = True
-            return not report.get("cancel_requested")
-        finally:
-            self.reserving.difference_update(keys)
+        if session != info["session"]:
+            raise NativeDispatchChanged("Continuation native session changed")
+        if not await self.reserve(item, session):
+            return False
+        report = self.ownership[(item["id"], item.get("claim"))]
+        epoch = item["native_epoch"]
+        for parent in info["parents"]:
+            key = (parent["id"], parent.get("claim"))
+            if self.ownership.get(key) is not info["report"]:
+                raise NativeDispatchChanged("Continuation ownership changed")
+            self.ownership[key] = report
+            evidence = {
+                "session_id": session,
+                "execution_id": report["execution_id"],
+                "native_epoch": epoch,
+            }
+            try:
+                receipt = await self.update(parent, "dispatch", evidence=evidence)
+            except HubError:
+                settled = await self.hub.request("GET", "/messages/" + parent["id"])
+                if settled.get("claim") == key[1] and settled["state"] in {
+                    "done",
+                    "failed",
+                    "blocked",
+                    "cancelled",
+                }:
+                    self.release_ownership(key)
+                    continue
+                raise
+            if receipt["state"] == "cancelling":
+                await self.update(parent, "heartbeat", evidence=evidence)
+            if receipt["state"] != "running" or key in self.cancelled_claims:
+                report["cancel_requested"] = True
+        return not report.get("cancel_requested")
+
+    async def rollback_continuation(self, info):
+        old = info["report"]
+        for parent in info["parents"]:
+            key = (parent["id"], parent.get("claim"))
+            owned = self.ownership.get(key)
+            if owned is old or owned is None:
+                continue
+            current = await self.hub.request("GET", "/messages/" + parent["id"])
+            if current.get("claim") != key[1] or current.get("instance") != self.instance:
+                continue
+            if current["state"] in {"done", "failed", "blocked", "cancelled"}:
+                self.release_ownership(key)
+                continue
+            if current.get("evidence", {}).get("execution_id") != owned.get("execution_id"):
+                raise NativeDispatchChanged("Continuation rollback ownership changed")
+            evidence = dict(parent.get("evidence", {}))
+            evidence["native_epoch"] = getattr(self.gateway.sessions, "native_epoch", lambda _t: 0)(
+                info["thread"]
+            )
+            await self.update(current, "heartbeat", evidence=evidence)
+            if self.ownership.get(key) is owned:
+                self.ownership[key] = old
+        self.gateway.prune_reports()
 
     async def heartbeat(self, item):
         while True:
@@ -501,10 +588,14 @@ class CollaborationConsumer:
                         if continuation is not None
                         else (lambda session: self.reserve(item, session))
                     ),
-                    ownership_guard=(lambda: self.continuation_idle(continuation))
+                    ownership_guard=(lambda: self.continuation_idle(continuation, reserved=True))
                     if continuation is not None
                     else None,
                 )
+                if continuation is not None and result and (
+                    result.get("queued") or result.get("native_dispatched") is False
+                ):
+                    await self.rollback_continuation(continuation)
             finally:
                 self.reserving.difference_update(transfer_keys)
             # Explicit mm-work reply may already have settled the request.

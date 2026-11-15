@@ -469,6 +469,13 @@ class CollaborationStore:
                     item["recovery"] = "Worker lease expired; reconcile before retry"
                     self.save_message(item)
 
+    def active_claims(self, actor, instance):
+        rows = self.db.execute(
+            "SELECT data FROM messages WHERE recipient=? AND state IN "
+            "('running','cancelling','unconfirmed','interrupted')", (actor,)
+        ).fetchall()
+        return [item for row in rows if (item := json.loads(row[0])).get("instance") == instance]
+
     def claim_next(self, actor, instance, *, controls_only=False):
         with self.transaction():
             self.expire()

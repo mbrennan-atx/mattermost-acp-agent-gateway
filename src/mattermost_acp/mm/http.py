@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Callable
 import aiohttp
 from aiohttp import web
 
+from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.commands.models_catalog import fetch_catalog
 from mattermost_acp.config import Config
 from mattermost_acp.mm.slash import (
@@ -102,9 +103,21 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
         if action == "seal":
             if not gateway.draining or not gateway.maintenance_state()["idle"]:
                 raise web.HTTPConflict(text="Gateway must be drained and idle")
+            try:
+                await consumer.set_admission("sealed")
+            except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+                raise web.HTTPConflict(text="Mailbox admission could not settle") from None
+            if not gateway.maintenance_state()["idle"]:
+                await consumer.set_admission("controls")
+                raise web.HTTPConflict(text="Gateway has pending work")
             gateway.sealed = True
         elif action != "state":
             gateway.draining = action == "drain"
+            try:
+                await consumer.set_admission("controls" if gateway.draining else "normal")
+            except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+                gateway.draining = True
+                raise web.HTTPConflict(text="Mailbox admission could not settle") from None
             if action == "resume":
                 gateway.sealed = False
         return web.json_response(gateway.maintenance_state())

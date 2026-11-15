@@ -48,6 +48,7 @@ def build_app(
     verify_creation=None,
 ) -> web.Application:
     changed = asyncio.Event()
+    admission_fences: dict[tuple[str, str], str] = {}
     store.sidecar_actors = {name for name, settings in actors.items() if settings.get("sidecar")}
     creation_lock = asyncio.Lock()
 
@@ -217,18 +218,44 @@ def build_app(
             raise KeyError("Unknown action")
         return web.json_response(result)
 
+    async def mailbox_admission(request):
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("Mailbox admission settings required")
+        instance, mode = body.get("instance"), body.get("mode")
+        if not isinstance(instance, str) or not instance or len(instance) > 128:
+            raise ValueError("Worker instance required")
+        if not isinstance(mode, str) or mode not in {"normal", "controls", "sealed"}:
+            raise ValueError("Mailbox admission mode required")
+        key = (request["actor"], instance)
+        if mode == "normal":
+            admission_fences.pop(key, None)
+        else:
+            admission_fences[key] = mode
+        claims = store.active_claims(*key)
+        changed.set()
+        return web.json_response(claims)
+
     async def mailbox(request):
         instance = request.query.get("instance", "")
         if not instance or len(instance) > 128:
             raise ValueError("Worker instance required")
         wait = min(20, max(0, float(request.query.get("wait", "20"))))
         deadline = asyncio.get_running_loop().time() + wait
+        controls_only = request.query.get("controls_only") == "1"
         while True:
             changed.clear()
+            mode = admission_fences.get((request["actor"], instance), "normal")
+            if mode == "sealed":
+                return web.json_response(None)
             item = store.claim_next(
-                request["actor"], instance, controls_only=request.query.get("controls_only") == "1"
+                request["actor"], instance, controls_only=controls_only or mode == "controls"
             )
-            if item is not None or asyncio.get_running_loop().time() >= deadline:
+            if (
+                item is not None
+                or asyncio.get_running_loop().time() >= deadline
+                or (mode == "controls" and not controls_only)
+            ):
                 return web.json_response(item)
             try:
                 # Deterministic lease/deadline checks; no model is polled or woken.
@@ -344,6 +371,7 @@ def build_app(
     app.router.add_get("/messages/{mid}", message)
     app.router.add_post("/messages/{mid}/{action}", message_action)
     app.router.add_get("/mailbox", mailbox)
+    app.router.add_post("/mailbox/admission", mailbox_admission)
     app.router.add_post("/cancel-thread", cancel_thread)
     app.router.add_post("/mentions", mention)
     return app
@@ -356,8 +384,9 @@ def main():
     parser.add_argument("--port", type=int, default=18780)
     args = parser.parse_args()
     actors = load_actors(args.config)
+    args.db = args.db.expanduser().resolve()
     args.db.parent.mkdir(parents=True, exist_ok=True)
-    with args.db.with_suffix(".lock").open("a") as lock:
+    with args.db.with_name(args.db.name + ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         store = CollaborationStore(args.db, set(actors))
         try:

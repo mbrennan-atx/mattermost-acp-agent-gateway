@@ -249,6 +249,7 @@ class MattermostGateway:
         # its pending-work state again after newer notifications.
         report["reporter"].observe(update)
         update.report_observed = True
+        self.prune_reports()
         if report["active"]:
             return
         receipt = self._last_terminal.get(report["thread_id"])
@@ -656,6 +657,10 @@ class MattermostGateway:
                 return await self._run_prompt(thread_id=thread_id, **kwargs)
             finally:
                 for report in self.live_reports():
+                    if report["thread_id"] == thread_id:
+                        report["preparing"] = False
+                self.prune_reports()
+                for report in self.live_reports():
                     if report["thread_id"] == thread_id and not report.get("active"):
                         report["foreground_complete"] = True
 
@@ -666,6 +671,30 @@ class MattermostGateway:
                 seen.add(id(report))
                 yield report
                 report = report.get("previous")
+
+    def prune_reports(self):
+        """Keep predecessors only while preparation, work or ownership needs them."""
+        owned = {id(report) for report in getattr(self.collaboration, "ownership", {}).values()}
+        for head in self._reports.values():
+            if head.get("preparing"):
+                continue
+            current = head
+            seen = {id(head)}
+            while (previous := current.get("previous")) is not None:
+                if id(previous) in seen:
+                    current["previous"] = None
+                    break
+                seen.add(id(previous))
+                if (
+                    previous.get("active") or previous["reporter"].has_pending_work()
+                    or id(previous) in owned
+                ):
+                    current = previous
+                    continue
+                current["previous"] = previous.get("previous")
+                previous["previous"] = None
+                if previous.get("task"):
+                    previous["task"].cancel()
 
     def background_pending(self, thread_id, *, exclude=None):
         return any(
@@ -699,6 +728,10 @@ class MattermostGateway:
                 len(self.collaboration.workers)
                 + len(getattr(self.collaboration, "pending_stops", ()))
                 + len(getattr(self.collaboration, "ownership", ()))
+                + len(getattr(self.collaboration, "reserving", ()))
+                + int(getattr(self.collaboration, "claiming", False))
+                + int(getattr(self.collaboration, "claim_uncertain", False))
+                + getattr(self.collaboration, "admission_pending", 0)
             )
             if self.collaboration
             else 0,
@@ -867,6 +900,7 @@ class MattermostGateway:
 
         session_id = str(session_status.get("session_id") or "")
         previous = self._reports.get(session_id)
+        previous_terminal = self._last_terminal.get(thread_id)
         if before_native is not None and self.background_pending(thread_id):
             return {"queued": True}
         if previous and previous.get("task"):
@@ -879,6 +913,7 @@ class MattermostGateway:
             "channel_id": channel_id,
             "active": True,
             "foreground_complete": False,
+            "preparing": before_native is not None,
             "previous": previous
             if previous and (before_native is not None or self.background_pending(thread_id))
             else None,
@@ -890,6 +925,24 @@ class MattermostGateway:
             self._publish_progress(report), name=f"progress-{thread_id}"
         )
         report["task"] = progress_task
+
+        async def restore_undispatched():
+            actual_session = str(session_status.get("session_id") or "")
+            if previous is not None and self._reports.get(actual_session) is report:
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+                self._reports.pop(actual_session, None)
+                self._reports[session_id] = previous
+                if previous_terminal is not None:
+                    previous_terminal["pending"] = previous["reporter"].has_pending_work()
+                    self._last_terminal[thread_id] = previous_terminal
+                if previous["reporter"].has_pending_work() and (
+                    previous.get("task") is None or previous["task"].done()
+                ):
+                    previous["task"] = asyncio.create_task(
+                        self._publish_progress(previous), name=f"progress-{thread_id}"
+                    )
+
         try:
             await _publish_status(status.render(), force=True)
             try:
@@ -928,10 +981,7 @@ class MattermostGateway:
                     except asyncio.CancelledError:
                         pass
         except NativeDispatchChanged:
-            actual_session = str(session_status.get("session_id") or "")
-            if self._reports.get(actual_session) is report and previous is not None:
-                self._reports.pop(actual_session, None)
-                self._reports[session_id] = previous
+            await restore_undispatched()
             return {"queued": True}
         except AcpError as exc:
             logger.warning("ACP error thread=%s: %s", thread_id, exc)
@@ -951,6 +1001,10 @@ class MattermostGateway:
                 root_id=thread_id,
             )
             return
+
+        if before_native is not None and not result.native_dispatched:
+            await restore_undispatched()
+            return {"queued": True, "native_dispatched": False}
 
         # Progress already has its own live post. Keep it out of the answer.
         # Preserve the narration fallback when an adapter supplies no final text.

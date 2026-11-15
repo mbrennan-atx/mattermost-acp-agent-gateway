@@ -254,11 +254,14 @@ async def test_cancellation_during_continuation_transfer_keeps_parent_unsettled(
             assert consumer.reserve_continuation.await_count == 1
             assert accepted == [False]
             cached = gateway._last_terminal["discussion"]
-            assert cached["execution_id"] == moved["execution_id"]
-            assert cached["stop_reason"] == "cancelled" and not cached["native_dispatched"]
+            assert cached["execution_id"] == old["execution_id"]
+            assert cached["stop_reason"] == "end_turn" and cached["native_dispatched"]
+            restored = store.get_message(parent["id"], "beta")["evidence"]
+            assert restored["execution_id"] == old["execution_id"]
+            assert restored["native_epoch"] == sessions.native_epoch("discussion")
             await asyncio.wait_for(cancellation, 3)
             assert store.get_message(parent["id"], "beta")["state"] == "cancelling"
-            assert consumer.ownership[(parent["id"], parent["claim"])] is moved
+            assert consumer.ownership[(parent["id"], parent["claim"])] is old
             assert store.show(unrelated["id"], "alpha")["status"] == "active"
             assert store.get_message(untouched["id"], "gamma")["state"] == "queued"
             assert writer.messages == []
