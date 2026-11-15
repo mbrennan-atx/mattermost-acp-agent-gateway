@@ -281,6 +281,18 @@ def build_app(
             store.cancel_thread(request["actor"], body["thread_id"], cutoff=body.get("cutoff"))
         )
 
+    def ordinary_mention_fallback(actor, body):
+        # Unverified callers can fall back only outside registered discussions.
+        store.mention(
+            None,
+            body["channel_id"],
+            body["thread_id"],
+            actor,
+            body["text"],
+            "post:" + body["post_id"],
+        )
+        return web.json_response(None)
+
     async def mention(request):
         body = await request.json()
         sender = next(
@@ -291,7 +303,9 @@ def build_app(
             ),
             None,
         )
-        if sender is None or sender == request["actor"]:
+        if sender is None:
+            return ordinary_mention_fallback(request["actor"], body)
+        if sender == request["actor"]:
             return web.json_response(None)
         if verify_post is not None:
             verified = await verify_post(body["post_id"], request["actor"])
@@ -303,7 +317,7 @@ def build_app(
             base = settings.get("mattermost_url")
             token_path = settings.get("mattermost_token_file")
             if not base or not token_path:
-                return web.json_response(None)
+                return ordinary_mention_fallback(request["actor"], body)
             token = Path(token_path).expanduser().read_text().strip()
             async with aiohttp.ClientSession(
                 headers={"Authorization": "Bearer " + token},

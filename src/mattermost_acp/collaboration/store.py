@@ -677,6 +677,8 @@ class CollaborationStore:
             if item["state"] not in ACTIVE:
                 raise PermissionError("Delivery is no longer owned by this worker")
             if state in {"dispatch", "post_dispatch"}:
+                self.expire()
+                item = self.get_message(mid, actor)
                 project = self.get_project(item["project"], actor)
                 if item["state"] != "running" or project["status"] != "active":
                     return item

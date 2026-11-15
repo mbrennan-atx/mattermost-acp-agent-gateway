@@ -8,6 +8,7 @@ import pytest
 from aiohttp import ClientPayloadError, web
 from aiohttp.test_utils import TestServer
 from test_collaboration import active_gateway, api_fixture, ask, close_api, project
+from test_collaboration_dispatch_review import close_reports, native_gateway
 from test_collaboration_regressions import (
     close_creation,
     creation_api,
@@ -376,3 +377,225 @@ async def test_creation_bounds_rendered_post_and_preserves_full_objective(tmp_pa
     finally:
         await close_creation(store, server, client)
         await mm_server.close()
+
+
+@pytest.mark.parametrize("state", ["active", "budget", "expired", "cancelled"])
+async def test_unknown_allowlisted_author_cannot_bypass_registered_project_admission(
+    tmp_path, state
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.collab_sidecar = False
+    gateway.config.allow_user_ids = frozenset({"outside-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    posted = PostedEvent(
+        post_id="unknown-author",
+        channel_id="floor",
+        user_id="outside-user",
+        message="@beta ASK: Verify the dependency",
+        root_id="discussion",
+    )
+    try:
+        p = project(store, max_turns=1)
+        if state == "budget":
+            ask(store, p["id"])
+        elif state == "expired":
+            store.clock = lambda: p["deadline"] + 1
+        elif state == "cancelled":
+            store.cancel(p["id"], "alpha")
+        before = store.show(p["id"], "alpha")
+        await gateway.handle_posted(posted)
+        gateway.run_prompt.assert_not_awaited()
+        assert store.show(p["id"], "alpha") == before
+        assert len(gateway.client.posts) == 1
+        channel, notice, root = gateway.client.posts[0]
+        assert (channel, root) == ("floor", "discussion")
+        assert "rejected" in notice and "@" not in notice and "ASK:" not in notice
+        await gateway.handle_posted(
+            PostedEvent(
+                post_id="unregistered-author",
+                channel_id="floor",
+                user_id="outside-user",
+                message=posted.message,
+                root_id="unregistered",
+            )
+        )
+        gateway.run_prompt.assert_awaited_once()
+        assert gateway.run_prompt.call_args.kwargs["thread_id"] == "unregistered"
+        assert store.show(p["id"], "alpha") == before
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_missing_verification_config_cannot_bypass_registered_project_admission(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    actors = {name: {"token": name * 32, "user_id": name + "-user"} for name in store.actors}
+    server = TestServer(build_app(store, actors))
+    await server.start_server()
+    gateway = active_gateway(busy=False)
+    gateway.config.collab_sidecar = False
+    gateway.config.allow_user_ids = frozenset({"alpha-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    consumer = CollaborationConsumer(
+        gateway, Settings(str(server.make_url("/")).rstrip("/"), actors["beta"]["token"])
+    )
+    gateway.collaboration = consumer
+    try:
+        p = project(store, max_turns=1)
+        ask(store, p["id"])
+        before = store.show(p["id"], "alpha")
+        await gateway.handle_posted(
+            PostedEvent(
+                post_id="known-author",
+                channel_id="floor",
+                user_id="alpha-user",
+                message="@beta ASK: Verify the dependency",
+                root_id="discussion",
+            )
+        )
+        gateway.run_prompt.assert_not_awaited()
+        assert store.show(p["id"], "alpha") == before
+        assert len(gateway.client.posts) == 1 and "rejected" in gateway.client.posts[0][1]
+        await gateway.handle_posted(
+            PostedEvent(
+                post_id="unregistered-author",
+                channel_id="floor",
+                user_id="alpha-user",
+                message="@beta ASK: Verify the dependency",
+                root_id="unregistered",
+            )
+        )
+        gateway.run_prompt.assert_awaited_once()
+        assert gateway.run_prompt.call_args.kwargs["thread_id"] == "unregistered"
+        assert store.show(p["id"], "alpha") == before
+    finally:
+        await consumer.close()
+        await server.close()
+        store.close()
+
+
+@pytest.mark.parametrize("lateness", [0, 0.1])
+def test_dispatch_expiry_refuses_new_reservation_and_retains_existing_execution(tmp_path, lateness):
+    now = [1000.0]
+    store = CollaborationStore(
+        tmp_path / "hub.db", {"alpha", "beta", "gamma"}, clock=lambda: now[0]
+    )
+    try:
+        p = project(store, max_seconds=1, max_workers=2)
+        older = ask(store, p["id"], recipient="gamma", key="retained-work")
+        retained = store.claim_next("gamma", "old-worker")
+        old_evidence = {
+            "session_id": "retained-native",
+            "execution_id": "retained-execution",
+            "native_epoch": 3,
+        }
+        store.update(
+            older["id"],
+            "gamma",
+            "old-worker",
+            "dispatch",
+            evidence=old_evidence,
+            claim=retained["claim"],
+        )
+        old_evidence = dict(store.get_message(older["id"], "alpha")["evidence"])
+        request = ask(store, p["id"], key="new-work")
+        claimed = store.claim_next("beta", "preparing-worker")
+        now[0] = p["deadline"] + lateness
+        assert store.get_project(p["id"], "alpha")["status"] == "active"
+        assert store.get_message(request["id"], "alpha")["state"] == "running"
+        receipt = store.update(
+            request["id"],
+            "beta",
+            "preparing-worker",
+            "dispatch",
+            evidence={
+                "session_id": "new-native",
+                "execution_id": "new-execution",
+                "native_epoch": 4,
+            },
+            claim=claimed["claim"],
+        )
+        assert receipt["state"] == "cancelling" and not receipt.get("execution_pending")
+        assert receipt["evidence"] == {} and "dispatch_started" not in receipt["evidence"]
+        current = store.get_project(p["id"], "alpha")
+        assert current["status"] == "cancelling" and current["dispatched"] == 2
+        old = store.get_message(older["id"], "alpha")
+        assert old["state"] == "cancelling" and old["execution_pending"]
+        assert old["evidence"] == old_evidence
+        controls = [m for m in store.show(p["id"], "alpha")["messages"] if m["kind"] == "cancel"]
+        assert {control["parent"] for control in controls} == {older["id"], request["id"]}
+        store.update(request["id"], "beta", "preparing-worker", "queued", claim=claimed["claim"])
+        assert store.get_message(request["id"], "alpha")["state"] == "cancelled"
+        assert store.get_project(p["id"], "alpha")["status"] == "cancelling"
+        assert store.get_message(older["id"], "alpha")["execution_pending"]
+    finally:
+        store.close()
+
+
+async def test_final_preparation_crossing_deadline_cannot_dispatch_before_mailbox_expiry(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    now = [1000.0]
+    store.clock = lambda: now[0]
+    gateway, _broker, writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.collab_sidecar = False
+    gateway.sessions.store.get = AsyncMock(return_value=None)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    entered, release = asyncio.Event(), asyncio.Event()
+    prepared = 0
+    receipts = []
+    handling = None
+
+    async def prepare(*args, **kwargs):
+        nonlocal prepared
+        prepared += 1
+        if prepared == 2:
+            entered.set()
+            await release.wait()
+        return "existing-native"
+
+    gateway.sessions.ensure_session = AsyncMock(side_effect=prepare)
+    original_update = consumer.update
+    try:
+        p = project(store, max_seconds=1)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+
+        async def update(item, state, *args, **kwargs):
+            if state == "dispatch":
+                assert now[0] == p["deadline"]
+                assert store.get_project(p["id"], "alpha")["status"] == "active"
+                assert store.get_message(request["id"], "alpha")["state"] == "running"
+            receipt = await original_update(item, state, *args, **kwargs)
+            if state == "dispatch":
+                receipts.append(receipt)
+                assert receipt["state"] == "cancelling" and not receipt.get("execution_pending")
+            return receipt
+
+        consumer.update = update
+        handling = asyncio.create_task(consumer.handle(claimed))
+        await asyncio.wait_for(entered.wait(), 2)
+        now[0] = p["deadline"]
+        release.set()
+        await asyncio.wait_for(handling, 3)
+        assert prepared == 2 and len(receipts) == 1
+        assert writer.messages == [] and not consumer.ownership
+        assert store.active_claims("beta", consumer.instance) == []
+        saved = store.get_message(request["id"], "alpha")
+        assert saved["state"] == "cancelled" and not saved.get("execution_pending")
+        assert "dispatch_started" not in saved["evidence"]
+    finally:
+        release.set()
+        if handling:
+            await asyncio.gather(handling, return_exceptions=True)
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
