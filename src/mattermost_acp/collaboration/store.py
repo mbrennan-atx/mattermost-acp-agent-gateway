@@ -394,6 +394,7 @@ class CollaborationStore:
                 depth = parent["depth"] + 1
             if depth > project["limits"]["max_depth"]:
                 raise ValueError("Project delegation depth limit reached")
+            self.check_ancestor_recipient(pid, actor, recipient, parent_id)
             dependencies = body.get("dependencies", [])
             if not isinstance(dependencies, list) or len(dependencies) > 100:
                 raise ValueError("dependencies must be a bounded list")
@@ -425,6 +426,23 @@ class CollaborationStore:
             self.save_message(item)
             return item
 
+    def check_ancestor_recipient(self, pid, actor, recipient, parent_id):
+        if recipient is None:
+            return
+        seen = set()
+        while parent_id:
+            if parent_id in seen:
+                raise ValueError("Delegation ancestry is invalid")
+            seen.add(parent_id)
+            parent = self.get_message(parent_id, actor)
+            if parent["project"] != pid:
+                raise ValueError("Delegation ancestry belongs to another project")
+            if recipient in {parent["sender"], parent.get("recipient")}:
+                raise ValueError(
+                    "Cannot delegate to an ancestor; return a blocked result to the parent instead"
+                )
+            parent_id = parent.get("parent")
+
     def claim_open(self, mid, actor):
         with self.transaction():
             item = self.get_message(mid, actor)
@@ -437,6 +455,7 @@ class CollaborationStore:
             project = self.get_project(item["project"], actor)
             if project["status"] != "active":
                 raise ValueError("Project is inactive")
+            self.check_ancestor_recipient(item["project"], actor, actor, item.get("parent"))
             item.update(recipient=actor, state="queued")
             self.save_message(item)
             return item
@@ -853,6 +872,13 @@ class CollaborationStore:
                 item = json.loads(row[0])
                 if item["kind"] not in WORK and item["kind"] != "result":
                     continue
+                binding = item.get("binding", {})
+                owner_origin = (
+                    item["recipient"] == project["owner"]
+                    and not project.get("owner_in_discussion")
+                    and binding.get("thread_id") == project["origin_thread_id"]
+                    and binding.get("channel_id") == project["origin_channel_id"]
+                )
                 if (
                     item["state"] in TERMINAL
                     and item.get(
@@ -862,19 +888,14 @@ class CollaborationStore:
                             and item.get("evidence", {}).get("dispatch_started") is not None
                         ),
                     )
-                    and not (
-                        item["recipient"] == project["owner"]
-                        and not project.get("owner_in_discussion")
-                    )
+                    and not owner_origin
                 ):
                     # The correlated result is complete, but its reserved native
                     # execution remains cancellable until verified settlement.
                     item["execution_cancelling"] = True
                     self.save_message(item)
                 if item["state"] in {"queued", "open"} or (
-                    item["state"] not in TERMINAL
-                    and item["recipient"] == project["owner"]
-                    and not project.get("owner_in_discussion")
+                    item["state"] not in TERMINAL and owner_origin
                 ):
                     # Stop routing into the owner's conversation without stopping
                     # its existing work. Origin /stop separately cancels that turn.

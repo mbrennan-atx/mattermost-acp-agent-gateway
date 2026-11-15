@@ -55,13 +55,21 @@ For text with quotes, shell syntax or several paragraphs, use `--text-file /path
 
 ## Busy sessions and results
 
-The consumer tries the existing active-only steering capability first. Every question asks for an explicit correlated reply, including work that continues in background tools or workers:
+The consumer tries active-only steering when the loaded session has a recorded execution report and execution ID. Missing reports prevent steering. The existing busy-work guards keep the request queued or allow serialized normal preparation to create a new report. Every question asks for an explicit correlated reply, including work that continues in background tools or workers:
 
 ```sh
 mm-work reply REQUEST_ID --claim CLAIM_NONCE --text 'Verified result and evidence' --artifact https://example.com/proof
 ```
 
 Further delegation requires `mm-work ask PROJECT_ID RECIPIENT --parent REQUEST_ID --text 'Specific request'`. Without an explicit parent, the request is independent. Sharing an actor credential between a home gateway and its project sidecar does not connect their native work.
+
+Explicit delegation uses a bounded DAG of participants. A child cannot address anyone already on its parent chain, including the original requester and its own actor. Unassigned delegated tasks enforce the same rule when claimed. Callback questions to an ancestor are not supported. Return a correlated blocked result that identifies the missing information:
+
+```sh
+mm-work reply CHILD_REQUEST_ID --claim CHILD_CLAIM --state blocked --text 'Need the parent to supply the commit hash before verification can continue'
+```
+
+The parent handles that result and supplies the information in a new child request with a new key. This returns control through the result path without leaving both participants waiting for each other.
 
 The request prompt includes its ID and claim nonce. Use `--state blocked` or `--state failed` when appropriate. The receiver sees the result status, parent request and evidence. Every successful work request remains pending until its explicit correlated reply. An early reply retains native ownership while observed tools or workers remain active. A foreground end_turn is not proof that a native goal finished. The gateway records foreground output as evidence, with long text retained in a private runtime file. Result notifications preserve the peer result and artifact evidence independently of delivery retries.
 
@@ -91,7 +99,7 @@ mm-work retry REQUEST_ID --reconciliation 'Verified the previous attempt made no
 
 Retry retains old dispatch evidence as history and clears it for the new attempt. It creates a new claim nonce, so an old worker cannot settle the new attempt. Reply submission is idempotent for the same result. Keep completed work and evidence when rolling back the executable; never restore an older database over newer state.
 
-Default project limits are three worker slots, 24 allocated requests, delegation depth two and one hour. A running parent may borrow one descendant slot when the worker limit is full, so a parent waiting for its peer does not deadlock. Active sibling loans serialize. The hard total ceiling is workers multiplied by depth plus one, nine requests at defaults. Set other positive limits with the create command's `--max-workers`, `--max-turns`, `--max-depth` and `--max-seconds` options. Dependencies block dispatch until their requests finish successfully. Result and cancellation deliveries bypass the worker limit so a full project can still settle.
+Default project limits are three worker slots, 24 allocated requests, delegation depth two and one hour. A running parent may borrow one descendant slot when the worker limit is full. Child work must use a participant outside that explicit chain. Active sibling loans serialize. The hard total ceiling is workers multiplied by depth plus one, nine requests at defaults. Set other positive limits with the create command's `--max-workers`, `--max-turns`, `--max-depth` and `--max-seconds` options. Dependencies block dispatch until their requests finish successfully. Result and cancellation deliveries bypass the worker limit so a full project can still settle.
 
 Request-count limits bound collaboration activation. They do not enforce an exact dollar budget or limit native subagents launched inside a harness. Provider cost coverage is currently unknown and is recorded that way in project state.
 
@@ -101,7 +109,7 @@ Request-count limits bound collaboration activation. They do not enforce an exac
 mm-work cancel PROJECT_ID
 ```
 
-Stopping the owner's originating thread in an upgraded home gateway also requests cancellation for its linked projects created by that stop time. Durable retries retain that boundary and preserve later projects. Creation intent retains its admission timestamp, so a stop during discussion posting or read-back also cancels that project when it finishes. The hub persists the latest origin stop boundary across restart. A legacy home gateway with separate project sidecars requires `mm-work cancel`; its `/stop` does not propagate. Queued work cancels immediately. Result deliveries and requests addressed to the owner stop routing without cancelling the owner's ongoing conversation. For active worker work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session or native turn replaced it, or the gateway cannot prove turn ownership after a restart, cancellation stays blocked to preserve that work. Reconcile its native outcome before proceeding.
+Stopping the owner's originating thread in an upgraded home gateway also requests cancellation for its linked projects created by that stop time. Durable retries retain that boundary and preserve later projects. Creation intent retains its admission timestamp, so a stop during discussion posting or read-back also cancels that project when it finishes. The hub persists the latest origin stop boundary across restart. A legacy home gateway with separate project sidecars requires `mm-work cancel`; its `/stop` does not propagate. Queued work cancels immediately. In normal gateway mode, requests and result deliveries bound to the owner's original thread and channel stop routing without cancelling that conversation. An owner rebound to a separate worker thread receives the same native cancellation controls as other workers, including early results whose executions remain pending. For active worker work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session or native turn replaced it, or the gateway cannot prove turn ownership after a restart, cancellation stays blocked to preserve that work. Reconcile its native outcome before proceeding.
 
 A native result racing cancellation is retained as completed work. Conflicting repeated results are rejected. It does not establish that effects were prevented. Cancellation controls requeue after transport interruption. Session and execution guards are checked immediately before writing native controls, so session replacement cannot redirect a reserved cancellation or injection. The project remains `cancelling` while any execution lacks terminal evidence; the state makes that uncertainty visible. Cancellation of one project preserves unrelated sessions and projects.
 

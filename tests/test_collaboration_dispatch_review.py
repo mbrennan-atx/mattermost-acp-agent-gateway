@@ -186,6 +186,7 @@ async def test_injection_rechecks_loaded_session_after_waiting_for_broker_write(
         return_value=SimpleNamespace(session_id="existing-native", harness="claude")
     )
     gateway.sessions.store.harness = "claude"
+    gateway._reports["existing-native"] = idle_report()
     consumer = CollaborationConsumer(gateway, clients["beta"].settings)
     gateway.collaboration = consumer
     handling = None

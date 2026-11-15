@@ -777,38 +777,42 @@ async def test_injected_native_failure_settles_request_and_routes_failed_result(
 
 
 def test_descendant_slot_loan_breaks_parent_wait_and_serializes_siblings(tmp_path):
-    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma", "delta"})
     try:
         p = project(store, max_workers=1, max_depth=2)
+        with store.transaction():
+            p["members"].append("delta")
+            p["bindings"]["delta"] = {"thread_id": "discussion", "channel_id": "floor"}
+            store.save_project(p)
         parent = ask(store, p["id"])
         store.claim_next("beta", "parent-worker")
         child = ask(
             store, p["id"], sender="beta", recipient="gamma", key="child", parent=parent["id"]
         )
         sibling = ask(
-            store, p["id"], sender="beta", recipient="alpha", key="sibling", parent=parent["id"]
+            store, p["id"], sender="beta", recipient="delta", key="sibling", parent=parent["id"]
         )
         loaned = store.claim_next("gamma", "child-worker")
         assert loaned["id"] == child["id"] and loaned["delegation_slot"]
-        assert store.claim_next("alpha", "sibling-worker") is None
+        assert store.claim_next("delta", "sibling-worker") is None
         grandchild = ask(
-            store, p["id"], sender="gamma", recipient="alpha", key="grandchild", parent=child["id"]
+            store, p["id"], sender="gamma", recipient="delta", key="grandchild", parent=child["id"]
         )
-        nested = store.claim_next("alpha", "nested-worker")
+        nested = store.claim_next("delta", "nested-worker")
         assert nested["id"] == grandchild["id"] and nested["delegation_slot"]
         assert sum(m["state"] == "running" for m in store.show(p["id"], "alpha")["messages"]) == 3
         with pytest.raises(ValueError, match="depth"):
             ask(
                 store,
                 p["id"],
-                sender="alpha",
+                sender="delta",
                 recipient="beta",
                 key="too-deep",
                 parent=grandchild["id"],
             )
         store.reply(child["id"], "gamma", "Delegated finding", claim=loaned["claim"])
-        store.reply(grandchild["id"], "alpha", "Nested finding", claim=nested["claim"])
-        next_item = store.claim_next("alpha", "sibling-worker")
+        store.reply(grandchild["id"], "delta", "Nested finding", claim=nested["claim"])
+        next_item = store.claim_next("delta", "sibling-worker")
         assert next_item["id"] == sibling["id"] and next_item["delegation_slot"]
     finally:
         store.close()

@@ -14,6 +14,7 @@ from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.gateway import MattermostGateway
+from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
 from mattermost_acp.store import ThreadStore
 
@@ -250,6 +251,19 @@ def active_gateway(outcome="injected", *, steering=True, busy=True):
     return gateway
 
 
+def execution_report(project_id, execution_id="tracked-execution"):
+    return {
+        "execution_id": execution_id,
+        "collaboration_project": project_id,
+        "thread_id": "discussion",
+        "channel_id": "floor",
+        "active": False,
+        "foreground_complete": True,
+        "reporter": TurnReporter(),
+        "task": None,
+    }
+
+
 @pytest.mark.parametrize("case", ["unsupported", "timeout", "unknown"])
 async def test_busy_delivery_preserves_unsupported_and_ambiguous_requests(tmp_path, case):
     store, server, clients = await api_fixture(tmp_path)
@@ -260,6 +274,7 @@ async def test_busy_delivery_preserves_unsupported_and_ambiguous_requests(tmp_pa
         gateway = active_gateway(
             outcome="unknown" if case == "unknown" else "injected", steering=case != "unsupported"
         )
+        gateway._reports["existing-native"] = execution_report(p["id"])
         if case == "timeout":
             gateway.sessions.hint.side_effect = TimeoutError("possibly accepted")
         consumer = CollaborationConsumer(gateway, clients["beta"].settings)
@@ -282,6 +297,7 @@ async def test_active_injection_uses_explicit_correlated_reply(tmp_path):
         p = project(store)
         m = ask(store, p["id"])
         gateway = active_gateway(busy=False)  # Background native work, no foreground RPC.
+        gateway._reports["existing-native"] = execution_report(p["id"])
         consumer = CollaborationConsumer(gateway, clients["beta"].settings)
         handling = asyncio.create_task(consumer.handle(store.claim_next("beta", consumer.instance)))
         async with asyncio.timeout(2):

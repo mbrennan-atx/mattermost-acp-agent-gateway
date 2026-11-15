@@ -2,7 +2,7 @@
 
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 660 tests pass, one optional installed Codex adapter fixture skipped, 92.36 seconds.
+- Python 3.12.15 with locked dependencies: 685 tests pass, one optional installed Codex adapter fixture skipped, 95.98 seconds.
 - Ruff passes across the repository. Formatting passes for all 31 changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
 - Preceding full-branch Sol/high reports and finalized synthesis were inspected. All supported findings have fixes and meaningful regressions. Latest fixes reject unknown and unverified authors in registered discussions, retain ordinary behavior outside projects, and apply expiry inside dispatch transactions after native preparation. A fresh committed-source review precedes publication.
@@ -32,6 +32,8 @@ Rejected addressed requests receive a fixed admission notice without waking a mo
 Creation intent records its admission timestamp. Origin cancellation retains the latest boundary in the hub, including across restart, so posting/read-back delays cannot move earlier admitted work beyond the stop cutoff. Later projects remain active.
 
 Steering requires a same-harness session successfully loaded by the current broker process, with a final guarded check at the native write. Restart clears loaded-session evidence. Stop suppresses report publication while preserving every pending predecessor observer.
+
+Steering also requires a recorded execution report and nonempty execution ID, rechecked at the native write boundary. Missing reports retain existing unresolved execution and create no null ownership. Owner cancellation exemptions require the delivery's recorded original thread and channel; rebinding the owner receives normal native cancellation, including after an early result. Explicit delegation and task claiming reject participants on the parent chain before changing state or request budgets. A blocked correlated result returns missing-information requests to the parent. Twenty-five regressions cover these conditions and settlement.
 
 Session creation and replacement share a separate per-thread preparation lock. Final turn preparation receives the expected workspace and rejects a stored mismatch before reservation. Replacement can still cancel a running turn; terminal model persistence cannot resurrect or overwrite a replaced session. Known busy refusals queue quietly, and the full accepted slash-handler lifetime blocks maintenance during root creation.
 

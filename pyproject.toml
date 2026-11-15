@@ -58,6 +58,7 @@ include = [
     "/tests/test_collaboration_state_review.py",
     "/tests/test_collaboration_continuation_review.py",
     "/tests/test_collaboration_dispatch_review.py",
+    "/tests/test_collaboration_dispatch_regressions.py",
     "/tests/test_collaboration_retirement_review.py",
     "/tests/test_collaboration_result_review.py",
     "/tests/test_collaboration_admission_review.py",

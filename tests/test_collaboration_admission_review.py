@@ -120,7 +120,7 @@ async def test_addressed_floor_request_is_independent_of_running_delegation(tmp_
         p["limits"]["max_depth"] = 1
         with store.transaction():
             store.save_project(p)
-        first = ask(store, p["id"], recipient="gamma", key="parent")
+        first = ask(store, p["id"], sender="beta", recipient="gamma", key="parent")
         store.claim_next("gamma", "peer")
         inbound = ask(
             store, p["id"], sender="gamma", recipient="alpha", parent=first["id"], key="child"

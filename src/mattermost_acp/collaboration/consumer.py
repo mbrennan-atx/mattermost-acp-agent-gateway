@@ -508,6 +508,9 @@ class CollaborationConsumer:
                 + " <recipient> --parent "
                 + item["id"]
                 + " --text '<specific request>'`. "
+                "Do not delegate back to anyone on the explicit parent chain. "
+                "If you need information from an ancestor, return a blocked result with the "
+                "missing information so the parent can supply it in a new request. "
             )
         else:
             instructions += (
@@ -586,6 +589,7 @@ class CollaborationConsumer:
             prompt = self.prompt(item)
             outcome = None
             caps = broker.capabilities
+            report = self.gateway._reports.get(record.session_id) if record is not None else None
             is_loaded = getattr(broker, "is_session_loaded", lambda _session: False)
             can_hint = (
                 record is not None
@@ -597,6 +601,8 @@ class CollaborationConsumer:
                 and broker.is_running
                 and is_loaded(record.session_id)
                 and caps.steering
+                and report is not None
+                and bool(report.get("execution_id"))
             )
             if can_hint and broker.backend == "codex":
                 can_hint = ((caps.raw.get("_meta") or {}).get("steering") or {}).get(
@@ -613,8 +619,11 @@ class CollaborationConsumer:
                         expected_epoch=item["native_epoch"],
                         guard=lambda: (
                             is_loaded(record.session_id)
-                            and self.gateway._reports.get(record.session_id)
-                            is self.ownership.get((item["id"], item.get("claim")))
+                            and report is not None
+                            and self.gateway._reports.get(record.session_id) is report
+                            and self.ownership.get((item["id"], item.get("claim"))) is report
+                            and report.get("execution_id")
+                            == item["reservation_evidence"]["execution_id"]
                             and (item["id"], item.get("claim")) not in self.cancelled_claims
                         ),
                     )
@@ -793,6 +802,22 @@ class CollaborationConsumer:
 
     async def reserve(self, item, session):
         report = self.gateway._reports.get(session)
+        if report is None or not report.get("execution_id"):
+            current = await self.hub.request("GET", "/messages/" + item["id"])
+            if current.get("claim") == item.get("claim"):
+                if current.get("execution_pending") and current["state"] in {
+                    "running",
+                    "unconfirmed",
+                    "cancelling",
+                }:
+                    await self.update(
+                        item,
+                        "unconfirmed",
+                        "Native execution report is unavailable; reconcile delivery",
+                    )
+                elif current["state"] in {"running", "cancelling"}:
+                    await self.update(item, "queued")
+            return False
         epoch = getattr(self.gateway.sessions, "native_epoch", lambda _thread: 0)(
             item["binding"]["thread_id"]
         )
@@ -802,7 +827,7 @@ class CollaborationConsumer:
         self.ownership_threads[key] = item["binding"]["thread_id"]
         evidence = {
             "session_id": session,
-            "execution_id": (report or {}).get("execution_id"),
+            "execution_id": report["execution_id"],
             "native_epoch": epoch,
         }
         item["reservation_evidence"] = evidence

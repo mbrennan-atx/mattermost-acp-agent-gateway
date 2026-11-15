@@ -546,6 +546,7 @@ async def test_proven_prewrite_outcomes_leave_no_false_native_claim(tmp_path, fa
         request = ask(store, p["id"])
         claimed = store.claim_next("beta", consumer.instance)
         if failure == "prompt_required":
+            gateway._reports["existing-native"] = idle_report()
             gateway.sessions.hint = AsyncMock(return_value="promptRequired")
             gateway.sessions.ensure_session = AsyncMock(
                 side_effect=RuntimeError("Preparation failed before native work")
