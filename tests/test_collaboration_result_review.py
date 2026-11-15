@@ -3,12 +3,15 @@
 import asyncio
 import json
 import os
+import re
 import stat
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 from test_collaboration import active_gateway, api_fixture, ask, close_api, project
 from test_collaboration_continuation_review import child_result, retained_parent, terminal
 from test_collaboration_dispatch_review import close_reports, idle_report, native_gateway
@@ -23,7 +26,7 @@ from mattermost_acp.acp import AcpBroker, SessionUpdate, TurnResult
 from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
-from mattermost_acp.mm.client import PostedEvent
+from mattermost_acp.mm.client import MattermostClient, PostedEvent
 from mattermost_acp.session_service import SessionService
 
 
@@ -409,6 +412,96 @@ async def test_posted_result_has_no_native_debt_and_cold_sidecar_can_seal(tmp_pa
         if maintenance:
             await maintenance.close()
         await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("length", [8000, 16000])
+async def test_dense_result_posts_once_with_full_footer_and_durable_evidence(tmp_path, length):
+    store, server, clients = await api_fixture(tmp_path)
+    posts, reads = [], []
+
+    async def create(request):
+        body = await request.json()
+        if len(body["message"]) > 16383:
+            return web.json_response({"error": "Message exceeds Mattermost limit"}, status=400)
+        post = {**body, "id": "notification"}
+        posts.append(post)
+        return web.json_response(post)
+
+    async def read(request):
+        post_id = request.match_info["post"]
+        reads.append(post_id)
+        if post_id == "origin":
+            return web.json_response({"id": "origin", "channel_id": "home", "root_id": ""})
+        assert post_id == "notification"
+        return web.json_response(posts[0])
+
+    app = web.Application()
+    app.router.add_post("/api/v4/posts", create)
+    app.router.add_get("/api/v4/posts/{post}", read)
+    mm_server = TestServer(app)
+    await mm_server.start_server()
+    client = MattermostClient(str(mm_server.make_url("/")).rstrip("/"), "synthetic-mm-token")
+    client.me = {"id": "alpha-user", "username": "alpha"}
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.collab_sidecar = True
+    gateway.client = client
+    consumer = CollaborationConsumer(gateway, clients["alpha"].settings)
+    gateway.collaboration = consumer
+    answer = "@" * length
+    provenance = {
+        "session_id": "peer-native",
+        "execution_id": "peer-execution",
+        "artifact": "https://example.invalid/evidence",
+    }
+    try:
+        p = store.create_project(
+            "alpha",
+            {
+                "title": "@" * 200,
+                "objective": "Verify bounded result delivery",
+                "members": ["alpha", "beta", "gamma"],
+                "channel_id": "floor",
+                "thread_id": "discussion",
+                "origin_channel_id": "home",
+                "origin_thread_id": "origin",
+            },
+        )
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", "peer-worker")
+        store.reply(request["id"], "beta", answer, claim=claimed["claim"], evidence=provenance)
+        delivery = store.claim_next("alpha", consumer.instance)
+        await consumer.handle(delivery)
+        saved = store.get_message(delivery["id"], "alpha")
+        assert saved["state"] == "done" and saved["result"] == answer
+        assert saved["text"] == answer and saved["result_evidence"] == provenance
+        assert not saved["execution_pending"] and "dispatch_started" not in saved["evidence"]
+        assert saved["evidence"]["result_post_id"] == "notification"
+        assert "post_started" in saved["evidence"]
+        assert store.active_claims("alpha", consumer.instance) == [] and not consumer.ownership
+        assert len(posts) == 1 and reads == ["origin", "notification"]
+        notice = posts[0]["message"]
+        assert posts[0]["channel_id"] == "home" and posts[0]["root_id"] == "origin"
+        assert len(notice) <= 15000 and not re.search(r"@(?!\u200b)", notice)
+        assert notice.endswith(
+            f"Request: `{request['id']}`. Full result and evidence: `mm-work show {p['id']}`."
+        )
+        assert len(notice) < len(answer.replace("@", "@\u200b"))
+        store.reply(request["id"], "beta", answer, claim=claimed["claim"], evidence=provenance)
+        await consumer.handle(delivery)
+        assert len(posts) == 1 and reads == ["origin", "notification"]
+        assert store.claim_next("alpha", consumer.instance) is None
+        parent = store.get_message(request["id"], "alpha")
+        assert parent["result"] == answer and parent["evidence"] == provenance
+        gateway.sessions.store.get.assert_not_awaited()
+        gateway.sessions.hint.assert_not_awaited()
+        gateway.sessions.cancel.assert_not_awaited()
+        gateway.run_prompt.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await client.close()
+        await mm_server.close()
         await close_api(store, server, clients)
 
 

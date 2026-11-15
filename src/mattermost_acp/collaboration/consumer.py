@@ -18,6 +18,7 @@ import aiohttp
 
 from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
+from mattermost_acp.mm.chunk import DEFAULT_LIMIT
 from mattermost_acp.mm.client import MattermostError
 
 logger = logging.getLogger(__name__)
@@ -977,13 +978,18 @@ class CollaborationConsumer:
         if root.get("channel_id") != channel or root.get("root_id"):
             await self.update(item, "failed", "Origin is not a root in its recorded channel")
             return
-        body = (
+        header = (
             f"Project {item['project_title']}: {item['sender']} "
             f"returned {item.get('result_state', 'done')}.\n\n"
-            + item["text"][:8000]
-            + f"\n\nRequest: `{item['parent']}`. "
-            + f"Full result and evidence: `mm-work show {item['project']}`."
         ).replace("@", "@\u200b")
+        footer = (
+            f"\n\nRequest: `{item['parent']}`. "
+            f"Full result and evidence: `mm-work show {item['project']}`."
+        ).replace("@", "@\u200b")
+        header = header[: DEFAULT_LIMIT - len(footer)].removesuffix("@")
+        preview = item["text"][:8000].replace("@", "@\u200b")
+        preview = preview[: DEFAULT_LIMIT - len(header) - len(footer)].removesuffix("@")
+        body = header + preview + footer
         receipt = await self.update(
             item, "post_dispatch", evidence={"delivery": "posted", "origin_thread_id": thread}
         )
