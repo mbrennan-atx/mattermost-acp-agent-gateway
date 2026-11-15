@@ -2,10 +2,10 @@
 
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 601 tests pass, one optional installed Codex adapter fixture skipped, 93.61 seconds.
+- Python 3.12.15 with locked dependencies: 614 tests pass, one optional installed Codex adapter fixture skipped, 87.63 seconds.
 - Ruff passes across the repository. Formatting passes for all changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
-- Both reports and synthesis from the preceding full-branch Sol/high reviews were inspected. All supported findings have implementation fixes and meaningful regressions. The latest reports and synthesis have four additional fixes: explicit delegation parents, cancellation of pending creation, loaded-session steering and retention of pending predecessor reports. A fresh review of the committed branch precedes publication.
+- Both reports and synthesis from the preceding full-branch Sol/high reviews were inspected. All supported findings have implementation fixes and meaningful regressions. The latest report and synthesis have three additional fixes: cancellation and quota accounting for retained native execution after an early reply, normalized creation retries and inclusion of admission regressions in source archives. The 192 affected checks and seven byte-verified extracted-source admission tests pass. A fresh review of the committed branch precedes publication.
 - The prior immutable candidate passed committed-source export, wheel-from-sdist policy checks, parity for all 46 installed Python files and Config imports for seven actual original profiles. The amended source requires a new immutable build before activation.
 - Temporary real-profile staging verified seven generated sidecar configurations, enabled workspace guards and eight units through the actual systemd parser. It installed and started no services.
 
@@ -23,7 +23,7 @@ FR-013: root AGENTS.md.
 
 ## Verified boundaries
 
-Successful work requests require an explicit correlated reply. Foreground output remains evidence; observed pending tools and workers retain native ownership. Further delegation requires an explicit parent; independent home requests cannot borrow a sidecar's native task. Correlated child results continue their parent through the same native session. A rejected continuation restores the parent's cancellation epoch even when preparation advanced it before ownership transfer. Terminal parents retain ownership until their restored native work settles.
+Successful work requests require an explicit correlated reply. Foreground output remains evidence; observed pending tools and workers retain native ownership. Further delegation requires an explicit parent; independent home requests cannot borrow a sidecar's native task. Correlated child results continue their parent through the same native session. A rejected continuation restores the parent's cancellation epoch even when preparation advanced it before ownership transfer. Terminal parents retain ownership until their restored native work settles. Correlated reply completion is separate from reserved native execution. Pending executions still consume worker capacity and remain visible to mailbox admission and cancellation. A matching native terminal receipt clears that execution without rewriting the completed result or its artifacts. Project cancellation waits for that settlement.
 
 Registered project requests reject non-member senders and recipients instead of falling through to ordinary wake rules. Creation intent and project keys use the same normalized value across reservation, post receipts and read-back retries. Result-notification recovery does not consume the exhausted work-request budget. Database startup holds both canonical path and inode locks; hard-link aliases cannot initialize a separate SQLite WAL against live state.
 
