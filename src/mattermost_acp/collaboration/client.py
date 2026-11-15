@@ -12,7 +12,9 @@ import aiohttp
 
 
 class HubError(Exception):
-    pass
+    def __init__(self, message, *, status=None):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -60,7 +62,8 @@ class HubClient:
             if response.status >= 400:
                 raise HubError(
                     f"Collaboration HTTP {response.status}: "
-                    f"{result.get('error', 'request rejected')}"
+                    f"{result.get('error', 'request rejected')}",
+                    status=response.status,
                 )
             return result
 

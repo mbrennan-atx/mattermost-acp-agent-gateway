@@ -14,8 +14,11 @@ import time
 import uuid
 from pathlib import Path
 
+import aiohttp
+
 from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
+from mattermost_acp.mm.client import MattermostError
 
 logger = logging.getLogger(__name__)
 
@@ -1017,8 +1020,24 @@ class CollaborationConsumer:
                     },
                 )
             )
-        except HubError:
+        except (HubError, aiohttp.ClientError, TimeoutError, ValueError) as exc:
             # Only a successful unregistered-discussion response permits normal
             # wake fallback. Rejection or uncertainty cannot authorize new work.
             logger.warning("Project mention could not be admitted; ordinary wake suppressed")
+            rejected = (
+                isinstance(exc, HubError) and exc.status is not None and 400 <= exc.status < 500
+            )
+            notice = (
+                "Project request rejected by collaboration admission. "
+                "Check the project status, membership and request limits."
+                if rejected
+                else "Project request admission is unconfirmed. "
+                "Check the project state before retrying."
+            )
+            try:
+                await self.gateway.client.create_post(
+                    posted.channel_id, notice, root_id=posted.root_id
+                )
+            except (MattermostError, aiohttp.ClientError, TimeoutError):
+                logger.warning("Project request admission notice could not be posted")
             return True

@@ -664,7 +664,7 @@ async def test_late_reply_cannot_reconcile_with_receipt_before_new_injection(tmp
         assert final["evidence"]["foreground_answer"] == "Output after the new injection"
 
 
-@pytest.mark.parametrize("limit", ["dispatch", "membership", "sender-membership"])
+@pytest.mark.parametrize("limit", ["dispatch", "expiry", "membership", "sender-membership"])
 async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wake(tmp_path, limit):
     store, server, clients = await api_fixture(tmp_path)
     gateway = active_gateway(busy=False)
@@ -695,6 +695,8 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
             p = project(store, max_turns=1)
         if limit == "dispatch":
             ask(store, p["id"])
+        elif limit == "expiry":
+            store.clock = lambda: p["deadline"] + 1
         posted = PostedEvent(
             post_id="post-1",
             channel_id="floor",
@@ -702,7 +704,9 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
             message="@beta ASK: Verify the dependency",
             root_id="discussion",
         )
-        with pytest.raises(HubError, match="HTTP 403" if "membership" in limit else "HTTP 409"):
+        with pytest.raises(
+            HubError, match="HTTP 403" if "membership" in limit else "HTTP 409"
+        ) as rejection:
             await clients["beta"].request(
                 "POST",
                 "/mentions",
@@ -714,10 +718,18 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
                     "text": posted.message,
                 },
             )
+        assert rejection.value.status == (403 if "membership" in limit else 409)
         before = store.show(p["id"], p["owner"])["messages"]
+        before_budget = store.get_project(p["id"], p["owner"])["dispatched"]
         await gateway.handle_posted(posted)
         gateway.run_prompt.assert_not_awaited()
         assert store.show(p["id"], p["owner"])["messages"] == before
+        assert store.get_project(p["id"], p["owner"])["dispatched"] == before_budget
+        assert len(gateway.client.posts) == 1
+        channel, notice, root = gateway.client.posts[0]
+        assert channel == "floor" and root == "discussion"
+        assert "rejected" in notice and "unconfirmed" not in notice
+        assert "@" not in notice and "ASK:" not in notice
 
         unregistered = PostedEvent(
             post_id="post-2",

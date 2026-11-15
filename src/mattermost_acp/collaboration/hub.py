@@ -15,6 +15,7 @@ import aiohttp
 from aiohttp import web
 
 from mattermost_acp.collaboration.store import CollaborationStore
+from mattermost_acp.mm.chunk import DEFAULT_LIMIT
 
 
 def load_actors(path: Path) -> dict:
@@ -127,6 +128,10 @@ def build_app(
                         message = (
                             "Project collaboration: " + body["title"] + "\n\n" + body["objective"]
                         ).replace("@", "@\u200b")
+                        if len(message) > DEFAULT_LIMIT:
+                            suffix = "\n\nFull objective is saved in the project record."
+                            message = message[: DEFAULT_LIMIT - len(suffix)].removesuffix("@")
+                            message += suffix
                         async with session.post(
                             base.rstrip("/") + "/api/v4/posts",
                             json={"channel_id": body["channel_id"], "message": message},

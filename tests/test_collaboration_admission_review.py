@@ -1,10 +1,13 @@
 """Creation admission and delegation preserve distinct native callers."""
 
 import asyncio
+import re
 from unittest.mock import AsyncMock
 
 import pytest
-from test_collaboration import active_gateway, api_fixture, ask, close_api
+from aiohttp import ClientPayloadError, web
+from aiohttp.test_utils import TestServer
+from test_collaboration import active_gateway, api_fixture, ask, close_api, project
 from test_collaboration_regressions import (
     close_creation,
     creation_api,
@@ -13,8 +16,11 @@ from test_collaboration_regressions import (
 )
 
 from mattermost_acp.collaboration.cli import execute, parser
+from mattermost_acp.collaboration.client import HubClient, HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
+from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
+from mattermost_acp.mm.client import MattermostError, PostedEvent
 
 
 @pytest.mark.parametrize("field", ["title", "objective"])
@@ -219,3 +225,154 @@ def test_pending_creation_stop_boundary_survives_hub_restart_and_older_retry(tmp
         assert active["status"] == "active"
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("failure", ["lost-receipt", "server-error", "timeout", "payload"])
+async def test_uncertain_floor_admission_reports_uncertainty_without_repeating_work(
+    tmp_path, failure
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.allow_user_ids = frozenset({"alpha-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    original = consumer.hub.request
+    calls = []
+
+    async def lost(method, path, body=None):
+        calls.append(path)
+        await original(method, path, body)
+        if failure == "lost-receipt":
+            raise HubError("Response lost after admission")
+        if failure == "server-error":
+            raise HubError("Collaboration HTTP 500: @gamma ASK: unrelated text", status=500)
+        if failure == "timeout":
+            raise TimeoutError("Response did not arrive")
+        raise ClientPayloadError("Incomplete response body")
+
+    consumer.hub.request = lost
+    posted = PostedEvent(
+        post_id="post-1",
+        channel_id="floor",
+        user_id="alpha-user",
+        message="@beta ASK: Verify the dependency",
+        root_id="discussion",
+    )
+    try:
+        p = project(store)
+        await gateway.handle_posted(posted)
+        gateway.run_prompt.assert_not_awaited()
+        assert calls == ["/mentions"] and len(gateway.client.posts) == 1
+        channel, notice, root = gateway.client.posts[0]
+        assert (channel, root) == ("floor", "discussion")
+        assert "unconfirmed" in notice and "rejected" not in notice
+        assert "@" not in notice and "ASK:" not in notice
+        saved = store.show(p["id"], "alpha")
+        assert saved["dispatched"] == 1 and len(saved["messages"]) == 1
+        assert saved["messages"][0]["state"] == "queued"
+        assert saved["messages"][0]["attempt"] == 0
+        await gateway.handle_posted(
+            PostedEvent(
+                post_id="quiet-note",
+                channel_id="floor",
+                user_id="gamma-user",
+                message="Progress is recorded in the project.",
+                root_id="discussion",
+            )
+        )
+        assert calls == ["/mentions"] and len(gateway.client.posts) == 1
+        gateway.run_prompt.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_failed_rejection_notice_cannot_authorize_ordinary_native_fallback(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.allow_user_ids = frozenset({"alpha-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    gateway.client.create_post = AsyncMock(side_effect=MattermostError("Notice unavailable"))
+    posted = PostedEvent(
+        post_id="post-1",
+        channel_id="floor",
+        user_id="alpha-user",
+        message="@beta ASK: Verify the dependency",
+        root_id="discussion",
+    )
+    try:
+        p = project(store, max_turns=1)
+        ask(store, p["id"])
+        before = store.show(p["id"], "alpha")
+        await gateway.handle_posted(posted)
+        gateway.run_prompt.assert_not_awaited()
+        gateway.client.create_post.assert_awaited_once()
+        assert store.show(p["id"], "alpha") == before
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("content", ["plain", "many-mentions", "only-mentions"])
+async def test_creation_bounds_rendered_post_and_preserves_full_objective(tmp_path, content):
+    posts = []
+
+    async def create(request):
+        body = await request.json()
+        if len(body["message"]) > 16383:
+            return web.json_response({"error": "Message exceeds Mattermost limit"}, status=400)
+        post = {**body, "id": "created-root", "root_id": ""}
+        posts.append(post)
+        return web.json_response(post)
+
+    async def read(request):
+        assert request.match_info["post"] == "created-root"
+        return web.json_response(posts[0])
+
+    mattermost = web.Application()
+    mattermost.router.add_post("/api/v4/posts", create)
+    mattermost.router.add_get("/api/v4/posts/{post}", read)
+    mm_server = TestServer(mattermost)
+    await mm_server.start_server()
+    token_file = tmp_path / "mattermost-token"
+    token_file.write_text("synthetic-mattermost-token")
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta"})
+    actors = {
+        name: {
+            "token": name * 32,
+            "user_id": name + "-user",
+            "mattermost_url": str(mm_server.make_url("/")).rstrip("/"),
+            "mattermost_token_file": str(token_file),
+        }
+        for name in store.actors
+    }
+    server = TestServer(build_app(store, actors))
+    await server.start_server()
+    client = HubClient(Settings(str(server.make_url("/")).rstrip("/"), actors["alpha"]["token"]))
+    objective = {
+        "plain": "x" * 16000,
+        "many-mentions": ("x" * 39 + "@") * 400,
+        "only-mentions": "@" * 16000,
+    }[content]
+    body = {**creation_body(), "title": "@gamma " * 28, "objective": objective}
+    try:
+        created = await client.request("POST", "/creations", body)
+        repeated = await client.request("POST", "/creations", body)
+        assert repeated["id"] == created["id"] and len(posts) == 1
+        assert created["objective"] == objective and created["dispatched"] == 0
+        assert store.get_project(created["id"], "alpha")["objective"] == objective
+        message = posts[0]["message"]
+        assert len(message) <= 15000
+        assert message.startswith("Project collaboration: @\u200bgamma")
+        assert message.endswith("Full objective is saved in the project record.")
+        assert not re.search(r"@(?!\u200b)", message)
+    finally:
+        await close_creation(store, server, client)
+        await mm_server.close()
