@@ -270,7 +270,7 @@ class AcpBroker:
     def _build_argv(self) -> list[str]:
         if self.backend == "cursor":
             return [self.command, *self.extra_args, "acp"]
-        if self.backend in {"claude", "codex"}:
+        if self.backend in {"claude", "codex", "gemini"}:
             # Adapters speak ACP directly on stdio. Model/effort use session
             # config options; adapter environment controls the initial mode.
             return [self.command, *self.extra_args]

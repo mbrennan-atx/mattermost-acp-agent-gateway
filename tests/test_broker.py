@@ -147,6 +147,57 @@ def test_build_argv_codex_backend_has_no_grok_flags() -> None:
     assert b._build_argv() == ["codex-acp"]
 
 
+@pytest.mark.asyncio
+async def test_native_gemini_direct_adapter_session_keeps_unknown_idle_boundary(tmp_path) -> None:
+    launches = []
+    writes = []
+
+    async def spawn(argv):
+        launches.append(list(argv))
+        return await spawn_fake_agent_process(argv)
+
+    b = AcpBroker(
+        command="synthetic-gemini-adapter",
+        backend="gemini",
+        model="carbon-test",
+        always_approve=True,
+        extra_args=["--config", "/synthetic profile"],
+        process_factory=spawn,
+    )
+    actual_write = b._write
+
+    async def written(message, *, guard=None):
+        await actual_write(message, guard=guard)
+        writes.append(message)
+
+    b._write = written
+    assert b.native_boundary_idle
+    try:
+        capabilities = await b.start()
+        assert launches == [["synthetic-gemini-adapter", "--config", "/synthetic profile"]]
+        assert b.is_running and capabilities.load_session
+        assert not b.native_boundary_idle
+        sid = await b.session_new(str(tmp_path))
+        assert sid.startswith("sess-test-")
+        assert await b.set_model(sid, "carbon-test") == "carbon-test"
+        result = await b.prompt_turn(sid, "Verify native Gemini routing")
+        assert result.stop_reason == "end_turn"
+        assert "Verify native Gemini routing" in result.answer_text
+        assert result.tool_titles == ["read_file vault"]
+        assert not b._pending and not b.native_boundary_idle
+        await b.cancel(sid)
+        assert writes[-1] == {
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": sid},
+        }
+        await b.session_resume(sid, str(tmp_path))
+        assert not b._pending and not b.native_boundary_idle
+    finally:
+        await b.stop()
+    assert not b.is_running and not b.native_boundary_idle
+
+
 def test_pick_allow_prefers_always() -> None:
     from mattermost_acp.acp.broker import _pick_allow_option
 

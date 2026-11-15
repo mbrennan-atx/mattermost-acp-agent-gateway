@@ -130,3 +130,32 @@ def test_explicit_harness_and_command_required(monkeypatch):
     monkeypatch.delenv("GROK_COMMAND", raising=False)
     with pytest.raises(ValueError, match="AGENT_COMMAND"):
         Config.load("/dev/null")
+
+
+@pytest.mark.parametrize("model", [None, "", " \t "])
+def test_native_gemini_requires_selected_model(monkeypatch, model):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("HARNESS", "gemini")
+    monkeypatch.setenv("AGENT_COMMAND", "synthetic-gemini-adapter")
+    if model is not None:
+        monkeypatch.setenv("AGENT_MODEL", model)
+    with pytest.raises(ValueError, match="AGENT_MODEL"):
+        Config.load("/dev/null")
+
+
+def test_native_gemini_retains_explicit_adapter_model_and_directory(tmp_path, monkeypatch):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("HARNESS", "gemini")
+    monkeypatch.setenv("AGENT_COMMAND", "synthetic-gemini-adapter")
+    monkeypatch.setenv("AGENT_MODEL", "carbon-test")
+    monkeypatch.setenv("GROK_MODEL", "legacy-test")
+    monkeypatch.setenv("AGENT_CWD", str(tmp_path))
+    cfg = Config.load("/dev/null")
+    assert cfg.harness == "gemini"
+    assert cfg.grok_command == "synthetic-gemini-adapter"
+    assert cfg.grok_model == "carbon-test"
+    assert cfg.grok_cwd == tmp_path

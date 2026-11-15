@@ -35,3 +35,5 @@ not implemented by this transport.
 
 Provider notes: [Grok](grok.md), [Claude](claude.md), [Codex](codex.md),
 [Cursor](cursor.md).
+
+Native Gemini can run through its experimental ACP stdio interface with `HARNESS=gemini`. Set an explicit `AGENT_MODEL`, configure the selected executable and its ACP arguments, and retain its native provider/profile settings. The gateway passes those arguments directly. Connector access and optional commands depend on that native client; this mode does not imply capability parity with the four clients above. Warmed native goal and queue boundaries remain unknown for maintenance.

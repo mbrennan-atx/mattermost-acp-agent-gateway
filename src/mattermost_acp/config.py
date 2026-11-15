@@ -156,12 +156,14 @@ class Config:
         peer_channel_id = os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "").strip() or None
 
         harness = os.environ.get("HARNESS", "").strip()
-        if harness not in {"grok", "claude", "codex", "cursor"}:
-            raise ValueError("HARNESS must explicitly select grok, claude, codex or cursor")
+        if harness not in {"grok", "claude", "codex", "cursor", "gemini"}:
+            raise ValueError("HARNESS must explicitly select grok, claude, codex, cursor or gemini")
         command = _env("AGENT_COMMAND", "").strip()
         if not command:
             raise ValueError("AGENT_COMMAND is required")
         model = _env("AGENT_MODEL", "").strip() or None
+        if harness == "gemini" and model is None:
+            raise ValueError("AGENT_MODEL is required for the native Gemini harness")
         cwd = Path(_env("AGENT_CWD", ".")).expanduser()
         answer_mode = _env("AGENT_ANSWER_MODE", "finalize").strip().lower()
         if answer_mode not in {"finalize", "live"}:
