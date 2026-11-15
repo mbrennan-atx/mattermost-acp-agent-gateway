@@ -44,6 +44,8 @@ class CollaborationStore:
                 UNIQUE(project, sender, key));
             CREATE INDEX IF NOT EXISTS mailbox ON messages(recipient,state,created);
             CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY, project TEXT, data TEXT);
+            CREATE TABLE IF NOT EXISTS creations(actor TEXT, key TEXT, data TEXT,
+                PRIMARY KEY(actor,key));
         """)
         # A new hub process cannot establish what a crashed native turn did.
         with self.transaction():
@@ -110,6 +112,49 @@ class CollaborationStore:
         item = json.loads(row[0])
         self.get_project(item["project"], actor)
         return item
+
+    def prepare_creation(self, actor, body):
+        """Persist intent before external posting; uncertain posts need reconciliation."""
+        key = text(body.get("key"), "project idempotency key", 200)
+        canonical = {k: v for k, v in body.items() if k != "thread_id"}
+        with self.transaction():
+            row = self.db.execute(
+                "SELECT data FROM creations WHERE actor=? AND key=?", (actor, key)
+            ).fetchone()
+            if row:
+                intent = json.loads(row[0])
+                if intent["body"] != canonical:
+                    raise ValueError("Conflicting project creation key")
+                return intent, False
+            # Validate project input and binding rules without retaining a
+            # placeholder project or triggering any native work.
+            self.db.execute("SAVEPOINT creation_validation")
+            try:
+                self.create_project(
+                    actor,
+                    {**canonical, "thread_id": body.get("thread_id") or "creation-" + identifier()},
+                )
+            finally:
+                self.db.execute("ROLLBACK TO creation_validation")
+                self.db.execute("RELEASE creation_validation")
+            intent = {"body": canonical, "thread_id": body.get("thread_id"), "status": "reserved"}
+            self.save_creation(actor, key, intent)
+            return intent, True
+
+    def save_creation(self, actor, key, intent):
+        with self.transaction():
+            self.db.execute(
+                "INSERT OR REPLACE INTO creations VALUES(?,?,?)", (actor, key, json.dumps(intent))
+            )
+
+    def finish_creation(self, actor, intent):
+        with self.transaction():
+            project = self.create_project(
+                actor, {**intent["body"], "thread_id": intent["thread_id"]}
+            )
+            intent["status"] = "complete"
+            self.save_creation(actor, intent["body"]["key"], intent)
+            return project
 
     def create_project(self, actor, body):
         key = body.get("key")
@@ -394,7 +439,29 @@ class CollaborationStore:
                         (project["id"],),
                     ).fetchone()[0]
                     if active >= project["limits"]["max_workers"]:
-                        continue
+                        # A parent waiting for a delegated result cannot release
+                        # its slot yet. Loan one slot per active parent, bounded
+                        # by depth and a hard total ceiling. Siblings serialize.
+                        parent = (
+                            self.get_message(item["parent"], actor) if item.get("parent") else None
+                        )
+                        sibling = self.db.execute(
+                            "SELECT data FROM messages WHERE project=? AND kind IN ('ask','work') "
+                            "AND state IN ('running','unconfirmed','interrupted','cancelling')",
+                            (project["id"],),
+                        ).fetchall()
+                        if (
+                            not parent
+                            or parent["state"] != "running"
+                            or any(
+                                json.loads(row[0]).get("parent") == parent["id"] for row in sibling
+                            )
+                            or active
+                            >= project["limits"]["max_workers"]
+                            * (project["limits"]["max_depth"] + 1)
+                        ):
+                            continue
+                        item["delegation_slot"] = True
                     # Only one work request can occupy an assistant's project thread.
                     if (
                         item["kind"] == "work"
@@ -434,6 +501,22 @@ class CollaborationStore:
                 or (claim is not None and claim != item.get("claim"))
             ):
                 raise PermissionError("Stale or foreign worker instance")
+            if state == "evidence":
+                item["evidence"].update(evidence or {})
+                self.save_message(item)
+                if item["kind"] in WORK:
+                    for (raw,) in self.db.execute(
+                        "SELECT data FROM messages WHERE project=? AND kind='result'",
+                        (item["project"],),
+                    ).fetchall():
+                        delivery = json.loads(raw)
+                        if delivery.get("parent") != mid:
+                            continue
+                        delivery.setdefault("result_evidence", {}).update(evidence or {})
+                        if delivery["state"] == "queued":
+                            delivery["evidence"].update(evidence or {})
+                        self.save_message(delivery)
+                return item
             if item["state"] in TERMINAL:
                 if state == item["state"] and result == item.get("result", ""):
                     return item
@@ -458,7 +541,9 @@ class CollaborationStore:
             elif state in {"unconfirmed", "interrupted"}:
                 item["recovery"] = text(result, "recovery")
                 if item["state"] != "cancelling":
-                    item["state"] = state
+                    item["state"] = "queued" if item["kind"] == "cancel" else state
+                    if item["kind"] == "cancel":
+                        item["not_before"] = self.clock() + 2
             elif state in TERMINAL:
                 if item["state"] == "cancelling" and state != "cancelled":
                     if (evidence or {}).get("stop_reason") and not (evidence or {}).get("pending"):
@@ -506,6 +591,10 @@ class CollaborationStore:
                     return item
                 raise ValueError("Conflicting repeated result")
             if item["state"] == "cancelling":
+                if "late_state" in item:
+                    if item["late_result"] != result or item["late_state"] != state:
+                        raise ValueError("Conflicting repeated result")
+                    return item
                 item["late_result"] = result
                 item["late_state"] = state
                 item["late_evidence"] = evidence

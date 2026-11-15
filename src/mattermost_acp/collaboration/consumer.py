@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
+import sys
 import uuid
 from pathlib import Path
 
+from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,9 @@ class CollaborationConsumer:
     async def run(self):
         while not self.closing:
             try:
+                if self.gateway.draining:
+                    await asyncio.sleep(0.25)
+                    continue
                 item = await self.hub.request("GET", f"/mailbox?instance={self.instance}&wait=20")
                 if item:
                     task = asyncio.create_task(
@@ -92,20 +98,44 @@ class CollaborationConsumer:
         while True:
             await asyncio.sleep(1)
             state = await self.hub.request("GET", f"/messages/{item['id']}")
-            if state["state"] not in {"running", "cancelling"}:
-                return
             terminal = self.gateway._last_terminal.get(item["binding"]["thread_id"])
             receipt = state.get("evidence", {})
+            if state["state"] not in {"running", "cancelling"}:
+                if (
+                    state["state"] in {"done", "failed", "blocked", "cancelled"}
+                    and terminal
+                    and terminal.get("session_id") == receipt.get("session_id")
+                    and terminal.get("execution_id") == receipt.get("execution_id")
+                    and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
+                ):
+                    await self.update(item, "evidence", evidence=self.foreground(item, terminal))
+                else:
+                    owned = self.ownership.get((item["id"], item.get("claim")))
+                    if (
+                        owned
+                        and owned.get("active")
+                        and self.gateway._reports.get(receipt.get("session_id")) is owned
+                    ):
+                        # A correlated reply can precede the foreground RPC.
+                        # Retain the observer until its actual receipt arrives.
+                        continue
+                return
             if (
                 receipt.get("session_id")
                 and terminal
                 and terminal.get("session_id") == receipt["session_id"]
                 and terminal.get("execution_id") == receipt.get("execution_id")
-                and terminal["stop_reason"] == "cancelled"
+                and terminal["stop_reason"] != "end_turn"
                 and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
                 and not terminal.get("pending")
             ):
-                await self.update(item, "cancelled", "Native stop=cancelled", terminal)
+                state = "cancelled" if terminal["stop_reason"] == "cancelled" else "failed"
+                await self.update(
+                    item,
+                    state,
+                    "Native stop=" + terminal["stop_reason"],
+                    self.foreground(item, terminal),
+                )
                 return
 
     def prompt(self, item):
@@ -139,6 +169,8 @@ class CollaborationConsumer:
                 "then continue authorized work or report the verified outcome. This delivery "
                 "requires no acknowledgement or reply to the sender. "
             )
+        command = shlex.quote(str(Path(sys.executable).parent / "mm-work"))
+        instructions = instructions.replace("mm-work ", command + " ")
         return (
             f"Project collaboration: {item['project_title']}\n"
             f"Project ID: {item['project']}\nRequest ID: {item['id']}\n"
@@ -152,6 +184,9 @@ class CollaborationConsumer:
     async def handle(self, item):
         renewal = asyncio.create_task(self.heartbeat(item))
         try:
+            if self.gateway.draining:
+                await self.update(item, "queued")
+                return
             if item["kind"] == "cancel":
                 await self.handle_cancel(item)
                 return
@@ -161,6 +196,11 @@ class CollaborationConsumer:
                 return
             if current["state"] != "running" or current.get("claim") != item.get("claim"):
                 return
+            # A new claim is explicit reconciliation. Old uncertain reservations
+            # must not occupy the thread indefinitely after that reconciliation.
+            for key in list(self.ownership):
+                if key[0] == item["id"] and key[1] != item.get("claim"):
+                    self.ownership.pop(key)
             binding = item["binding"]
             thread = binding["thread_id"]
             # Verify the declared discussion/binding before creating native work.
@@ -194,7 +234,20 @@ class CollaborationConsumer:
                     await self.update(item, "cancelled", "Cancelled before native injection")
                     return
                 try:
-                    outcome = await self.gateway.sessions.hint(thread, prompt)
+                    outcome = await self.gateway.sessions.hint(
+                        thread,
+                        prompt,
+                        expected_session=record.session_id,
+                        expected_epoch=item["native_epoch"],
+                        guard=lambda: (
+                            self.gateway._reports.get(record.session_id)
+                            is self.ownership.get((item["id"], item.get("claim")))
+                        ),
+                    )
+                except NativeDispatchChanged:
+                    self.ownership.pop((item["id"], item.get("claim")), None)
+                    await self.update(item, "queued")
+                    return
                 except Exception:
                     # The adapter may have accepted the injection before a timeout/error.
                     await self.update(item, "unconfirmed", "Native injection was not confirmed")
@@ -235,6 +288,8 @@ class CollaborationConsumer:
             # Explicit mm-work reply may already have settled the request.
             current = await self.hub.request("GET", f"/messages/{item['id']}")
             if current["state"] in {"done", "failed", "blocked", "cancelled"}:
+                if result and not result.get("queued"):
+                    await self.update(item, "evidence", evidence=self.foreground(item, result))
                 return
             if result is None:
                 await self.update(item, "interrupted", "No confirmed native terminal receipt")
@@ -287,7 +342,9 @@ class CollaborationConsumer:
         if len(answer) > 8000:
             folder = Path.home() / ".local/state/mattermost-acp-collaboration/results"
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
-            path = folder / (item["id"] + ".txt")
+            path = folder / (
+                item["id"] + "-" + str(item.get("claim") or item.get("attempt", 0)) + ".txt"
+            )
             path.write_text(answer)
             path.chmod(0o600)
             evidence["result_file"] = str(path)
@@ -297,13 +354,21 @@ class CollaborationConsumer:
 
     async def reserve(self, item, session):
         report = self.gateway._reports.get(session)
+        epoch = getattr(self.gateway.sessions, "native_epoch", lambda _thread: 0)(
+            item["binding"]["thread_id"]
+        )
         receipt = await self.update(
             item,
             "dispatch",
-            evidence={"session_id": session, "execution_id": (report or {}).get("execution_id")},
+            evidence={
+                "session_id": session,
+                "execution_id": (report or {}).get("execution_id"),
+                "native_epoch": epoch,
+            },
         )
         accepted = receipt["state"] == "running" and receipt.get("claim") == item.get("claim")
         if accepted:
+            item["native_epoch"] = epoch
             self.ownership[(item["id"], item.get("claim"))] = report
         return accepted
 
@@ -369,7 +434,20 @@ class CollaborationConsumer:
                     )
                     return
                 # Repeat an idempotent cancellation until actual termination is observed.
-                await self.gateway.sessions.cancel(binding["thread_id"])
+                try:
+                    await self.gateway.sessions.cancel(
+                        binding["thread_id"],
+                        expected_session=expected,
+                        expected_epoch=target.get("evidence", {}).get("native_epoch"),
+                        guard=lambda expected=expected, owned=owned: (
+                            self.gateway._reports.get(expected) is owned
+                        ),
+                    )
+                except NativeDispatchChanged:
+                    await self.update(
+                        item, "blocked", "Native ownership changed before cancellation"
+                    )
+                    return
             elif expected and record is not None and record.session_id != expected:
                 await self.update(item, "blocked", "Native session changed; preserve other work")
                 return

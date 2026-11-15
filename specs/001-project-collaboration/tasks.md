@@ -37,4 +37,4 @@
 
 ## Dependencies and implementation strategy
 
-Foundation precedes US1. US2 and US3 complete the delivery contract before live activation. CLI and store tests can be developed independently once the contract is fixed; gateway consumer and native-thread locking share a boundary and must be coordinated. No shared-checkout parallel writers are planned. Finish all three stories and run convergence before publication and activation.
+Foundation precedes US1. US2 and US3 complete the delivery contract before live activation. A delegated worker writes only a separate regression test file while the parent owns source changes, integration and acceptance. Finish all three stories and run convergence before publication and activation.

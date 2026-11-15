@@ -95,6 +95,11 @@ class MattermostGateway:
         self._prompt_locks: dict[str, asyncio.Lock] = {}
         self._last_terminal: dict[str, dict] = {}
         self.collaboration = None
+        self.draining = False
+        self.sealed = False
+        self._inbound_tasks = set()
+        self._slash_tasks = set()
+        self._active_controls = 0
         broker = getattr(self.sessions, "broker", None)
         if broker is not None:
             broker.update_observer = self._observe_background_update
@@ -120,7 +125,7 @@ class MattermostGateway:
         if settings is not None:
             self.collaboration = CollaborationConsumer(self, settings)
             self.collaboration.start()
-        asyncio.create_task(self._handle_pending_restart_bump(), name="post-restart-bump")
+        self._track_control(self._handle_pending_restart_bump(), "post-restart-bump")
         logger.info(
             "Gateway online as %s (%s) harness=%s home=%s peer=%s",
             self.client.username,
@@ -307,6 +312,14 @@ class MattermostGateway:
         return str(root.get("user_id") or "")
 
     async def handle_posted(self, posted: PostedEvent) -> None:
+        task = asyncio.current_task()
+        self._inbound_tasks.add(task)
+        try:
+            await self._handle_posted(posted)
+        finally:
+            self._inbound_tasks.discard(task)
+
+    async def _handle_posted(self, posted: PostedEvent) -> None:
         if (
             self.collaboration is not None
             and posted.root_id
@@ -375,6 +388,8 @@ class MattermostGateway:
         )
 
     async def handle_slash(self, req: SlashRequest) -> dict[str, str]:
+        if self.sealed or (self.draining and req.command != "stop"):
+            return ephemeral("Gateway updating. Retry the command shortly.")
         if not self.allowed(req.user_id):
             return ephemeral("Not allowed.")
         if not self.in_home(req.channel_id):
@@ -393,7 +408,7 @@ class MattermostGateway:
             )
             thread_id = str(starter.get("id") or "")
         # MM requires a JSON response in a few seconds. Do the real work after ACK.
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._slash_dispatch(
                 thread_id=thread_id,
                 channel_id=req.channel_id,
@@ -404,6 +419,8 @@ class MattermostGateway:
             ),
             name=f"slash-{cmd}",
         )
+        self._slash_tasks.add(task)
+        task.add_done_callback(self._slash_tasks.discard)
         if req.root_id:
             ack = f"Working in this thread (`/{cmd}`)."
         else:
@@ -443,7 +460,27 @@ class MattermostGateway:
             except Exception:
                 logger.exception("slash error notice failed")
 
-    async def dispatch_command(
+    async def dispatch_command(self, **kwargs) -> None:
+        if self.sealed or (self.draining and kwargs["cmd"] != "stop"):
+            await self._post(
+                kwargs["channel_id"],
+                "Gateway updating. Retry the command shortly.",
+                root_id=kwargs["thread_id"],
+            )
+            return
+        self._active_controls += 1
+        try:
+            await self._dispatch_command(**kwargs)
+        finally:
+            self._active_controls -= 1
+
+    def _track_control(self, operation, name):
+        task = asyncio.create_task(operation, name=name)
+        self._slash_tasks.add(task)
+        task.add_done_callback(self._slash_tasks.discard)
+        return task
+
+    async def _dispatch_command(
         self,
         *,
         thread_id: str,
@@ -542,6 +579,15 @@ class MattermostGateway:
         await reply(f"Unknown command `/{cmd}`. Try `/help`.")
 
     async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
+        if self.draining:
+            if kwargs.get("before_native") is not None:
+                return {"queued": True}
+            await self._post(
+                kwargs["channel_id"],
+                "Gateway updating. Retry this message shortly.",
+                root_id=thread_id,
+            )
+            return None
         lock = self._prompt_locks.setdefault(thread_id, asyncio.Lock())
         if lock.locked() and kwargs.get("before_native") is None:
             await self._post(
@@ -551,7 +597,30 @@ class MattermostGateway:
             )
             return None
         async with lock:
+            if self.draining and kwargs.get("before_native") is not None:
+                return {"queued": True}
             return await self._run_prompt(thread_id=thread_id, **kwargs)
+
+    def maintenance_state(self):
+        pending = sum(
+            bool(report.get("active") or report["reporter"].has_pending_work())
+            for report in self._reports.values()
+        )
+        state = {
+            "draining": self.draining,
+            "sealed": self.sealed,
+            "foreground": len(getattr(self.sessions, "busy_threads", ())),
+            "responses": sum(lock.locked() for lock in self._prompt_locks.values()),
+            "inbound": len(self._inbound_tasks),
+            "commands": self._active_controls + len(self._slash_tasks),
+            "native_rpc": len(getattr(self.sessions.broker, "_pending", {})),
+            "background": pending,
+            "collaboration": len(self.collaboration.workers) if self.collaboration else 0,
+        }
+        state["idle"] = not any(
+            value for key, value in state.items() if key not in {"draining", "sealed"}
+        )
+        return state
 
     async def _run_prompt(
         self,
@@ -835,6 +904,8 @@ class MattermostGateway:
             status.render(phase="done", stop_reason=result.stop_reason, extra=extra),
             force=True,
         )
+        receipt["response_delivered"] = True
+        logger.info("response complete thread=%s session=%s", thread_id, result.session_id)
         return receipt
 
     async def _root_preview(self, thread_id: str) -> tuple[str, str]:
@@ -1060,9 +1131,9 @@ class MattermostGateway:
             f"🔀 `{plan.old_harness}` → `{plan.new_harness}` (model `{plan.model}`). "
             f"Restarting{wait_note}."
         )
-        asyncio.create_task(
+        self._track_control(
             self._restart_when_idle(thread_id, channel_id, user_id),
-            name="harness-switch-restart",
+            "harness-switch-restart",
         )
 
     async def _restart_when_idle(

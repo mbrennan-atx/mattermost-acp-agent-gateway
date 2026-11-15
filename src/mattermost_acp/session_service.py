@@ -14,6 +14,7 @@ from typing import Literal
 from urllib.parse import quote
 
 from mattermost_acp.acp import AcpBroker, AcpError, SessionUpdate, TurnResult
+from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.channel_context import session_meta_rules
 from mattermost_acp.commands.models_catalog import fetch_catalog
 from mattermost_acp.model_router import ModelRouter, RouteRequest
@@ -141,11 +142,18 @@ class SessionService:
         self._global_sem = asyncio.Semaphore(max_parallel_turns)
         self._busy: set[str] = set()
         self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._native_epochs: dict[str, int] = {}
         # Threads whose live ACP model has been synced this agent process.
         self._pinned: set[str] = set()
 
     def is_busy(self, thread_id: str) -> bool:
         return thread_id in self._busy
+
+    def native_epoch(self, thread_id: str) -> int:
+        return self._native_epochs.get(thread_id, 0)
+
+    def _advance_native(self, thread_id: str) -> None:
+        self._native_epochs[thread_id] = self.native_epoch(thread_id) + 1
 
     @property
     def busy_threads(self) -> frozenset[str]:
@@ -199,9 +207,7 @@ class SessionService:
             record = None
 
         if record is None:
-            model, effort, source = await self.store.model_preference(
-                thread_id, channel_id
-            )
+            model, effort, source = await self.store.model_preference(thread_id, channel_id)
             if source == "configuration" and route is not None:
                 model, effort = await self._route(thread_id, route, model, effort)
             return await self._create_and_pin(
@@ -254,9 +260,7 @@ class SessionService:
             )
             record = await self.store.get(thread_id)
             assert record is not None
-        desired_model, desired_effort, _ = await self.store.model_preference(
-            thread_id, channel_id
-        )
+        desired_model, desired_effort, _ = await self.store.model_preference(thread_id, channel_id)
         await self._sync_live_model(
             thread_id,
             record.session_id,
@@ -282,6 +286,7 @@ class SessionService:
             raise RuntimeError("This thread already has a turn in progress. Use /stop.")
 
         async with self._thread_locks.setdefault(thread_id, asyncio.Lock()), self._global_sem:
+            self._advance_native(thread_id)
             self._busy.add(thread_id)
             self._write_busy_marker()
             try:
@@ -290,29 +295,39 @@ class SessionService:
                 )
                 if before_prompt is not None and not await before_prompt(session_id):
                     return TurnResult(
-                        session_id=session_id, stop_reason="cancelled",
-                        answer_text="Cancelled before native dispatch", thought_text="",
+                        session_id=session_id,
+                        stop_reason="cancelled",
+                        answer_text="Cancelled before native dispatch",
+                        thought_text="",
                     )
-                result = await self.broker.prompt_turn(
-                    session_id, prompt, on_update=on_update
-                )
+                result = await self.broker.prompt_turn(session_id, prompt, on_update=on_update)
                 if result.model_id:
                     record = await self.store.get(thread_id)
                     cwd = record.cwd if record else str(self.default_cwd)
                     if record is None or record.model != result.model_id:
-                        await self.store.save(
-                            thread_id, session_id, cwd, model=result.model_id
-                        )
+                        await self.store.save(thread_id, session_id, cwd, model=result.model_id)
                 return result
             finally:
                 self._busy.discard(thread_id)
                 self._write_busy_marker()
 
-    async def hint(self, thread_id: str, text: str) -> str:
+    async def hint(
+        self, thread_id: str, text: str, *, expected_session=None, expected_epoch=None, guard=None
+    ) -> str:
         """Use the already loaded session; never resume or reconfigure active work."""
         record = await self.store.get(thread_id)
         if record is None or not self.broker.is_running:
             raise AcpError("No active agent session here. Send a normal message to start work.")
+        if expected_session is not None:
+            if record.session_id != expected_session:
+                raise NativeDispatchChanged("Native session changed before injection")
+            return await self.broker.steer(
+                expected_session,
+                text,
+                guard=lambda: (
+                    self.native_epoch(thread_id) == expected_epoch and (guard is None or guard())
+                ),
+            )
         return await self.broker.steer(record.session_id, text)
 
     async def switch_model(
@@ -367,14 +382,10 @@ class SessionService:
         )
         if scope == "thread":
             resolved_channel = channel_id or (record.channel_id if record else None)
-            await self.store.set_thread_override(
-                thread_id, resolved_channel, model_id, effort
-            )
+            await self.store.set_thread_override(thread_id, resolved_channel, model_id, effort)
         elif scope == "channel":
             assert channel_id is not None
-            await self.store.set_model_setting(
-                f"channel:{channel_id}", model_id, effort
-            )
+            await self.store.set_model_setting(f"channel:{channel_id}", model_id, effort)
         else:
             await self.store.set_model_setting("harness", model_id, effort)
         self._pinned.add(thread_id)
@@ -400,9 +411,7 @@ class SessionService:
         try:
             await self.broker.prompt_turn(session_id, COMPACT_PROMPT)
         except AcpError as exc:
-            logger.warning(
-                "pre-switch compaction failed session=%s: %s", session_id, exc
-            )
+            logger.warning("pre-switch compaction failed session=%s: %s", session_id, exc)
             return "failed"
         return "compacted"
 
@@ -415,25 +424,29 @@ class SessionService:
         """
         session_id = await self.ensure_session(thread_id)
         record = await self.store.get(thread_id)
-        model_id = (
-            (record.model if record else None)
-            or self.default_model
-            or "grok-4.5"
-        )
-        resolved = await self.broker.set_model(
-            session_id, model_id, effort=effort
-        )
+        model_id = (record.model if record else None) or self.default_model or "grok-4.5"
+        resolved = await self.broker.set_model(session_id, model_id, effort=effort)
         cwd = record.cwd if record else str(self.default_cwd)
-        await self.store.save(
-            thread_id, session_id, cwd, model=resolved, effort=effort
-        )
+        await self.store.save(thread_id, session_id, cwd, model=resolved, effort=effort)
         self._pinned.add(thread_id)
         return resolved, effort
 
-    async def cancel(self, thread_id: str) -> bool:
+    async def cancel(
+        self, thread_id: str, *, expected_session=None, expected_epoch=None, guard=None
+    ) -> bool:
         record = await self.store.get(thread_id)
         if record is None:
             return False
+        if expected_session is not None:
+            if record.session_id != expected_session:
+                raise NativeDispatchChanged("Native session changed before cancellation")
+            await self.broker.cancel(
+                expected_session,
+                guard=lambda: (
+                    self.native_epoch(thread_id) == expected_epoch and (guard is None or guard())
+                ),
+            )
+            return True
         await self.broker.cancel(record.session_id)
         return True
 
@@ -445,6 +458,7 @@ class SessionService:
         channel_id: str | None = None,
     ) -> str:
         """Close current ACP session (if any) and start fresh."""
+        self._advance_native(thread_id)
         await self.broker.start()
         record = await self.store.get(thread_id)
         work_cwd = Path(record.cwd) if record else (cwd or self.default_cwd)
@@ -457,9 +471,7 @@ class SessionService:
                 pass
             await self.broker.session_close(record.session_id)
 
-        desired_model, desired_effort, _ = await self.store.model_preference(
-            thread_id, channel_id
-        )
+        desired_model, desired_effort, _ = await self.store.model_preference(thread_id, channel_id)
         self._pinned.discard(thread_id)
         return await self._create_and_pin(
             thread_id,
@@ -489,13 +501,19 @@ class SessionService:
                         break
         if backend == "cursor":
             from mattermost_acp.commands.cursor_models import model_effort
+
             effort = model_effort(model) or effort
         if backend == "grok":
             if record:
-                effort = discover_session_model(
-                    record.session_id, Path(record.cwd), grok_home=self.grok_home,
-                    field="reasoning_effort",
-                ) or effort
+                effort = (
+                    discover_session_model(
+                        record.session_id,
+                        Path(record.cwd),
+                        grok_home=self.grok_home,
+                        field="reasoning_effort",
+                    )
+                    or effort
+                )
             if not effort:
                 try:
                     config = tomllib.loads(
@@ -512,7 +530,8 @@ class SessionService:
             "model": model,
             "effort": effort,
             "subagents": [u.raw for u in self.broker.subagents.snapshots(record.session_id)]
-            if record and hasattr(self.broker, "subagents") else [],
+            if record and hasattr(self.broker, "subagents")
+            else [],
             "busy": thread_id in self._busy,
             "agent_running": self.broker.is_running,
         }
@@ -526,9 +545,8 @@ class SessionService:
         effort: str | None,
         channel_id: str | None,
     ) -> str:
-        session_id = await self.broker.session_new(
-            work_cwd, meta=self._new_session_meta()
-        )
+        self._advance_native(thread_id)
+        session_id = await self.broker.session_new(work_cwd, meta=self._new_session_meta())
         pinned = await self._pin_or_discover(
             session_id,
             work_cwd,
@@ -572,9 +590,7 @@ class SessionService:
             is_new=False,
         )
         if pinned and pinned != stored_model:
-            await self.store.save(
-                thread_id, session_id, str(work_cwd), model=pinned
-            )
+            await self.store.save(thread_id, session_id, str(work_cwd), model=pinned)
         self._pinned.add(thread_id)
 
     async def _pin_or_discover(
@@ -595,9 +611,7 @@ class SessionService:
         """
         if stored_model:
             try:
-                return await self.broker.set_model(
-                    session_id, stored_model, effort=stored_effort
-                )
+                return await self.broker.set_model(session_id, stored_model, effort=stored_effort)
             except AcpError as exc:
                 logger.warning(
                     "set_model(%s) failed session=%s: %s",
@@ -607,9 +621,7 @@ class SessionService:
                 )
 
         if not is_new:
-            live = discover_session_model(
-                session_id, work_cwd, grok_home=self.grok_home
-            )
+            live = discover_session_model(session_id, work_cwd, grok_home=self.grok_home)
             if live:
                 return live
             return stored_model
@@ -617,9 +629,7 @@ class SessionService:
         desired = await self._resolve_default_model()
         if desired:
             try:
-                return await self.broker.set_model(
-                    session_id, desired, effort=stored_effort
-                )
+                return await self.broker.set_model(session_id, desired, effort=stored_effort)
             except AcpError as exc:
                 logger.warning(
                     "pin default model %s failed session=%s: %s",

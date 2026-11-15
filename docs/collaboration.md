@@ -21,7 +21,7 @@ MATTERMOST_COLLAB_URL=http://127.0.0.1:18780
 MATTERMOST_COLLAB_TOKEN_FILE=/path/to/that/actors/private/token
 ```
 
-The gateway's native shell inherits these settings, so `mm-work` uses the same actor credential. A gateway without `MATTERMOST_COLLAB_URL` retains its previous behavior and needs no collaboration service. Credentials never enter model prompts.
+The gateway's native shell inherits these settings, so `mm-work` uses the same actor credential. Request prompts supply the absolute installed command path, including virtual-environment installs. A gateway without `MATTERMOST_COLLAB_URL` retains its previous behavior and needs no collaboration service. Credentials never enter model prompts. Choose another free port with `--port` and use that port in each gateway's URL when the default is occupied.
 
 ## Share a project
 
@@ -31,7 +31,7 @@ Create the project from the owner assistant's environment. Copy the originating 
 mm-work create --title 'Build investigation' --objective 'Find the failing dependency and verify a fix' --members assistant-a,assistant-b --origin-thread example-origin --origin-channel example-home --key example-project-key
 ```
 
-The command creates and reads back a discussion root on the configured Agents floor. It returns the project ID and participant bindings. The owner receives results in its originating thread; other participants have independent native sessions in the floor discussion. Membership alone starts no model work.
+The hub persists creation intent before creating and reading back a discussion root on the configured Agents floor. Concurrent retries share the same intent. A saved post ID survives read-back or project-persistence failure. If posting itself is uncertain, creation stays unconfirmed instead of posting another root; inspect the floor and repeat the same key with `--discussion-thread EXISTING_ROOT` to reconcile. A changed explicit root is rejected. The command returns the project ID and participant bindings. The owner receives results in its originating thread; other participants have independent native sessions in the floor discussion. Membership alone starts no model work.
 
 Assign a request or make a task available for a participant to claim:
 
@@ -87,7 +87,7 @@ mm-work retry REQUEST_ID --reconciliation 'Verified the previous attempt made no
 
 Retry retains old dispatch evidence as history and clears it for the new attempt. It creates a new claim nonce, so an old worker cannot settle the new attempt. Reply submission is idempotent for the same result. Keep completed work and evidence when rolling back the executable; never restore an older database over newer state.
 
-Default project limits are three simultaneous collaboration requests, 24 allocated requests, delegation depth two and one hour. Set other positive limits with the create command's `--max-workers`, `--max-turns`, `--max-depth` and `--max-seconds` options. Dependencies block dispatch until their requests finish successfully. Result and cancellation deliveries bypass the worker limit so a full project can still settle.
+Default project limits are three worker slots, 24 allocated requests, delegation depth two and one hour. A running parent may borrow one descendant slot when the worker limit is full, so a parent waiting for its peer does not deadlock. Active sibling loans serialize. The hard total ceiling is workers multiplied by depth plus one, nine requests at defaults. Set other positive limits with the create command's `--max-workers`, `--max-turns`, `--max-depth` and `--max-seconds` options. Dependencies block dispatch until their requests finish successfully. Result and cancellation deliveries bypass the worker limit so a full project can still settle.
 
 Request-count limits bound collaboration activation. They do not enforce an exact dollar budget or limit native subagents launched inside a harness. Provider cost coverage is currently unknown and is recorded that way in project state.
 
@@ -99,4 +99,8 @@ mm-work cancel PROJECT_ID
 
 Stopping the owner's originating thread also requests cancellation for its linked projects. Queued work cancels immediately. Result deliveries and requests addressed to the owner stop routing without cancelling the owner's ongoing conversation. For active worker work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session or native turn replaced it, or the gateway cannot prove turn ownership after a restart, cancellation stays blocked to preserve that work. Reconcile its native outcome before proceeding.
 
-A native result racing cancellation is retained as completed work. It does not establish that effects were prevented. The project remains `cancelling` while any execution lacks terminal evidence; the state makes that uncertainty visible. Cancellation of one project preserves unrelated sessions and projects.
+A native result racing cancellation is retained as completed work. Conflicting repeated results are rejected. It does not establish that effects were prevented. Cancellation controls requeue after transport interruption. Session and execution guards are checked immediately before writing native controls, so session replacement cannot redirect a reserved cancellation or injection. The project remains `cancelling` while any execution lacks terminal evidence; the state makes that uncertainty visible. Cancellation of one project preserves unrelated sessions and projects.
+
+## Gateway maintenance
+
+Participating gateways expose a loopback-only `POST /maintenance` on their slash listener, authenticated with that gateway's collaboration actor token. `state` returns foreground, full response delivery, inbound, command, native RPC, background and collaboration counters. `drain` pauses new model work while allowing stop commands. `seal` requires drained idle state and atomically blocks every new native control, including stop. `resume` clears both flags. Deployment tooling can seal admission before freezing and replacing a verified idle process; it must preserve the current native databases and provider configuration.

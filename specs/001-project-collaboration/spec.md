@@ -18,7 +18,7 @@ Acceptance: active injection preserves the native session and model; unsupported
 
 ### US3: Bound and cancel a project (P1)
 
-The owner sets concurrent-worker, dispatch-count, delegation-depth and elapsed-time limits. Cancelling the project or stopping its originating thread blocks new work and requests cancellation of its active sessions, preserving unrelated work.
+The owner sets worker-slot, dispatch-count, delegation-depth and elapsed-time limits. A full worker pool permits one descendant loan per running parent, serializes active sibling loans and enforces the hard total ceiling `max_workers * (max_depth + 1)`. Cancelling the project or stopping its originating thread blocks new work and requests cancellation of its active sessions, preserving unrelated work.
 
 Acceptance: limits are enforced across assistants; queued requests cancel immediately; active requests remain cancelling until terminal evidence arrives; unrelated sessions keep running.
 

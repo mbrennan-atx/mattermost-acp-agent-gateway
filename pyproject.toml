@@ -53,6 +53,7 @@ include = [
     "/docs/collaboration.md",
     "/src/mattermost_acp/collaboration/*.py",
     "/tests/test_collaboration.py",
+    "/tests/test_collaboration_regressions.py",
     "/specs/001-project-collaboration/**",
     "/.env.example",
     "/.github/workflows/checks.yml",

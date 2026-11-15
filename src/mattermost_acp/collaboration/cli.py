@@ -10,45 +10,11 @@ import sys
 import uuid
 from pathlib import Path
 
-import aiohttp
-
 from mattermost_acp.collaboration.client import HubClient, Settings
-from mattermost_acp.config import Config
 
 
 def content(args):
     return Path(args.text_file).read_text() if args.text_file else args.text
-
-
-async def create_discussion(args):
-    config = Config.load()
-    base, floor, token = (
-        config.mattermost_url.rstrip("/"),
-        config.peer_channel_id,
-        config.mattermost_token,
-    )
-    if not base or not floor or not token:
-        raise ValueError(
-            "Mattermost URL, floor and actor token file are required to create discussion"
-        )
-    async with aiohttp.ClientSession(
-        headers={"Authorization": "Bearer " + token}, timeout=aiohttp.ClientTimeout(total=20)
-    ) as session:
-        body = {
-            "channel_id": floor,
-            "message": ("Project collaboration: " + args.title + "\n\n" + args.objective).replace(
-                "@", "@\u200b"
-            ),
-        }
-        async with session.post(base + "/api/v4/posts", json=body) as response:
-            if response.status >= 400:
-                raise ValueError("Mattermost discussion creation failed")
-            post = await response.json()
-        async with session.get(base + "/api/v4/posts/" + post["id"]) as response:
-            verified = await response.json()
-            if response.status >= 400 or verified.get("channel_id") != floor:
-                raise ValueError("Mattermost discussion read-back failed")
-        return floor, post["id"]
 
 
 async def execute(args, hub):
@@ -59,7 +25,9 @@ async def execute(args, hub):
         return await hub.request("GET", f"/projects/{args.project}")
     if command == "create":
         actor = (await hub.request("GET", "/identity"))["actor"]
-        members = args.members.split(",") if args.members else await hub.request("GET", "/actors")
+        members = sorted(
+            set(args.members.split(",") if args.members else await hub.request("GET", "/actors"))
+        )
         body = {
             "title": args.title,
             "objective": args.objective,
@@ -88,16 +56,14 @@ async def execute(args, hub):
                     raise ValueError("Conflicting project creation key")
                 if set(existing["members"]) != set(members):
                     raise ValueError("Conflicting project membership for creation key")
+                if args.discussion_thread and existing["thread_id"] != args.discussion_thread:
+                    raise ValueError("Conflicting project discussion for creation key")
                 return existing
-        if args.discussion_thread:
-            channel, thread = (
-                os.environ.get("MATTERMOST_PEER_CHANNEL_ID", ""),
-                args.discussion_thread,
-            )
-        else:
-            channel, thread = await create_discussion(args)
-        body.update(channel_id=channel, thread_id=thread)
-        return await hub.request("POST", "/projects", body)
+        body.update(
+            channel_id=os.environ.get("MATTERMOST_PEER_CHANNEL_ID", ""),
+            thread_id=args.discussion_thread,
+        )
+        return await hub.request("POST", "/creations", body)
     if command in {"ask", "task"}:
         recipient = args.recipient if command == "ask" else args.to
         return await hub.request(

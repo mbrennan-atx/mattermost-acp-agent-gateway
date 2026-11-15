@@ -66,6 +66,10 @@ class AcpError(RuntimeError):
         self.data = data
 
 
+class NativeDispatchChanged(AcpError):
+    """A guarded control was rejected before any bytes reached the adapter."""
+
+
 def _format_rpc_error(err: Any) -> str:
     """Human-readable text for a JSON-RPC error object.
 
@@ -213,16 +217,12 @@ class AcpBroker:
         self.prompt_idle_timeout_s = (
             prompt_idle_timeout_s
             if prompt_idle_timeout_s is not None
-            else _env_float(
-                "ACP_PROMPT_IDLE_TIMEOUT_SEC", _DEFAULT_PROMPT_IDLE_TIMEOUT_S
-            )
+            else _env_float("ACP_PROMPT_IDLE_TIMEOUT_SEC", _DEFAULT_PROMPT_IDLE_TIMEOUT_S)
         )
         self.prompt_hard_max_s = (
             prompt_hard_max_s
             if prompt_hard_max_s is not None
-            else _env_float(
-                "ACP_PROMPT_HARD_MAX_SEC", _DEFAULT_PROMPT_HARD_MAX_S
-            )
+            else _env_float("ACP_PROMPT_HARD_MAX_SEC", _DEFAULT_PROMPT_HARD_MAX_S)
         )
 
         self._proc: asyncio.subprocess.Process | None = None
@@ -300,9 +300,7 @@ class AcpBroker:
                 )
 
             assert self._proc.stdout is not None
-            self._reader_task = asyncio.create_task(
-                self._read_loop(), name="acp-broker-reader"
-            )
+            self._reader_task = asyncio.create_task(self._read_loop(), name="acp-broker-reader")
             # Drain stderr in background so the pipe cannot fill
             if self._proc.stderr is not None:
                 asyncio.create_task(self._drain_stderr(self._proc.stderr), name="acp-stderr")
@@ -372,6 +370,7 @@ class AcpBroker:
         params: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        guard: Callable[[], bool] | None = None,
     ) -> Any:
         if self._proc is None or self._proc.stdin is None:
             raise AcpError("agent process is not running")
@@ -383,12 +382,14 @@ class AcpBroker:
         self._pending[req_id] = fut
 
         msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
-        await self._write(msg)
-
         # None → control-plane default. session/prompt passes a hard max; idle
         # kill for prompts is owned by prompt_turn (resets on tool completion).
         wait_s = self.rpc_timeout_s if timeout is None else timeout
         try:
+            if guard is None:
+                await self._write(msg)
+            else:
+                await self._write(msg, guard=guard)
             return await asyncio.wait_for(fut, timeout=wait_s)
         except TimeoutError as exc:
             self._pending.pop(req_id, None)
@@ -396,12 +397,14 @@ class AcpBroker:
         except asyncio.CancelledError:
             self._pending.pop(req_id, None)
             raise
+        finally:
+            self._pending.pop(req_id, None)
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         await self._write(msg)
 
-    async def steer(self, session_id: str, text: str) -> str:
+    async def steer(self, session_id: str, text: str, *, guard=None) -> str:
         """Inject into a live turn without taking its lock or starting a turn.
 
         The idle opt-in keeps a turn-completion race from launching an
@@ -423,6 +426,7 @@ class AcpBroker:
                 "prompt": [{"type": "text", "text": text.strip()}],
                 "_meta": {"steering": {"idleBehavior": "promptRequired"}},
             },
+            **({"guard": guard} if guard is not None else {}),
         )
         outcome = result.get("outcome") if isinstance(result, dict) else None
         if outcome not in {"injected", "promptRequired"}:
@@ -494,10 +498,16 @@ class AcpBroker:
         """
         if self.backend == "cursor":
             from mattermost_acp.commands.cursor_models import with_effort
+
             model_id = with_effort(model_id, effort)
-            result = await self.request("session/set_config_option", {
-                "sessionId": session_id, "configId": "model", "value": model_id,
-            })
+            result = await self.request(
+                "session/set_config_option",
+                {
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model_id,
+                },
+            )
             self._remember_config(session_id, result)
             for option in self.session_config_options.get(session_id, []):
                 if option.get("id") == "model":
@@ -571,8 +581,14 @@ class AcpBroker:
         except AcpError as exc:
             logger.warning("session/close failed for %s: %s", session_id, exc)
 
-    async def cancel(self, session_id: str) -> None:
-        await self.notify("session/cancel", {"sessionId": session_id})
+    async def cancel(self, session_id: str, *, guard=None) -> None:
+        if guard is None:
+            await self.notify("session/cancel", {"sessionId": session_id})
+        else:
+            await self._write(
+                {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}},
+                guard=guard,
+            )
 
     async def prompt_turn(
         self,
@@ -731,11 +747,13 @@ class AcpBroker:
                 model_id=model_id,
             )
 
-    async def _write(self, msg: dict[str, Any]) -> None:
+    async def _write(self, msg: dict[str, Any], *, guard=None) -> None:
         if self._proc is None or self._proc.stdin is None:
             raise AcpError("agent process is not running")
         line = json.dumps(msg, separators=(",", ":")) + "\n"
         async with self._write_lock:
+            if guard is not None and not guard():
+                raise NativeDispatchChanged("Native execution changed before control dispatch")
             self._proc.stdin.write(line.encode("utf-8"))
             await self._proc.stdin.drain()
 
@@ -793,11 +811,19 @@ class AcpBroker:
                 # Mattermost answers arrive on a later turn. Never invent a user
                 # selection or silently approve a plan requiring explicit approval.
                 outcome = "skipped" if method == "cursor/ask_question" else "rejected"
-                await self._write({"jsonrpc": "2.0", "id": req_id, "result": {
-                    "outcome": {"outcome": outcome, "reason":
-                        "Present this question or plan in your chat response "
-                        "and wait for the user's next message."}
-                }})
+                await self._write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "outcome": {
+                                "outcome": outcome,
+                                "reason": "Present this question or plan in your chat response "
+                                "and wait for the user's next message.",
+                            }
+                        },
+                    }
+                )
                 return
             logger.warning(
                 "Rejecting unsupported ACP server request method=%s id=%s",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ class HubClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.session = aiohttp.ClientSession(
+            json_serialize=lambda value: json.dumps(value, ensure_ascii=False),
             headers={"Authorization": "Bearer " + settings.token},
             timeout=aiohttp.ClientTimeout(total=25),
         )

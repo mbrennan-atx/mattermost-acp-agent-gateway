@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 
 import aiohttp
@@ -74,6 +76,39 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
     app.router.add_post("/slash", slash)
     app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
 
+    async def maintenance(request):
+        gateway = getattr(handler, "__self__", None)
+        consumer = getattr(gateway, "collaboration", None)
+        if consumer is None:
+            raise web.HTTPNotFound()
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if (
+            not request.remote
+            or not ipaddress.ip_address(request.remote).is_loopback
+            or not secrets.compare_digest(token.encode(), consumer.hub.settings.token.encode())
+        ):
+            raise web.HTTPUnauthorized()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest() from None
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest()
+        action = body.get("action", "state")
+        if not isinstance(action, str) or action not in {"state", "drain", "resume", "seal"}:
+            raise web.HTTPBadRequest()
+        if action == "seal":
+            if not gateway.draining or not gateway.maintenance_state()["idle"]:
+                raise web.HTTPConflict(text="Gateway must be drained and idle")
+            gateway.sealed = True
+        elif action != "state":
+            gateway.draining = action == "drain"
+            if action == "resume":
+                gateway.sealed = False
+        return web.json_response(gateway.maintenance_state())
+
+    app.router.add_post("/maintenance", maintenance)
+
     async def autocomplete_models(request: web.Request) -> web.Response:
         """Plugin dynamic-list lookup: ``[]AutocompleteListItem`` JSON.
 
@@ -94,22 +129,16 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
     return app
 
 
-async def start_slash_site(
-    config: Config, handler: SlashHandler
-) -> web.AppRunner | None:
+async def start_slash_site(config: Config, handler: SlashHandler) -> web.AppRunner | None:
     if config.slash_port <= 0:
         logger.info("Slash HTTP disabled (MATTERMOST_SLASH_PORT<=0)")
         return None
     if not config.slash_tokens:
-        logger.warning(
-            "Slash HTTP listening but MATTERMOST_SLASH_TOKEN is empty — all posts 401"
-        )
+        logger.warning("Slash HTTP listening but MATTERMOST_SLASH_TOKEN is empty — all posts 401")
     app = build_slash_app(config, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, config.slash_host, config.slash_port)
     await site.start()
-    logger.info(
-        "Slash HTTP on http://%s:%s/slash", config.slash_host, config.slash_port
-    )
+    logger.info("Slash HTTP on http://%s:%s/slash", config.slash_host, config.slash_port)
     return runner

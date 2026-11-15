@@ -104,6 +104,7 @@ tests/test_chunk.py
 tests/test_codex_catalog.py
 tests/test_codex_steering_patch.py
 tests/test_collaboration.py
+tests/test_collaboration_regressions.py
 tests/test_commands.py
 tests/test_config.py
 tests/test_cursor.py

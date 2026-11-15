@@ -43,8 +43,11 @@ def build_app(
     *,
     verify_post=None,
     verify_recipient=None,
+    create_post=None,
+    verify_creation=None,
 ) -> web.Application:
     changed = asyncio.Event()
+    creation_lock = asyncio.Lock()
 
     @web.middleware
     async def authorize(request, handler):
@@ -56,7 +59,7 @@ def build_app(
             (
                 name
                 for name, settings in actors.items()
-                if token and secrets.compare_digest(token, settings["token"])
+                if token and secrets.compare_digest(token.encode(), settings["token"].encode())
             ),
             None,
         )
@@ -77,13 +80,84 @@ def build_app(
             changed.set()
         return result
 
-    app = web.Application(middlewares=[authorize], client_max_size=65536)
+    app = web.Application(middlewares=[authorize], client_max_size=262144)
 
     async def projects(request):
         actor = request["actor"]
         if request.method == "GET":
             return web.json_response(store.list_projects(actor))
         return web.json_response(store.create_project(actor, await request.json()))
+
+    async def creations(request):
+        actor = request["actor"]
+        body = await request.json()
+        async with creation_lock:
+            intent, fresh = store.prepare_creation(actor, body)
+            explicit = body.get("thread_id")
+            if explicit:
+                if intent.get("thread_id") and intent["thread_id"] != explicit:
+                    raise ValueError("Conflicting project discussion for creation key")
+                intent["thread_id"] = explicit
+                store.save_creation(actor, body["key"], intent)
+            if not intent.get("thread_id"):
+                if not fresh:
+                    raise ValueError(
+                        "Discussion posting is unconfirmed; reconcile with --discussion-thread"
+                    )
+                settings = actors[actor]
+                if create_post is not None:
+                    post = await create_post(actor, body)
+                else:
+                    base = settings.get("mattermost_url")
+                    path = settings.get("mattermost_token_file")
+                    if not base or not path:
+                        raise ValueError("Mattermost posting configuration required")
+                    token = Path(path).expanduser().read_text().strip()
+                    async with aiohttp.ClientSession(
+                        headers={"Authorization": "Bearer " + token},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as session:
+                        message = (
+                            "Project collaboration: " + body["title"] + "\n\n" + body["objective"]
+                        ).replace("@", "@\u200b")
+                        async with session.post(
+                            base.rstrip("/") + "/api/v4/posts",
+                            json={"channel_id": body["channel_id"], "message": message},
+                        ) as response:
+                            if response.status >= 400:
+                                raise ValueError("Discussion creation was not confirmed")
+                            post = await response.json()
+                if post.get("channel_id") != body["channel_id"] or not post.get("id"):
+                    raise ValueError("Discussion creation was not confirmed")
+                intent["thread_id"] = post["id"]
+                intent["status"] = "posted"
+                store.save_creation(actor, body["key"], intent)
+            settings = actors[actor]
+            if verify_creation is not None:
+                verified = await verify_creation(actor, intent["thread_id"])
+            elif settings.get("mattermost_url") and settings.get("mattermost_token_file"):
+                token = Path(settings["mattermost_token_file"]).expanduser().read_text().strip()
+                async with aiohttp.ClientSession(
+                    headers={"Authorization": "Bearer " + token},
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as session:
+                    async with session.get(
+                        settings["mattermost_url"].rstrip("/")
+                        + "/api/v4/posts/"
+                        + intent["thread_id"]
+                    ) as response:
+                        if response.status != 200:
+                            raise ValueError("Discussion read-back failed")
+                        verified = await response.json()
+            else:
+                verified = {"id": intent["thread_id"], "channel_id": body["channel_id"]}
+            if (
+                verified.get("id") != intent["thread_id"]
+                or verified.get("channel_id") != body["channel_id"]
+                or verified.get("root_id")
+            ):
+                raise ValueError("Discussion read-back did not match its root binding")
+            return web.json_response(store.finish_creation(actor, intent))
 
     async def show(request):
         store.expire()
@@ -246,6 +320,7 @@ def build_app(
     app.router.add_get("/identity", identity)
     app.router.add_get("/healthz", health)
     app.router.add_route("*", "/projects", projects)
+    app.router.add_post("/creations", creations)
     app.router.add_get("/projects/{pid}", show)
     app.router.add_post("/projects/{pid}/{action}", project_action)
     app.router.add_get("/messages/{mid}", message)

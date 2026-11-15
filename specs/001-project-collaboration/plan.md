@@ -8,6 +8,8 @@ Python 3.12, existing aiohttp transport and SQLite runtime persistence. Add an o
 
 Generic source contains synthetic examples only. Private deployment supplies actor credentials, roster and instructions. Collaboration is disabled without explicit environment selectors. Durable receipts, bounded dispatch and native-thread locks are required. Candidate releases are immutable; busy gateways activate only at verified idle boundaries.
 
+Creation intent precedes Mattermost posting. Saved root IDs survive read-back/persistence failures; uncertain posting requires explicit-root reconciliation. Native cancellation and steering validate session epochs and execution ownership inside the broker write lock. A saturated pool loans one bounded descendant slot per running parent. Authenticated drain/seal maintenance blocks admission before frozen replacement.
+
 ## Design
 
 The hub owns project membership, participant thread/workspace bindings, tasks/questions, result receipts and notes. Per-actor bearer credentials map to the declared deployment roster. Gateways long-poll their mailbox, claim requests with instance-fenced leases, try active-only steering, and otherwise use a serialized normal continuation. Ambiguous injection remains unconfirmed. Leases that expire become interrupted; explicit retry follows reconciliation.

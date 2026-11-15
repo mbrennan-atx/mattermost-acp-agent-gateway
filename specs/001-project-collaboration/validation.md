@@ -35,3 +35,11 @@ SC-001 through SC-003 require that live evidence. Local tests establish implemen
 - Successful requests now require an explicit correlated reply, including quiet native goals. Foreground output remains evidence rather than completion.
 - Additional contracts cover a pending-work check under the native-thread lock, background activity becoming pending again, running-request native cancellation, and peer evidence surviving result requeue.
 - All nine supported findings from the second Sol review were addressed. Final-source review and hosted CI remain required.
+
+## Guarded controls and durable creation
+
+- Python 3.12.15 and locked dependencies: full suite 410 passed with one optional fixture skipped in 44.40 seconds. Two additional evidence/cancellation regressions bring the focused new suite to 32 passing tests.
+- The third Sol review's 12 supported findings have fixes and regression coverage: installed command paths, retry ownership, guarded native controls, interrupted cancellation, injected failure, early-reply evidence, attempt artifacts, bounded descendant dispatch, durable creation, explicit-root conflicts and conflicting late replies.
+- Evidence enrichment updates the existing result delivery without duplicating it. Foreground observation continues after an injected early reply until its actual receipt is available.
+- Maintenance reports all seven activity counters and atomically seals drained idle admission. Startup recovery and delayed harness-control tasks are included.
+- Final committed-source review, hosted CI, export/install parity and live activation remain pending.
