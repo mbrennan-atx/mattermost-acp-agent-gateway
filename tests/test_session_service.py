@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -10,7 +11,7 @@ from urllib.parse import quote
 import pytest
 from fake_agent import spawn_fake_agent_process
 
-from mattermost_acp.acp.broker import AcpBroker, AcpError
+from mattermost_acp.acp.broker import AcpBroker, AcpError, NativeDispatchChanged
 from mattermost_acp.commands.models_catalog import ModelCatalog, ModelInfo
 from mattermost_acp.session_service import SessionService, discover_session_model
 from mattermost_acp.store import ThreadStore
@@ -38,6 +39,31 @@ async def test_switch_model_updates_store(service: SessionService) -> None:
     record = await service.store.get(thread_id)
     assert record is not None
     assert record.model == "hub-claude-5-sonnet"
+
+
+async def test_compaction_fences_previous_project_cancellation(service):
+    sid = await service.ensure_session("compact-thread")
+    old_epoch = service.native_epoch("compact-thread")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_prompt = service.broker.prompt_turn
+    async def compact(session, prompt):
+        entered.set()
+        await release.wait()
+        return await original_prompt(session, prompt)
+    service.broker.prompt_turn = compact
+    task = asyncio.create_task(service._compact_history("compact-thread", sid))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert service.is_busy("compact-thread")
+        with pytest.raises(NativeDispatchChanged):
+            await service.cancel("compact-thread", expected_session=sid, expected_epoch=old_epoch)
+        release.set()
+        assert await task == "compacted"
+        assert not service.is_busy("compact-thread")
+        assert service.native_epoch("compact-thread") > old_epoch
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

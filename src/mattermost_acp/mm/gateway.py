@@ -101,6 +101,7 @@ class MattermostGateway:
         self._inbound_tasks = set()
         self._slash_tasks = set()
         self._active_controls = 0
+        self._harness_restart_task: asyncio.Task | None = None
         broker = getattr(self.sessions, "broker", None)
         if broker is not None:
             broker.update_observer = self._observe_background_update
@@ -626,7 +627,7 @@ class MattermostGateway:
         await reply(f"Unknown command `/{cmd}`. Try `/help`.")
 
     async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
-        if self.draining:
+        if self.draining or self.sealed:
             if kwargs.get("before_native") is not None:
                 return {"queued": True}
             await self._post(
@@ -644,8 +645,15 @@ class MattermostGateway:
             )
             return None
         async with lock:
-            if self.draining and kwargs.get("before_native") is not None:
-                return {"queued": True}
+            if self.draining or self.sealed:
+                if kwargs.get("before_native") is not None:
+                    return {"queued": True}
+                await self._post(
+                    kwargs["channel_id"],
+                    "Gateway updating. Retry this message shortly.",
+                    root_id=thread_id,
+                )
+                return None
             if (
                 kwargs.get("before_native") is not None
                 and self.collaboration is not None
@@ -1330,10 +1338,12 @@ class MattermostGateway:
             f"🔀 `{plan.old_harness}` → `{plan.new_harness}` (model `{plan.model}`). "
             "Saved. Automatic restart requires verified idle status."
         )
-        self._track_control(
-            self._restart_when_idle(thread_id, channel_id, user_id),
-            "harness-switch-restart",
-        )
+        pending_restart = getattr(self, "_harness_restart_task", None)
+        if pending_restart is None or pending_restart.done():
+            self._harness_restart_task = self._track_control(
+                self._restart_when_idle(thread_id, channel_id, user_id),
+                "harness-switch-restart",
+            )
 
     async def _restart_when_idle(
         self, thread_id: str, channel_id: str, user_id: str, *, timeout_s: float = 900

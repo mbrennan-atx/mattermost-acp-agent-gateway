@@ -69,7 +69,8 @@ def test_durable_request_and_idempotent_result(tmp_path):
     result = reopened.claim_next("alpha", "instance-2")
     assert result["kind"] == "result"
     assert result["text"] == "Found the missing dependency"
-    assert result["evidence"]["session"] == "native"
+    assert result["evidence"] == {}
+    assert result["result_evidence"]["session"] == "native"
     reopened.close()
 
 

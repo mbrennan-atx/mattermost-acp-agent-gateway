@@ -156,7 +156,10 @@ class CollaborationConsumer:
                                 continue
                             current = await self.hub.request("GET", "/messages/" + item["id"])
                             if current.get("claim") != key[1] or current["state"] not in {
-                                "running", "cancelling", "unconfirmed", "interrupted"
+                                "running",
+                                "cancelling",
+                                "unconfirmed",
+                                "interrupted",
                             }:
                                 continue
                             if current["state"] not in {"running", "cancelling"} or current.get(
@@ -232,7 +235,8 @@ class CollaborationConsumer:
             if cancelled_retry and report is not None and terminal:
                 evidence = next(
                     (
-                        prior for prior in reversed(state.get("delivery_history", []))
+                        prior
+                        for prior in reversed(state.get("delivery_history", []))
                         if prior.get("execution_id") == report.get("execution_id")
                         and prior.get("session_id") == terminal.get("session_id")
                     ),
@@ -420,9 +424,9 @@ class CollaborationConsumer:
                 and not terminal.get("pending")
                 and terminal.get("native_dispatched", True)
             ):
-                state = {
-                    "cancelled": "cancelled", "end_turn": "done"
-                }.get(terminal["stop_reason"], "failed")
+                state = {"cancelled": "cancelled", "end_turn": "done"}.get(
+                    terminal["stop_reason"], "failed"
+                )
                 evidence = self.foreground(item, terminal)
                 await self.update(
                     item,
@@ -612,8 +616,10 @@ class CollaborationConsumer:
                     if continuation is not None
                     else None,
                 )
-                if continuation is not None and result and (
-                    result.get("queued") or result.get("native_dispatched") is False
+                if (
+                    continuation is not None
+                    and result
+                    and (result.get("queued") or result.get("native_dispatched") is False)
                 ):
                     await self.rollback_continuation(continuation)
             finally:
@@ -861,9 +867,13 @@ class CollaborationConsumer:
             + f"\n\nRequest: `{item['parent']}`. "
             + f"Full result and evidence: `mm-work show {item['project']}`."
         ).replace("@", "@\u200b")
-        await self.update(
+        receipt = await self.update(
             item, "dispatch", evidence={"delivery": "posted", "origin_thread_id": thread}
         )
+        if receipt["state"] != "running" or receipt.get("claim") != item.get("claim"):
+            if receipt["state"] == "cancelling" and receipt.get("claim") == item.get("claim"):
+                await self.update(item, "queued")
+            return
         post = await self.gateway.client.create_post(channel, body, root_id=thread)
         await self.update(item, "heartbeat", evidence={"result_post_id": post["id"]})
         verified = await self.gateway.client.get_post(post["id"])

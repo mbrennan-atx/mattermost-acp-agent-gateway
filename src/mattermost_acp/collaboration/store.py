@@ -472,7 +472,8 @@ class CollaborationStore:
     def active_claims(self, actor, instance):
         rows = self.db.execute(
             "SELECT data FROM messages WHERE recipient=? AND state IN "
-            "('running','cancelling','unconfirmed','interrupted')", (actor,)
+            "('running','cancelling','unconfirmed','interrupted')",
+            (actor,),
         ).fetchall()
         return [item for row in rows if (item := json.loads(row[0])).get("instance") == instance]
 
@@ -604,8 +605,6 @@ class CollaborationStore:
                         if delivery.get("parent") != mid:
                             continue
                         delivery.setdefault("result_evidence", {}).update(evidence or {})
-                        if delivery["state"] == "queued":
-                            delivery["evidence"].update(evidence or {})
                         self.save_message(delivery)
                 return item
             if item["state"] in TERMINAL:
@@ -636,7 +635,7 @@ class CollaborationStore:
                 item["evidence"]["not_dispatched"] = True
             elif state == "queued" and item["state"] == "running":
                 item.setdefault("delivery_history", []).append(item["evidence"])
-                item["evidence"] = dict(item.get("result_evidence", {}))
+                item["evidence"] = {}
                 item.update(state="queued", not_before=self.clock() + 2)
             elif state in {"unconfirmed", "interrupted"}:
                 item["recovery"] = text(result, "recovery")
@@ -718,7 +717,7 @@ class CollaborationStore:
                 "state": "queued",
                 "created": self.clock(),
                 "attempt": 0,
-                "evidence": evidence,
+                "evidence": {},
                 "result_evidence": evidence,
                 "result_state": state,
             }
@@ -740,7 +739,7 @@ class CollaborationStore:
             project["dispatched"] += 1
             self.save_project(project)
             item.setdefault("delivery_history", []).append(item["evidence"])
-            item["evidence"] = dict(item.get("result_evidence", {}))
+            item["evidence"] = {}
             item.update(
                 state="queued",
                 reconciliation=text(reconciliation, "reconciliation"),

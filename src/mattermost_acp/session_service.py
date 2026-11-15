@@ -383,7 +383,7 @@ class SessionService:
         compaction: CompactionOutcome = "not_needed"
         if model_to_apply != active_model:
             if needs_history_compaction(active_model, model_to_apply):
-                compaction = await self._compact_history(session_id)
+                compaction = await self._compact_history(thread_id, session_id)
             active_model = await self.broker.set_model(
                 session_id, model_to_apply, effort=effort_to_apply
             )
@@ -413,7 +413,7 @@ class SessionService:
             active_model=active_model,
         )
 
-    async def _compact_history(self, session_id: str) -> CompactionOutcome:
+    async def _compact_history(self, thread_id: str, session_id: str) -> CompactionOutcome:
         """Compact the session before a cross-provider switch to a Grok model.
 
         The agent replays the whole conversation to the new provider on the
@@ -426,11 +426,18 @@ class SessionService:
         agent serves its in-memory copy, ``session/resume`` does not reload,
         and ``session/close`` on a live session does not answer.
         """
-        try:
-            await self.broker.prompt_turn(session_id, COMPACT_PROMPT)
-        except AcpError as exc:
-            logger.warning("pre-switch compaction failed session=%s: %s", session_id, exc)
-            return "failed"
+        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()), self._global_sem:
+            self._advance_native(thread_id)
+            self._busy.add(thread_id)
+            self._write_busy_marker()
+            try:
+                await self.broker.prompt_turn(session_id, COMPACT_PROMPT)
+            except AcpError as exc:
+                logger.warning("pre-switch compaction failed session=%s: %s", session_id, exc)
+                return "failed"
+            finally:
+                self._busy.discard(thread_id)
+                self._write_busy_marker()
         return "compacted"
 
     async def set_effort(self, thread_id: str, effort: str) -> tuple[str, str]:

@@ -112,14 +112,16 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
                 raise web.HTTPConflict(text="Gateway has pending work")
             gateway.sealed = True
         elif action != "state":
-            gateway.draining = action == "drain"
+            # Keep local admission closed throughout a hub fence transition.
+            gateway.draining = True
             try:
-                await consumer.set_admission("controls" if gateway.draining else "normal")
+                await consumer.set_admission("controls" if action == "drain" else "normal")
             except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
                 gateway.draining = True
                 raise web.HTTPConflict(text="Mailbox admission could not settle") from None
             if action == "resume":
                 gateway.sealed = False
+                gateway.draining = False
         return web.json_response(gateway.maintenance_state())
 
     app.router.add_post("/maintenance", maintenance)

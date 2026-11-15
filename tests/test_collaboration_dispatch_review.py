@@ -9,8 +9,14 @@ import pytest
 from aiohttp.test_utils import TestServer
 from fake_agent import spawn_fake_agent_process
 from test_collaboration import active_gateway, api_fixture, ask, close_api, project
-from test_collaboration_regressions import maintenance_gateway, memory_broker
+from test_collaboration_regressions import (
+    auth,
+    maintenance_client,
+    maintenance_gateway,
+    memory_broker,
+)
 
+from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpBroker, SessionUpdate
 from mattermost_acp.collaboration.cli import execute, parser
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
@@ -20,6 +26,77 @@ from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
+
+
+@pytest.mark.parametrize("failure", [False, True])
+async def test_resume_keeps_local_native_admission_closed_until_hub_accepts(failure):
+    gateway = maintenance_gateway()
+    gateway.draining = gateway.sealed = True
+    gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+    gateway._run_prompt = AsyncMock()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def admission(mode):
+        assert mode == "normal"
+        entered.set()
+        await release.wait()
+        if failure:
+            raise TimeoutError("Lost admission response")
+
+    gateway.collaboration.set_admission = admission
+    client = await maintenance_client(gateway)
+    task = asyncio.create_task(
+        client.post("/maintenance", json={"action": "resume"}, headers=auth())
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await gateway.run_prompt(thread_id="discussion", channel_id="floor", prompt="work")
+        gateway._run_prompt.assert_not_awaited()
+        assert gateway.draining and gateway.sealed
+        release.set()
+        response = await task
+        assert response.status == (409 if failure else 200)
+        assert gateway.draining is failure and gateway.sealed is failure
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
+
+
+async def test_sealed_native_admission_is_closed_even_without_draining_flag():
+    gateway = maintenance_gateway()
+    gateway.sealed = True
+    gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+    gateway._run_prompt = AsyncMock()
+    await gateway.run_prompt(thread_id="discussion", channel_id="floor", prompt="work")
+    gateway._run_prompt.assert_not_awaited()
+
+
+async def test_repeated_harness_switches_share_one_idle_restart_waiter(monkeypatch):
+    gateway = maintenance_gateway()
+    gateway.config.harness = "codex"
+    gateway.client.user_id = "synthetic-owner"
+    plan = SimpleNamespace(old_harness="codex", new_harness="claude", model="opus")
+    monkeypatch.setattr(harness_switch, "load_profiles", lambda: {})
+    monkeypatch.setattr(harness_switch, "load_roster", lambda: {})
+    monkeypatch.setattr(harness_switch, "find_agent", lambda *a, **kw: {"username": "alpha"})
+    monkeypatch.setattr(harness_switch, "apply_switch", lambda *a, **kw: plan)
+    gate = asyncio.Event()
+    async def waiter(*args):
+        await gate.wait()
+    gateway._restart_when_idle = AsyncMock(side_effect=waiter)
+    reply = AsyncMock()
+    try:
+        await gateway._cmd_harness("discussion", "floor", "human", "claude", reply)
+        first = gateway._harness_restart_task
+        await gateway._cmd_harness("discussion", "floor", "human", "claude", reply)
+        assert gateway._harness_restart_task is first
+        gate.set()
+        await asyncio.wait_for(first, 2)
+        gateway._restart_when_idle.assert_awaited_once()
+    finally:
+        gate.set()
+        await asyncio.gather(*gateway._slash_tasks, return_exceptions=True)
 
 
 def native_gateway(tmp_path):
