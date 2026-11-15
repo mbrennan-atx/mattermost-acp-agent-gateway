@@ -251,6 +251,11 @@ class AcpBroker:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
 
+    @property
+    def native_boundary_idle(self) -> bool:
+        """ACP foreground completion does not prove native goals/queues are idle."""
+        return not self.is_running
+
     def set_permission_handler(self, handler: PermissionHandler | None) -> None:
         self._permission_handler = handler
 

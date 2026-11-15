@@ -639,6 +639,7 @@ class MattermostGateway:
                 kwargs.get("before_native") is not None
                 and self.collaboration is not None
                 and self.collaboration.owns_thread(thread_id)
+                and not (kwargs.get("ownership_guard") and kwargs["ownership_guard"]())
             ):
                 return {"queued": True}
             try:
@@ -665,6 +666,11 @@ class MattermostGateway:
         )
 
     def maintenance_state(self):
+        native_unknown = not getattr(
+            self.sessions.broker,
+            "native_boundary_idle",
+            not getattr(self.sessions.broker, "is_running", False),
+        )
         pending = sum(
             bool(report.get("active") or report["reporter"].has_pending_work())
             for report in self.live_reports()
@@ -677,7 +683,8 @@ class MattermostGateway:
             "inbound": len(self._inbound_tasks),
             "commands": self._active_controls + len(self._slash_tasks),
             "native_rpc": len(getattr(self.sessions.broker, "_pending", {})),
-            "background": pending,
+            "background": pending + int(native_unknown),
+            "native_boundary_unknown": native_unknown,
             "collaboration": (
                 len(self.collaboration.workers)
                 + len(getattr(self.collaboration, "pending_stops", ()))
@@ -717,6 +724,7 @@ class MattermostGateway:
         workspace: str | None = None,
         collaboration_project: str | None = None,
         before_native=None,
+        ownership_guard=None,
     ) -> dict | None:
         if before_native is not None and self.background_pending(thread_id):
             return {"queued": True}
@@ -951,6 +959,7 @@ class MattermostGateway:
             "execution_id": report["execution_id"],
             "answer": public_answer,
             "stop_reason": result.stop_reason,
+            "native_dispatched": result.native_dispatched,
             "session_id": result.session_id,
             "model": result.model_id or str(session_status.get("model") or ""),
             "pending": reporter.has_pending_work(),
@@ -1330,6 +1339,7 @@ class MattermostGateway:
             stop_coro=self.sessions.broker.stop,
             cancel_coro=_cancel,
             unit="mattermost-acp-gateway.service",
+            track=self._track_control,
         )
 
     async def _handle_pending_restart_bump(self) -> None:

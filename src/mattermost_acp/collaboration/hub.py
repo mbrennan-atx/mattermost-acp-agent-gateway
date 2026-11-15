@@ -242,7 +242,11 @@ def build_app(
 
     async def cancel_thread(request):
         body = await request.json()
-        return web.json_response(store.cancel_thread(request["actor"], body["thread_id"]))
+        if "cutoff" in body and type(body["cutoff"]) not in {int, float}:
+            raise ValueError("Cancellation cutoff must be a finite timestamp")
+        return web.json_response(
+            store.cancel_thread(request["actor"], body["thread_id"], cutoff=body.get("cutoff"))
+        )
 
     async def mention(request):
         body = await request.json()

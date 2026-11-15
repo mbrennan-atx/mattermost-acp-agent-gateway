@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import shlex
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -21,7 +23,6 @@ logger = logging.getLogger(__name__)
 class CollaborationConsumer:
     def __init__(self, gateway, settings: Settings):
         self.gateway = gateway
-        self.hub = HubClient(settings)
         self.instance = uuid.uuid4().hex
         self.task = None
         self.workers: dict[tuple[str, str | None], asyncio.Task] = {}
@@ -42,8 +43,18 @@ class CollaborationConsumer:
             )
         ).with_suffix(".stops.json")
         self.pending_stops = (
-            set(json.loads(self.stops_path.read_text())) if self.stops_path.exists() else set()
+            json.loads(self.stops_path.read_text()) if self.stops_path.exists() else {}
         )
+        if self.pending_stops == []:
+            self.pending_stops = {}
+        if not isinstance(self.pending_stops, dict) or any(
+            not isinstance(thread, str)
+            or type(cutoff) not in {int, float}
+            or not math.isfinite(cutoff)
+            for thread, cutoff in self.pending_stops.items()
+        ):
+            raise ValueError("Pending project stops require explicit recorded boundaries")
+        self.hub = HubClient(settings)
 
     def start(self):
         self.task = asyncio.create_task(self.run(), name="collaboration-mailbox")
@@ -73,7 +84,8 @@ class CollaborationConsumer:
                         self.actor = ""
                         raise ValueError("Hub and consumer delivery modes do not match")
                 for thread in list(self.pending_stops):
-                    await self.cancel_thread(thread)
+                    await self.cancel_thread(thread, retry=True)
+                await self.reconcile_ownership()
                 if self.gateway.sealed:
                     await asyncio.sleep(0.25)
                     continue
@@ -135,6 +147,131 @@ class CollaborationConsumer:
         if thread and not self.owns_thread(thread) and not self.gateway.background_pending(thread):
             self.gateway._last_terminal.pop(thread, None)
 
+    async def reconcile_ownership(self):
+        for key, report in list(self.ownership.items()):
+            if key in self.workers or key in self.reserving:
+                continue
+            state = await self.hub.request("GET", "/messages/" + key[0])
+            if state.get("claim") != key[1]:
+                continue
+            if state["state"] not in {"done", "failed", "blocked", "cancelled"}:
+                continue
+            thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
+            terminal = self.gateway._last_terminal.get(thread)
+            evidence = state.get("evidence", {})
+            if (
+                report is not None
+                and report.get("foreground_complete")
+                and not report.get("active")
+                and not self.gateway.sessions.is_busy(thread)
+                and not report["reporter"].has_pending_work()
+                and terminal
+                and terminal.get("session_id") == evidence.get("session_id")
+                and terminal.get("execution_id") == evidence.get("execution_id")
+                and not terminal.get("pending")
+                and terminal.get("native_dispatched", True)
+            ):
+                await self.update(state, "evidence", evidence=self.foreground(state, terminal))
+                self.release_ownership(key)
+
+    async def continuation(self, item):
+        parent_id = item.get("continuation_parent")
+        if item["kind"] != "result" or not parent_id:
+            return None
+        parent = await self.hub.request("GET", "/messages/" + parent_id)
+        key = (parent_id, item.get("continuation_claim"))
+        report = self.ownership.get(key)
+        thread = item["binding"]["thread_id"]
+        terminal = self.gateway._last_terminal.get(thread)
+        evidence = parent.get("evidence", {})
+        if (
+            report is None
+            or parent.get("claim") != key[1]
+            or parent.get("instance") != self.instance
+            or item.get("continuation_instance") != self.instance
+            or parent["state"] != "running"
+            or report.get("collaboration_project") != item["project"]
+            or report.get("thread_id") != thread
+            or not terminal
+            or terminal.get("execution_id") != evidence.get("execution_id")
+            or terminal.get("session_id") != evidence.get("session_id")
+            or terminal.get("stop_reason") != "end_turn"
+            or terminal.get("pending")
+        ):
+            return None
+        related = []
+        for owned_key, owned_report in list(self.ownership.items()):
+            if self.ownership_threads.get(owned_key) != thread:
+                continue
+            if owned_report is not report:
+                return None
+            state = await self.hub.request("GET", "/messages/" + owned_key[0])
+            if state["project"] != item["project"] or state.get("claim") != owned_key[1]:
+                return None
+            related.append(state)
+        info = {
+            "report": report,
+            "parents": related,
+            "session": evidence["session_id"],
+            "thread": thread,
+        }
+        return info if self.continuation_idle(info) else None
+
+    def continuation_idle(self, info):
+        report = info["report"]
+        return (
+            not self.gateway.sessions.is_busy(info["thread"])
+            and not report.get("active")
+            and report.get("foreground_complete")
+            and not report["reporter"].has_pending_work()
+            and all(
+                self.ownership.get((parent["id"], parent.get("claim"))) is report
+                and (parent["id"], parent.get("claim")) not in self.cancelled_claims
+                for parent in info["parents"]
+            )
+        )
+
+    async def reserve_continuation(self, item, session, info):
+        keys = {(parent["id"], parent.get("claim")) for parent in info["parents"]}
+        self.reserving.update(keys)
+        try:
+            if session != info["session"]:
+                raise NativeDispatchChanged("Continuation native session changed")
+            if not await self.reserve(item, session):
+                return False
+            report = self.ownership[(item["id"], item.get("claim"))]
+            epoch = item["native_epoch"]
+            for parent in info["parents"]:
+                key = (parent["id"], parent.get("claim"))
+                if self.ownership.get(key) is not info["report"]:
+                    raise NativeDispatchChanged("Continuation ownership changed")
+                self.ownership[key] = report
+                evidence = {
+                    "session_id": session,
+                    "execution_id": report["execution_id"],
+                    "native_epoch": epoch,
+                }
+                try:
+                    receipt = await self.update(parent, "dispatch", evidence=evidence)
+                except HubError:
+                    settled = await self.hub.request("GET", "/messages/" + parent["id"])
+                    if settled.get("claim") == key[1] and settled["state"] in {
+                        "done",
+                        "failed",
+                        "blocked",
+                        "cancelled",
+                    }:
+                        self.release_ownership(key)
+                        continue
+                    raise
+                if receipt["state"] == "cancelling":
+                    await self.update(parent, "heartbeat", evidence=evidence)
+                if receipt["state"] != "running" or key in self.cancelled_claims:
+                    report["cancel_requested"] = True
+            return not report.get("cancel_requested")
+        finally:
+            self.reserving.difference_update(keys)
+
     async def heartbeat(self, item):
         while True:
             await asyncio.sleep(10)
@@ -179,6 +316,7 @@ class CollaborationConsumer:
                 and terminal["stop_reason"] != "end_turn"
                 and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
                 and not terminal.get("pending")
+                and terminal.get("native_dispatched", True)
             ):
                 state = "cancelled" if terminal["stop_reason"] == "cancelled" else "failed"
                 await self.update(
@@ -340,19 +478,35 @@ class CollaborationConsumer:
                 await self.update(item, "unconfirmed", "Unknown native delivery outcome")
                 return
             self.release_ownership((item["id"], item.get("claim")))
-            if self.active(thread):
+            continuation = await self.continuation(item)
+            if self.active(thread) and continuation is None:
                 await self.update(item, "queued")
                 return
-            result = await self.gateway.run_prompt(
-                thread_id=thread,
-                channel_id=binding["channel_id"],
-                prompt=prompt,
-                author_id="project:" + item["project"],
-                author_name=item["sender"],
-                workspace=binding.get("workspace"),
-                collaboration_project=item["project"],
-                before_native=lambda session: self.reserve(item, session),
-            )
+            transfer_keys = {
+                (parent["id"], parent.get("claim"))
+                for parent in (continuation or {}).get("parents", [])
+            }
+            self.reserving.update(transfer_keys)
+            try:
+                result = await self.gateway.run_prompt(
+                    thread_id=thread,
+                    channel_id=binding["channel_id"],
+                    prompt=prompt,
+                    author_id="project:" + item["project"],
+                    author_name=item["sender"],
+                    workspace=binding.get("workspace"),
+                    collaboration_project=item["project"],
+                    before_native=(
+                        (lambda session: self.reserve_continuation(item, session, continuation))
+                        if continuation is not None
+                        else (lambda session: self.reserve(item, session))
+                    ),
+                    ownership_guard=(lambda: self.continuation_idle(continuation))
+                    if continuation is not None
+                    else None,
+                )
+            finally:
+                self.reserving.difference_update(transfer_keys)
             # Explicit mm-work reply may already have settled the request.
             current = await self.hub.request("GET", f"/messages/{item['id']}")
             if current["state"] in {"done", "failed", "blocked", "cancelled"}:
@@ -493,6 +647,7 @@ class CollaborationConsumer:
                 and terminal.get("execution_id") == target.get("evidence", {}).get("execution_id")
                 and terminal["completed_at"] >= started
                 and not terminal.get("pending")
+                and terminal.get("native_dispatched", True)
                 and (terminal["stop_reason"] != "end_turn" or target.get("late_result"))
             ):
                 state = {"cancelled": "cancelled", "end_turn": "done"}.get(
@@ -547,14 +702,19 @@ class CollaborationConsumer:
         # Cancellation remains visible and receives another deterministic delivery attempt.
         await self.update(item, "queued")
 
-    async def cancel_thread(self, thread):
-        self.pending_stops.add(thread)
+    async def cancel_thread(self, thread, *, retry=False):
+        if not retry:
+            self.pending_stops[thread] = time.time()
+        cutoff = self.pending_stops[thread]
         try:
             self.save_stops()
         except OSError:
             logger.warning("Project stop intent retained in memory; persistence unavailable")
-        result = await self.hub.request("POST", "/cancel-thread", {"thread_id": thread})
-        self.pending_stops.discard(thread)
+        result = await self.hub.request(
+            "POST", "/cancel-thread", {"thread_id": thread, "cutoff": cutoff}
+        )
+        if self.pending_stops.get(thread) == cutoff:
+            self.pending_stops.pop(thread)
         try:
             self.save_stops()
         except OSError:
@@ -566,7 +726,7 @@ class CollaborationConsumer:
         temporary = self.stops_path.with_name(self.stops_path.name + "." + self.instance)
         with temporary.open("w") as stream:
             temporary.chmod(0o600)
-            json.dump(sorted(self.pending_stops), stream)
+            json.dump(self.pending_stops, stream, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, self.stops_path)

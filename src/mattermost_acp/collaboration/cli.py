@@ -114,13 +114,25 @@ async def execute(args, hub):
         return await hub.request("POST", f"/messages/{args.message}/{command}", body)
     if command == "wait":
         deadline = asyncio.get_running_loop().time() + args.seconds
+        result = None
         while True:
-            result = await hub.request("GET", f"/messages/{args.message}")
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                if result is None:
+                    raise TimeoutError("Wait deadline elapsed without a receipt")
+                return result
+            try:
+                async with asyncio.timeout(remaining):
+                    result = await hub.request("GET", f"/messages/{args.message}")
+            except TimeoutError:
+                if result is None:
+                    raise
+                return result
             if result["state"] not in {"open", "queued", "running", "cancelling"}:
                 return result
             if asyncio.get_running_loop().time() >= deadline:
                 return result
-            await asyncio.sleep(1)
+            await asyncio.sleep(min(1, max(0, deadline - asyncio.get_running_loop().time())))
     raise ValueError("Unknown command")
 
 

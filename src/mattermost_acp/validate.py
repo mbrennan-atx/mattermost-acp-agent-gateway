@@ -14,7 +14,9 @@ def check() -> None:
     config = Config.load()
     from mattermost_acp.collaboration.client import Settings
 
-    Settings.load()
+    settings = Settings.load()
+    if config.collab_sidecar and settings is None:
+        raise ValueError("A project sidecar requires configured collaboration settings")
     if not config.grok_cwd.is_dir():
         raise ValueError("AGENT_CWD must select an existing directory")
     if not shutil.which(config.grok_command):

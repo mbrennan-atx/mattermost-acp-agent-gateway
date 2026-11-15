@@ -300,6 +300,7 @@ class SessionService:
                         session_id=session_id,
                         stop_reason="cancelled",
                         answer_text="Cancelled before native dispatch",
+                        native_dispatched=False,
                         thought_text="",
                     )
                 guarded = before_prompt is not None or dispatch_guard is not None

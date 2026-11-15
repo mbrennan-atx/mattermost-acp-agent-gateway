@@ -52,3 +52,4 @@ class TurnResult:
     usage_used: int | None = None
     usage_size: int | None = None
     model_id: str | None = None
+    native_dispatched: bool = True

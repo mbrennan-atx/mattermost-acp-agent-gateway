@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -36,7 +37,9 @@ class CollaborationStore:
         self.actors = actors
         self.clock = clock
         self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS projects(
+                id TEXT PRIMARY KEY, data TEXT NOT NULL, status TEXT, deadline REAL,
+                created REAL, owner TEXT, origin_thread TEXT);
             CREATE TABLE IF NOT EXISTS messages(
                 id TEXT PRIMARY KEY, project TEXT NOT NULL, sender TEXT NOT NULL,
                 recipient TEXT, kind TEXT NOT NULL, state TEXT NOT NULL,
@@ -47,6 +50,32 @@ class CollaborationStore:
             CREATE TABLE IF NOT EXISTS creations(actor TEXT, key TEXT, data TEXT,
                 PRIMARY KEY(actor,key));
         """)
+        # Backfill queryable metadata once for hubs created with the JSON-only
+        # project schema. Frequent expiry polls must not decode cancelled history.
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
+        with self.transaction():
+            for name, kind in (
+                ("status", "TEXT"),
+                ("deadline", "REAL"),
+                ("created", "REAL"),
+                ("owner", "TEXT"),
+                ("origin_thread", "TEXT"),
+            ):
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE projects ADD COLUMN {name} {kind}")
+            missing = self.db.execute(
+                "SELECT data FROM projects WHERE status IS NULL OR deadline IS NULL "
+                "OR created IS NULL OR owner IS NULL OR origin_thread IS NULL"
+            ).fetchall()
+            for row in missing:
+                self.save_project(json.loads(row[0]))
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS project_expiry ON projects(status,deadline)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS origin_projects "
+                "ON projects(owner,origin_thread,status,created)"
+            )
         # A new hub process cannot establish what a crashed native turn did.
         with self.transaction():
             for row in self.db.execute("SELECT data FROM messages WHERE state='running'"):
@@ -73,7 +102,17 @@ class CollaborationStore:
 
     def save_project(self, item):
         self.db.execute(
-            "INSERT OR REPLACE INTO projects VALUES(?,?)", (item["id"], json.dumps(item))
+            "INSERT OR REPLACE INTO projects(id,data,status,deadline,created,owner,origin_thread) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                item["id"],
+                json.dumps(item),
+                item["status"],
+                item["deadline"],
+                item["created"],
+                item["owner"],
+                item["origin_thread_id"],
+            ),
         )
 
     def save_message(self, item):
@@ -240,7 +279,16 @@ class CollaborationStore:
                 continue
             # Results may return to the same owner's conversation. Worker sessions
             # must remain exclusive, including sessions awaiting reconciliation.
-            if project["owner"] == actor == other["owner"]:
+            if (
+                project["owner"] == actor == other["owner"]
+                and actor not in getattr(self, "sidecar_actors", set())
+                and not project.get("owner_in_discussion")
+                and not other.get("owner_in_discussion")
+                and binding["thread_id"] == project["origin_thread_id"]
+                and binding["channel_id"] == project["origin_channel_id"]
+                and existing["thread_id"] == other["origin_thread_id"]
+                and existing["channel_id"] == other["origin_channel_id"]
+            ):
                 continue
             raise ValueError("Native worker binding belongs to another project")
 
@@ -406,10 +454,12 @@ class CollaborationStore:
 
     def expire(self):
         with self.transaction():
-            for row in self.db.execute("SELECT data FROM projects"):
+            now = self.clock()
+            for row in self.db.execute(
+                "SELECT data FROM projects WHERE status='active' AND deadline<=?", (now,)
+            ).fetchall():
                 project = json.loads(row[0])
-                if project["status"] == "active" and project["deadline"] <= self.clock():
-                    self.cancel(project["id"], project["owner"])
+                self.cancel(project["id"], project["owner"])
             for row in self.db.execute("SELECT data FROM messages WHERE state='running'"):
                 item = json.loads(row[0])
                 if item.get("lease_until", 0) <= self.clock():
@@ -496,8 +546,21 @@ class CollaborationStore:
                 )
                 item["binding"] = project["bindings"][actor]
                 self.save_message(item)
+                continuation = {}
+                if item["kind"] == "result" and item.get("parent"):
+                    child = self.get_message(item["parent"], actor)
+                    if child.get("parent"):
+                        parent = self.get_message(child["parent"], actor)
+                        continuation["continuation_parent"] = parent["id"]
+                        for source, target in (
+                            ("claim", "continuation_claim"),
+                            ("instance", "continuation_instance"),
+                        ):
+                            if parent.get(source):
+                                continuation[target] = parent[source]
                 return {
                     **item,
+                    **continuation,
                     "project_title": project["title"],
                     "objective": project["objective"],
                     "project_owner": project["owner"],
@@ -741,12 +804,21 @@ class CollaborationStore:
             project["status"] = "cancelled"
             self.save_project(project)
 
-    def cancel_thread(self, actor, thread):
-        return [
-            self.cancel(p["id"], actor)
-            for p in self.list_projects(actor)
-            if p["owner"] == actor and p["origin_thread_id"] == thread and p["status"] == "active"
-        ]
+    def cancel_thread(self, actor, thread, *, cutoff=None):
+        if cutoff is not None:
+            try:
+                if type(cutoff) not in {int, float} or not math.isfinite(float(cutoff)):
+                    raise ValueError("Cancellation cutoff must be a finite timestamp")
+                cutoff = float(cutoff)
+            except OverflowError:
+                raise ValueError("Cancellation cutoff must be a finite timestamp") from None
+        with self.transaction():
+            rows = self.db.execute(
+                "SELECT id FROM projects WHERE owner=? AND origin_thread=? AND status='active'"
+                + (" AND created<=?" if cutoff is not None else ""),
+                (actor, thread, cutoff) if cutoff is not None else (actor, thread),
+            ).fetchall()
+            return [self.cancel(row[0], actor) for row in rows]
 
     def mention(self, actor, channel, thread, recipient, body, key):
         for project in self.list_projects(actor):

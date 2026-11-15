@@ -449,6 +449,7 @@ def maintenance_gateway():
     gateway.config.slash_tokens = frozenset({"synthetic-slash-token"})
     gateway.sessions.busy_threads = set()
     gateway.sessions.broker._pending = {}
+    gateway.sessions.broker.native_boundary_idle = True
     gateway.collaboration = SimpleNamespace(
         hub=SimpleNamespace(settings=SimpleNamespace(token="synthetic-maintenance-token")),
         workers={},
@@ -1055,16 +1056,19 @@ async def test_origin_stop_retries_persistently_even_when_local_cancel_fails(tmp
             user_id="human",
             user_name="human",
         )
-        assert consumer.pending_stops == {"origin"}
-        assert json.loads(consumer.stops_path.read_text()) == ["origin"]
+        cutoff = consumer.pending_stops["origin"]
+        assert json.loads(consumer.stops_path.read_text()) == {"origin": cutoff}
         assert "Project cancellation is unconfirmed" in gateway.client.posts[-1][1]
         restarted = CollaborationConsumer(gateway, consumer.hub.settings)
         try:
-            assert restarted.pending_stops == {"origin"}
+            assert restarted.pending_stops == {"origin": cutoff}
             restarted.hub.request = AsyncMock(return_value={"cancelled": 1})
-            await restarted.cancel_thread("origin")
-            assert restarted.pending_stops == set()
-            assert json.loads(restarted.stops_path.read_text()) == []
+            await restarted.cancel_thread("origin", retry=True)
+            restarted.hub.request.assert_awaited_once_with(
+                "POST", "/cancel-thread", {"thread_id": "origin", "cutoff": cutoff}
+            )
+            assert restarted.pending_stops == {}
+            assert json.loads(restarted.stops_path.read_text()) == {}
         finally:
             await restarted.close()
     finally:
