@@ -47,6 +47,7 @@ def memory_broker():
     writer = MemoryAdapter(broker)
     broker._proc = SimpleNamespace(stdin=writer, returncode=None)
     broker._capabilities.steering = True
+    broker._live_sessions.update({"native", "existing-native"})
     return broker, writer
 
 

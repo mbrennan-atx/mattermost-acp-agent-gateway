@@ -299,12 +299,16 @@ class MattermostGateway:
                 reporter.published()
 
     def _stop_reports(self, thread_id: str) -> None:
-        for session_id, report in list(self._reports.items()):
+        for report in self.live_reports():
             if report["thread_id"] == thread_id:
                 report["suppressed"] = True
                 if report.get("task"):
                     report["task"].cancel()
-                if not report["active"] and not report["reporter"].has_pending_work():
+        if not self.background_pending(thread_id) and not (
+            self.collaboration is not None and self.collaboration.owns_thread(thread_id)
+        ):
+            for session_id, report in list(self._reports.items()):
+                if report["thread_id"] == thread_id:
                     self._reports.pop(session_id, None)
 
     async def _ensure_peer_membership(self) -> None:

@@ -17,7 +17,7 @@ from test_collaboration_regressions import (
 )
 
 from mattermost_acp import harness_switch
-from mattermost_acp.acp import AcpBroker, SessionUpdate
+from mattermost_acp.acp import AcpBroker, SessionUpdate, TurnResult
 from mattermost_acp.collaboration.cli import execute, parser
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
@@ -26,6 +26,7 @@ from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
+from mattermost_acp.store import ThreadStore
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -89,6 +90,205 @@ async def test_ordinary_followup_preserves_unresolved_project_report_and_termina
     assert gateway._reports["project-native"] is owned
     assert gateway._last_terminal["discussion"] is receipt
     assert "still pending" in gateway.client.posts[-1][1]
+
+
+@pytest.mark.parametrize("reason", ["unloaded", "foreign"])
+async def test_stored_session_without_current_broker_evidence_uses_native_preparation(
+    tmp_path, reason
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.harness = "claude"
+    record = await gateway.sessions.store.get("discussion")
+    record.harness = "codex" if reason == "foreign" else "claude"
+    gateway.sessions.broker.is_session_loaded = lambda _session: reason == "foreign"
+    gateway.sessions.hint.return_value = "promptRequired"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        gateway.run_prompt.return_value = {"queued": True}
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        gateway.sessions.hint.assert_not_awaited()
+        gateway.run_prompt.assert_awaited_once()
+        assert store.get_message(requested["id"], "beta")["state"] == "queued"
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+async def test_unloaded_stored_session_recovers_through_real_session_service(tmp_path, foreign):
+    store, server, clients = await api_fixture(tmp_path)
+    path = tmp_path / "threads.db"
+    previous = ThreadStore(path, harness="codex" if foreign else "grok")
+    await previous.open()
+    await previous.save(
+        "discussion", "historic-session", str(tmp_path), model="hub-claude-5-sonnet"
+    )
+    await previous.close()
+    native_store = ThreadStore(path, harness="grok")
+    await native_store.open()
+    broker = AcpBroker(process_factory=spawn_fake_agent_process)
+    await broker.start()
+    await broker.session_new(tmp_path / "other")
+    broker.capabilities.steering = True
+    if foreign:
+        await broker.session_resume("historic-session", tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    sessions = SessionService(
+        broker,
+        native_store,
+        default_cwd=tmp_path,
+        default_model="hub-claude-5-sonnet",
+        inject_channel_context=False,
+    )
+    sessions.hint = AsyncMock(wraps=sessions.hint)
+    gateway.sessions = sessions
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    p = project(store)
+    requested = ask(store, p["id"])
+    claimed = store.claim_next("beta", consumer.instance)
+    native_prompt = type(gateway).run_prompt.__get__(gateway)
+
+    async def replied(**kwargs):
+        receipt = await native_prompt(**kwargs)
+        store.reply(requested["id"], "beta", "Verified recovery", claim=claimed["claim"])
+        return receipt
+
+    gateway.run_prompt = replied
+    try:
+        await asyncio.wait_for(consumer.handle(claimed), 5)
+        sessions.hint.assert_not_awaited()
+        current = await native_store.get("discussion")
+        assert current.harness == "grok"
+        assert (current.session_id != "historic-session") is foreign
+        assert broker.is_session_loaded(current.session_id)
+        assert store.get_message(requested["id"], "beta")["state"] == "done"
+        assert store.get_message(requested["id"], "beta")["result"] == "Verified recovery"
+    finally:
+        await close_reports(gateway)
+        await consumer.close()
+        await broker.stop()
+        await native_store.close()
+        await close_api(store, server, clients)
+
+
+async def test_injection_rechecks_loaded_session_after_waiting_for_broker_write(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.get = AsyncMock(
+        return_value=SimpleNamespace(session_id="existing-native", harness="claude")
+    )
+    gateway.sessions.store.harness = "claude"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    handling = None
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        async with broker._write_lock:
+            handling = asyncio.create_task(
+                consumer.handle(store.claim_next("beta", consumer.instance))
+            )
+            async with asyncio.timeout(2):
+                while not broker._pending:
+                    await asyncio.sleep(0)
+            broker._live_sessions.clear()
+        await asyncio.wait_for(handling, 2)
+        assert writer.messages == []
+        assert broker._pending == {}
+        assert store.get_message(requested["id"], "beta")["state"] == "queued"
+        assert not consumer.owns_thread("discussion")
+    finally:
+        if handling and not handling.done():
+            handling.cancel()
+            await asyncio.gather(handling, return_exceptions=True)
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("background", ["tool", "worker"])
+async def test_stop_retains_predecessor_until_native_background_completion(tmp_path, background):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False, steering=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.ensure_session = AsyncMock(return_value="existing-native")
+    gateway.sessions.status = AsyncMock(return_value={"session_id": "existing-native"})
+    previous = idle_report()
+    previous["collaboration_project"] = None
+    if background == "tool":
+        previous["reporter"].observe(
+            SessionUpdate(
+                "existing-native", "tool_call", tool_call_id="old-tool", tool_status="in_progress"
+            )
+        )
+        completion = SessionUpdate(
+            "existing-native", "tool_call_update", tool_call_id="old-tool", tool_status="completed"
+        )
+    else:
+        previous["reporter"].observe(
+            SessionUpdate(
+                "existing-native",
+                "subagent_activity",
+                raw={"worker_id": "old-worker", "state": "running"},
+            )
+        )
+        completion = SessionUpdate(
+            "existing-native",
+            "subagent_activity",
+            raw={"worker_id": "old-worker", "state": "completed"},
+        )
+    gateway._reports["existing-native"] = previous
+
+    async def foreground(*args, **kwargs):
+        return TurnResult("existing-native", "end_turn", "Ordinary follow-up finished", "")
+
+    gateway.sessions.run_turn = AsyncMock(side_effect=foreground)
+    gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    try:
+        await gateway.run_prompt(
+            thread_id="discussion",
+            channel_id="floor",
+            prompt="Ordinary follow-up",
+            author_id="human",
+            author_name="human",
+        )
+        head = gateway._reports["existing-native"]
+        assert head is not previous and head["previous"] is previous
+        assert gateway.background_pending("discussion")
+        await gateway.dispatch_command(
+            cmd="stop",
+            arg="",
+            channel_id="floor",
+            thread_id="discussion",
+            user_id="human",
+            user_name="human",
+        )
+        gateway.sessions.cancel.assert_awaited_once()
+        assert gateway.background_pending("discussion")
+        assert previous in list(gateway.live_reports())
+        assert previous["suppressed"]
+        p = project(store)
+        requested = ask(store, p["id"])
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(requested["id"], "beta")["state"] == "queued"
+        gateway.sessions.run_turn.assert_awaited_once()
+        gateway._observe_background_update(completion)
+        assert not gateway.background_pending("discussion")
+        assert previous not in list(gateway.live_reports())
+    finally:
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
 
 
 async def test_repeated_harness_switches_share_one_idle_restart_waiter(monkeypatch):

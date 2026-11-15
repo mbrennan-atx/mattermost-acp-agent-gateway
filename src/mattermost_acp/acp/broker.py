@@ -243,6 +243,7 @@ class AcpBroker:
         self._permission_handler: PermissionHandler | None = None
         self.session_config_options: dict[str, list[dict[str, Any]]] = {}
         self._cursor_live_sessions: set[str] = set()
+        self._live_sessions: set[str] = set()
 
     @property
     def capabilities(self) -> AcpCapabilities:
@@ -251,6 +252,16 @@ class AcpBroker:
     @property
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
+
+    def is_session_loaded(self, session_id: str) -> bool:
+        """Require successful admission by the current live process."""
+        return self.is_running and session_id in self._live_sessions
+
+    def _remember_session(self, session_id: str, process: Any) -> bool:
+        if process is not None and self._proc is process and self.is_running:
+            self._live_sessions.add(session_id)
+            return True
+        return False
 
     @property
     def native_boundary_idle(self) -> bool:
@@ -290,6 +301,7 @@ class AcpBroker:
                 return self._capabilities
 
             self._cursor_live_sessions.clear()
+            self._live_sessions.clear()
             argv = self._build_argv()
             logger.info("Starting ACP agent: %s", " ".join(argv[:8]))
 
@@ -347,6 +359,7 @@ class AcpBroker:
         async with self._lock:
             self._started = False
             self._cursor_live_sessions.clear()
+            self._live_sessions.clear()
             self.subagents = SubagentTracker()
             proc = self._proc
             self._proc = None
@@ -443,6 +456,7 @@ class AcpBroker:
         return outcome
 
     async def session_new(self, cwd: str | Path, *, meta: dict[str, Any] | None = None) -> str:
+        process = self._proc
         params: dict[str, Any] = {
             "cwd": str(cwd),
             "mcpServers": [],
@@ -453,7 +467,8 @@ class AcpBroker:
         if not isinstance(result, dict) or "sessionId" not in result:
             raise AcpError("session/new missing sessionId", data=result)
         self._remember_config(str(result["sessionId"]), result)
-        if self.backend == "cursor":
+        loaded = self._remember_session(str(result["sessionId"]), process)
+        if self.backend == "cursor" and loaded:
             self._cursor_live_sessions.add(str(result["sessionId"]))
         return str(result["sessionId"])
 
@@ -462,17 +477,20 @@ class AcpBroker:
             self.session_config_options[session_id] = result["configOptions"]
 
     async def session_resume(self, session_id: str, cwd: str | Path) -> None:
+        process = self._proc
         result = await self.request(
             "session/resume",
             {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []},
         )
         self._remember_config(session_id, result)
+        self._remember_session(session_id, process)
 
     async def session_load(self, session_id: str, cwd: str | Path) -> None:
         """Load session; discard replayed history updates for Mattermost."""
         # Cursor cannot load a new, unpersisted chat already live in this process.
         if self.backend == "cursor" and session_id in self._cursor_live_sessions:
             return
+        process = self._proc
         # Subscribe a throwaway queue so replay does not leak into other waiters
         q: asyncio.Queue[SessionUpdate | None] = asyncio.Queue()
         self._session_queues.setdefault(session_id, []).append(q)
@@ -482,7 +500,8 @@ class AcpBroker:
                 {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []},
             )
             self._remember_config(session_id, result)
-            if self.backend == "cursor":
+            loaded = self._remember_session(session_id, process)
+            if self.backend == "cursor" and loaded:
                 self._cursor_live_sessions.add(session_id)
         finally:
             queues = self._session_queues.get(session_id, [])
@@ -585,8 +604,12 @@ class AcpBroker:
         self.subagents.forget(session_id)
         if not self._capabilities.close:
             return
+        process = self._proc
         try:
             await self.request("session/close", {"sessionId": session_id})
+            if self._proc is process:
+                self._live_sessions.discard(session_id)
+                self._cursor_live_sessions.discard(session_id)
         except AcpError as exc:
             logger.warning("session/close failed for %s: %s", session_id, exc)
 

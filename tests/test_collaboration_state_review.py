@@ -260,7 +260,14 @@ def test_nested_result_payload_exposes_current_parent_claim_and_instance(tmp_pat
         item = project(store)
         parent = ask(store, item["id"])
         original = store.claim_next("beta", "first-native-owner")
-        child = ask(store, item["id"], sender="beta", recipient="gamma", key="child")
+        child = ask(
+            store,
+            item["id"],
+            sender="beta",
+            recipient="gamma",
+            key="child",
+            parent=parent["id"],
+        )
         claim = store.claim_next("gamma", "child-worker")
         store.reply(child["id"], "gamma", "Verified child result", claim=claim["claim"])
         with store.transaction():

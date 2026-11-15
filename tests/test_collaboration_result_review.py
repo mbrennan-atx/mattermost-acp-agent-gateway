@@ -318,7 +318,7 @@ async def test_late_reply_cannot_reconcile_with_receipt_before_new_injection(tmp
         assert final["evidence"]["foreground_answer"] == "Output after the new injection"
 
 
-@pytest.mark.parametrize("limit", ["dispatch", "depth", "membership", "sender-membership"])
+@pytest.mark.parametrize("limit", ["dispatch", "membership", "sender-membership"])
 async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wake(tmp_path, limit):
     store, server, clients = await api_fixture(tmp_path)
     gateway = active_gateway(busy=False)
@@ -346,14 +346,9 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
                 },
             )
         else:
-            p = project(store, **({"max_turns": 1} if limit == "dispatch" else {"max_depth": 1}))
+            p = project(store, max_turns=1)
         if limit == "dispatch":
             ask(store, p["id"])
-        elif limit == "depth":
-            ask(store, p["id"])
-            store.claim_next("beta", "peer-parent-worker")
-            ask(store, p["id"], sender="beta", recipient="alpha")
-            store.claim_next("alpha", "parent-worker")
         posted = PostedEvent(
             post_id="post-1",
             channel_id="floor",

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fake_agent import spawn_fake_agent_process
@@ -48,6 +50,59 @@ async def test_session_new_and_prompt(broker: AcpBroker) -> None:
     assert result.usage_used == 1200
     assert "tool_call" in updates
     assert "agent_message_chunk" in updates
+
+
+async def test_loaded_sessions_follow_successful_admission_and_broker_generation(broker):
+    session = await broker.session_new("/tmp")
+    assert broker.is_session_loaded(session)
+    await broker.stop()
+    assert not broker.is_session_loaded(session)
+    await broker.start()
+    assert broker._live_sessions == set()
+    await broker.session_new("/tmp/other")
+    historic = "historic-session"
+    assert not broker.is_session_loaded(historic)
+    await broker.session_resume(historic, "/tmp")
+    assert broker.is_session_loaded(historic)
+    await broker.cancel(historic)
+    assert broker.is_session_loaded(historic)
+    await broker.session_close(historic)
+    assert not broker.is_session_loaded(historic)
+    await broker.session_load(historic, "/tmp")
+    assert broker.is_session_loaded(historic)
+
+
+@pytest.mark.parametrize("operation", ["new", "resume", "load"])
+@pytest.mark.parametrize("failure", ["rpc", "generation"])
+@pytest.mark.parametrize("backend", ["grok", "cursor"])
+async def test_failed_or_superseded_admission_does_not_mark_session_loaded(
+    operation, failure, backend
+):
+    broker = AcpBroker(backend=backend)
+    process = SimpleNamespace(returncode=None)
+    broker._proc = process
+
+    async def request(*args, **kwargs):
+        if failure == "rpc":
+            raise AcpError("Session admission failed")
+        broker._proc = SimpleNamespace(returncode=None)
+        return {"sessionId": "historic-session"}
+
+    broker.request = AsyncMock(side_effect=request)
+    if operation == "new":
+        operation = broker.session_new("/tmp")
+    elif operation == "resume":
+        operation = broker.session_resume("historic-session", "/tmp")
+    else:
+        operation = broker.session_load("historic-session", "/tmp")
+    if failure == "rpc":
+        with pytest.raises(AcpError, match="admission failed"):
+            await operation
+    else:
+        await operation
+    assert not broker.is_session_loaded("historic-session")
+    assert broker._live_sessions == set()
+    assert broker._cursor_live_sessions == set()
 
 
 @pytest.mark.asyncio

@@ -233,7 +233,10 @@ async def test_two_gateways_exchange_result_with_real_native_sessions(tmp_path):
 def active_gateway(outcome="injected", *, steering=True, busy=True):
     record = SimpleNamespace(session_id="existing-native")
     broker = SimpleNamespace(
-        capabilities=SimpleNamespace(steering=steering, raw={}), is_running=True, backend="claude"
+        capabilities=SimpleNamespace(steering=steering, raw={}),
+        is_running=True,
+        backend="claude",
+        is_session_loaded=lambda session: session == "existing-native",
     )
     sessions = SimpleNamespace(
         broker=broker,

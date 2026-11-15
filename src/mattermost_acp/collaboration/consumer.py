@@ -576,7 +576,18 @@ class CollaborationConsumer:
             prompt = self.prompt(item)
             outcome = None
             caps = broker.capabilities
-            can_hint = record is not None and broker.is_running and caps.steering
+            is_loaded = getattr(broker, "is_session_loaded", lambda _session: False)
+            can_hint = (
+                record is not None
+                and getattr(record, "harness", None)
+                in {
+                    None,
+                    getattr(self.gateway.sessions.store, "harness", self.gateway.config.harness),
+                }
+                and broker.is_running
+                and is_loaded(record.session_id)
+                and caps.steering
+            )
             if can_hint and broker.backend == "codex":
                 can_hint = ((caps.raw.get("_meta") or {}).get("steering") or {}).get(
                     "idleBehavior"
@@ -592,7 +603,8 @@ class CollaborationConsumer:
                         expected_session=record.session_id,
                         expected_epoch=item["native_epoch"],
                         guard=lambda: (
-                            self.gateway._reports.get(record.session_id)
+                            is_loaded(record.session_id)
+                            and self.gateway._reports.get(record.session_id)
                             is self.ownership.get((item["id"], item.get("claim")))
                             and (item["id"], item.get("claim")) not in self.cancelled_claims
                         ),

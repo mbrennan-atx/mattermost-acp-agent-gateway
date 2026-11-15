@@ -50,6 +50,8 @@ class CollaborationStore:
             CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY, project TEXT, data TEXT);
             CREATE TABLE IF NOT EXISTS creations(actor TEXT, key TEXT, data TEXT,
                 PRIMARY KEY(actor,key));
+            CREATE TABLE IF NOT EXISTS origin_stops(actor TEXT, thread TEXT, cutoff REAL NOT NULL,
+                PRIMARY KEY(actor,thread));
         """)
         # Backfill queryable metadata once for hubs created with the JSON-only
         # project schema. Frequent expiry polls must not decode cancelled history.
@@ -181,7 +183,12 @@ class CollaborationStore:
             finally:
                 self.db.execute("ROLLBACK TO creation_validation")
                 self.db.execute("RELEASE creation_validation")
-            intent = {"body": canonical, "thread_id": body.get("thread_id"), "status": "reserved"}
+            intent = {
+                "body": canonical,
+                "thread_id": body.get("thread_id"),
+                "status": "reserved",
+                "created": self.clock(),
+            }
             self.save_creation(actor, key, intent)
             return intent, True
 
@@ -195,13 +202,21 @@ class CollaborationStore:
     def finish_creation(self, actor, intent):
         with self.transaction():
             project = self.create_project(
-                actor, {**intent["body"], "thread_id": intent["thread_id"]}
+                actor,
+                {**intent["body"], "thread_id": intent["thread_id"]},
+                created=intent.get("created"),
             )
+            stop = self.db.execute(
+                "SELECT cutoff FROM origin_stops WHERE actor=? AND thread=?",
+                (actor, project["origin_thread_id"]),
+            ).fetchone()
+            if stop and project["created"] <= stop[0]:
+                project = self.cancel(project["id"], actor)
             intent["status"] = "complete"
             self.save_creation(actor, intent["body"]["key"], intent)
             return project
 
-    def create_project(self, actor, body):
+    def create_project(self, actor, body, *, created=None):
         body = {"owner_in_discussion": False, **body}
         key = body.get("key")
         fingerprint = hashlib.sha256(
@@ -232,6 +247,7 @@ class CollaborationStore:
             raise ValueError("Project limits must be positive bounded integers")
         channel = text(body.get("channel_id"), "channel_id", 128)
         thread = text(body.get("thread_id"), "thread_id", 128)
+        admitted = self.clock() if created is None else created
         item = {
             "id": identifier(),
             "title": text(body.get("title"), "title", 200),
@@ -243,9 +259,9 @@ class CollaborationStore:
             "origin_thread_id": body.get("origin_thread_id") or thread,
             "origin_channel_id": body.get("origin_channel_id") or channel,
             "status": "active",
-            "created": self.clock(),
+            "created": admitted,
             "limits": limits,
-            "deadline": self.clock() + limits["max_seconds"],
+            "deadline": admitted + limits["max_seconds"],
             "dispatched": 0,
             "cost_coverage": "unknown",
             "bindings": {},
@@ -369,14 +385,6 @@ class CollaborationStore:
             if recipient == actor:
                 raise ValueError("Self-addressed work is not collaboration")
             parent_id = body.get("parent")
-            if not parent_id:
-                row = self.db.execute(
-                    "SELECT id FROM messages WHERE project=? AND recipient=? "
-                    "AND kind IN ('ask','work') AND state='running' "
-                    "ORDER BY created DESC LIMIT 1",
-                    (pid, actor),
-                ).fetchone()
-                parent_id = row[0] if row else None
             depth = 0
             if parent_id:
                 parent = self.get_message(parent_id, actor)
@@ -825,6 +833,12 @@ class CollaborationStore:
             except OverflowError:
                 raise ValueError("Cancellation cutoff must be a finite timestamp") from None
         with self.transaction():
+            boundary = self.clock() if cutoff is None else cutoff
+            self.db.execute(
+                "INSERT INTO origin_stops VALUES(?,?,?) "
+                "ON CONFLICT(actor,thread) DO UPDATE SET cutoff=MAX(cutoff,excluded.cutoff)",
+                (actor, thread, boundary),
+            )
             rows = self.db.execute(
                 "SELECT id FROM projects WHERE owner=? AND origin_thread=? AND status='active'"
                 + (" AND created<=?" if cutoff is not None else ""),
