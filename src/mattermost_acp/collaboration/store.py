@@ -338,7 +338,8 @@ class CollaborationStore:
             project = self.get_project(pid, actor)
             if self.db.execute(
                 "SELECT 1 FROM messages WHERE project=? AND recipient=? "
-                "AND state IN ('running','unconfirmed','interrupted','cancelling')",
+                "AND (state IN ('running','unconfirmed','interrupted','cancelling') "
+                "OR json_extract(data,'$.execution_pending')=1)",
                 (pid, actor),
             ).fetchone():
                 raise ValueError("Cannot change a binding with active requests")
@@ -609,7 +610,28 @@ class CollaborationStore:
                 or (claim is not None and claim != item.get("claim"))
             ):
                 raise PermissionError("Stale or foreign worker instance")
-            if state in {"evidence", "execution_settled"}:
+            if state in {"evidence", "execution_settled", "undispatched"}:
+                if state == "undispatched":
+                    receipt = evidence or {}
+                    reserved = item.get("evidence", {})
+                    if (
+                        receipt.get("native_dispatched") is not False
+                        or receipt.get("not_dispatched") is not True
+                        or not reserved.get("session_id")
+                        or any(
+                            receipt.get(field) != reserved.get(field)
+                            for field in ("session_id", "execution_id", "native_epoch")
+                        )
+                    ):
+                        raise ValueError("Undispatched proof must match the native reservation")
+                    item["execution_pending"] = False
+                    item["execution_cancelling"] = False
+                    if item["state"] == "cancelling":
+                        item.update(
+                            state="cancelled",
+                            result="Cancelled before native dispatch",
+                            completed=self.clock(),
+                        )
                 if state == "execution_settled":
                     if item["state"] not in TERMINAL:
                         raise ValueError("Native settlement requires a terminal correlated result")
@@ -645,7 +667,7 @@ class CollaborationStore:
                             continue
                         delivery.setdefault("result_evidence", {}).update(evidence or {})
                         self.save_message(delivery)
-                if state == "execution_settled":
+                if state in {"execution_settled", "undispatched"}:
                     self.finish_cancellation(item["project"], actor)
                 return item
             if item["state"] in TERMINAL:
@@ -654,13 +676,29 @@ class CollaborationStore:
                 raise ValueError("Message already settled")
             if item["state"] not in ACTIVE:
                 raise PermissionError("Delivery is no longer owned by this worker")
-            if state == "dispatch":
+            if state in {"dispatch", "post_dispatch"}:
                 project = self.get_project(item["project"], actor)
                 if item["state"] != "running" or project["status"] != "active":
                     return item
+                if state == "dispatch" and not (evidence or {}).get("session_id"):
+                    raise ValueError("Native dispatch requires its session")
+                if state == "post_dispatch" and (
+                    item["kind"] != "result"
+                    or item.get("execution_pending")
+                    or any(
+                        (evidence or {}).get(field)
+                        for field in ("session_id", "execution_id", "native_epoch")
+                    )
+                ):
+                    raise ValueError("Post delivery cannot reserve native execution")
                 item["evidence"].update(evidence or {})
-                item["evidence"]["dispatch_started"] = self.clock()
-                item["execution_pending"] = True
+                if state == "dispatch":
+                    item["evidence"].pop("not_dispatched", None)
+                    item["evidence"].pop("native_dispatched", None)
+                item["evidence"]["dispatch_started" if state == "dispatch" else "post_started"] = (
+                    self.clock()
+                )
+                item["execution_pending"] = state == "dispatch"
                 item["lease_until"] = self.clock() + 45
             elif state == "heartbeat":
                 item["lease_until"] = self.clock() + 45

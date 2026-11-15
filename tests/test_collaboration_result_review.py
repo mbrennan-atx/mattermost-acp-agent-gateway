@@ -19,7 +19,7 @@ from test_collaboration_regressions import (
     sidecar_project,
 )
 
-from mattermost_acp.acp import SessionUpdate, TurnResult
+from mattermost_acp.acp import AcpBroker, SessionUpdate, TurnResult
 from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
@@ -354,6 +354,169 @@ async def test_admission_cannot_forget_unobserved_native_execution_after_early_r
             await consumer.set_admission("sealed")
         assert consumer.claim_uncertain
         assert store.get_message(parent["id"], "beta")["execution_pending"]
+
+
+async def test_posted_result_has_no_native_debt_and_cold_sidecar_can_seal(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.collab_sidecar = True
+    gateway.config.slash_port = 0
+    gateway.config.slash_tokens = frozenset({"synthetic-slash-token"})
+    gateway.sessions.broker = AcpBroker()
+    gateway.sessions.busy_threads = set()
+    consumer = CollaborationConsumer(gateway, clients["alpha"].settings)
+    gateway.collaboration = consumer
+    published = {}
+
+    async def read(post):
+        return (
+            {"id": "origin", "channel_id": "home", "root_id": ""} if post == "origin" else published
+        )
+
+    async def publish(channel, message, *, root_id):
+        published.update(id="notice", channel_id=channel, root_id=root_id, message=message)
+        return published
+
+    gateway.client.get_post = AsyncMock(side_effect=read)
+    gateway.client.create_post = AsyncMock(side_effect=publish)
+    maintenance = None
+    try:
+        p = sidecar_project(store)
+        peer = ask(store, p["id"], recipient="beta")
+        claimed = store.claim_next("beta", "peer")
+        store.reply(peer["id"], "beta", "Verified result", claim=claimed["claim"])
+        delivery = store.claim_next("alpha", consumer.instance)
+        await consumer.handle(delivery)
+        posted = store.get_message(delivery["id"], "alpha")
+        assert posted["state"] == "done" and not posted["execution_pending"]
+        assert "post_started" in posted["evidence"]
+        assert "dispatch_started" not in posted["evidence"]
+        assert store.active_claims("alpha", consumer.instance) == []
+        consumer.claim_uncertain = True
+        maintenance = await maintenance_client(gateway)
+        headers = {"Authorization": "Bearer " + clients["alpha"].settings.token}
+        assert (
+            await maintenance.post("/maintenance", json={"action": "drain"}, headers=headers)
+        ).status == 200
+        assert (
+            await maintenance.post("/maintenance", json={"action": "seal"}, headers=headers)
+        ).status == 200
+        assert gateway.sealed and not consumer.claim_uncertain
+        assert not gateway.sessions.broker.is_running
+        gateway.run_prompt.assert_not_awaited()
+    finally:
+        if maintenance:
+            await maintenance.close()
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("change", ["thread", "workspace"])
+async def test_binding_cannot_move_early_replys_pending_native_execution(tmp_path, change):
+    async with retained_parent(tmp_path) as (store, _clients, _gateway, consumer, p, parent, _old):
+        store.reply(parent["id"], "beta", "Explicit early result", claim=parent["claim"])
+        binding = {
+            "thread_id": "another-thread" if change == "thread" else "discussion",
+            "channel_id": "floor",
+        }
+        if change == "workspace":
+            binding["workspace"] = str(tmp_path)
+        original = store.get_project(p["id"], "beta")["bindings"]["beta"]
+        with pytest.raises(ValueError, match="active requests"):
+            store.bind(p["id"], "beta", binding)
+        assert store.get_project(p["id"], "beta")["bindings"]["beta"] == original
+        store.update(
+            parent["id"],
+            "beta",
+            consumer.instance,
+            "execution_settled",
+            evidence=terminal(),
+            claim=parent["claim"],
+        )
+        assert store.bind(p["id"], "beta", binding) == binding
+
+
+@pytest.mark.parametrize("failure", ["reply", "reply_lost_receipt", "prompt_required"])
+async def test_proven_prewrite_outcomes_leave_no_false_native_claim(tmp_path, failure):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.get = AsyncMock(
+        return_value=SimpleNamespace(session_id="existing-native")
+    )
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    original = consumer.update
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        if failure == "prompt_required":
+            gateway.sessions.hint = AsyncMock(return_value="promptRequired")
+            gateway.sessions.ensure_session = AsyncMock(
+                side_effect=RuntimeError("Preparation failed before native work")
+            )
+        else:
+            broker.capabilities.steering = False
+
+            async def reply_during_reservation(item, state, *args, **kwargs):
+                receipt = await original(item, state, *args, **kwargs)
+                if state == "dispatch":
+                    store.reply(
+                        request["id"], "beta", "Explicit prewrite result", claim=claimed["claim"]
+                    )
+                    if failure == "reply_lost_receipt":
+                        raise HubError("Reservation response lost before native prompt")
+                    return store.get_message(item["id"], "beta")
+                return receipt
+
+            consumer.update = reply_during_reservation
+        await consumer.handle(claimed)
+        receipt = store.get_message(request["id"], "beta")
+        assert not receipt["execution_pending"]
+        assert store.active_claims("beta", consumer.instance) == []
+        assert writer.messages == []
+        assert not consumer.owns_thread("discussion")
+        if failure != "prompt_required":
+            assert receipt["state"] == "done" and receipt["result"] == "Explicit prewrite result"
+            assert receipt["evidence"]["not_dispatched"]
+        else:
+            assert receipt["state"] == "queued"
+    finally:
+        await consumer.close()
+        await close_reports(gateway)
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("mismatch", ["claim", "session_id", "execution_id", "native_epoch"])
+async def test_undispatched_proof_cannot_clear_a_changed_reservation(tmp_path, mismatch):
+    async with retained_parent(tmp_path) as (store, _clients, _gateway, consumer, p, parent, _old):
+        store.reply(parent["id"], "beta", "Explicit prewrite result", claim=parent["claim"])
+        store.cancel(p["id"], "alpha")
+        evidence = {
+            **store.get_message(parent["id"], "beta")["evidence"],
+            "not_dispatched": True,
+            "native_dispatched": False,
+        }
+        claim = parent["claim"]
+        if mismatch == "claim":
+            claim = "stale-claim"
+        else:
+            evidence[mismatch] = "changed-reservation"
+        with pytest.raises(PermissionError if mismatch == "claim" else ValueError):
+            store.update(
+                parent["id"],
+                "beta",
+                consumer.instance,
+                "undispatched",
+                evidence=evidence,
+                claim=claim,
+            )
+        current = store.get_message(parent["id"], "beta")
+        assert current["execution_pending"] and current["execution_cancelling"]
+        assert current["result"] == "Explicit prewrite result"
+        assert store.show(p["id"], "alpha")["status"] == "cancelling"
 
 
 async def test_old_worker_cleanup_preserves_new_claim_owner_and_cancellation_fence(tmp_path):

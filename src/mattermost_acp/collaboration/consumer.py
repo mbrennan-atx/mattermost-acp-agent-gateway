@@ -534,7 +534,7 @@ class CollaborationConsumer:
                 return
             current = await self.hub.request("GET", f"/messages/{item['id']}")
             if current["state"] == "cancelling":
-                await self.update(item, "cancelled", "Cancelled before native dispatch")
+                await self.update(item, "queued")
                 return
             if current["state"] != "running" or current.get("claim") != item.get("claim"):
                 return
@@ -600,7 +600,6 @@ class CollaborationConsumer:
                 ) == "promptRequired"
             if can_hint:
                 if not await self.reserve(item, record.session_id):
-                    await self.update(item, "cancelled", "Cancelled before native injection")
                     return
                 try:
                     outcome = await self.gateway.sessions.hint(
@@ -616,8 +615,8 @@ class CollaborationConsumer:
                         ),
                     )
                 except NativeDispatchChanged:
+                    await self.undispatched(item, requeue=True)
                     self.release_ownership((item["id"], item.get("claim")))
-                    await self.update(item, "queued")
                     return
                 except Exception:
                     # The adapter may have accepted the injection before a timeout/error.
@@ -642,6 +641,8 @@ class CollaborationConsumer:
             if outcome not in {None, "promptRequired"}:
                 await self.update(item, "unconfirmed", "Unknown native delivery outcome")
                 return
+            if outcome == "promptRequired":
+                await self.undispatched(item)
             self.release_ownership((item["id"], item.get("claim")))
             continuation = await self.continuation(item)
             if self.active(thread) and continuation is None:
@@ -680,6 +681,14 @@ class CollaborationConsumer:
                 self.reserving.difference_update(transfer_keys)
             # Explicit mm-work reply may already have settled the request.
             current = await self.hub.request("GET", f"/messages/{item['id']}")
+            if (
+                result
+                and (result.get("queued") or result.get("native_dispatched") is False)
+                and item.get("reservation_evidence")
+                and current.get("claim") == item.get("claim")
+                and current.get("execution_pending")
+            ):
+                current = await self.undispatched(item)
             if current["state"] in {"done", "failed", "blocked", "cancelled"}:
                 if result and not result.get("queued"):
                     await self.update(item, "evidence", evidence=self.foreground(item, result))
@@ -687,7 +696,12 @@ class CollaborationConsumer:
                         await self.injected_wait(item)
                 return
             if result is None:
-                await self.update(item, "interrupted", "No confirmed native terminal receipt")
+                if current.get("execution_pending") is False and current.get("evidence", {}).get(
+                    "not_dispatched"
+                ):
+                    await self.update(item, "queued")
+                else:
+                    await self.update(item, "interrupted", "No confirmed native terminal receipt")
             elif result.get("queued"):
                 await self.update(item, "queued")
             elif result.get("pending"):
@@ -758,6 +772,21 @@ class CollaborationConsumer:
         evidence["foreground_answer"] = answer
         return evidence
 
+    async def undispatched(self, item, evidence=None, *, requeue=False):
+        receipt = await self.update(
+            item,
+            "undispatched",
+            evidence={
+                **(evidence if evidence is not None else item["reservation_evidence"]),
+                "native_dispatched": False,
+                "not_dispatched": True,
+            },
+        )
+        self.release_ownership((item["id"], item.get("claim")))
+        if requeue and receipt["state"] == "running":
+            return await self.update(item, "queued")
+        return receipt
+
     async def reserve(self, item, session):
         report = self.gateway._reports.get(session)
         epoch = getattr(self.gateway.sessions, "native_epoch", lambda _thread: 0)(
@@ -767,15 +796,17 @@ class CollaborationConsumer:
         self.reserving.add(key)
         self.ownership[key] = report
         self.ownership_threads[key] = item["binding"]["thread_id"]
+        evidence = {
+            "session_id": session,
+            "execution_id": (report or {}).get("execution_id"),
+            "native_epoch": epoch,
+        }
+        item["reservation_evidence"] = evidence
         try:
             receipt = await self.update(
                 item,
                 "dispatch",
-                evidence={
-                    "session_id": session,
-                    "execution_id": (report or {}).get("execution_id"),
-                    "native_epoch": epoch,
-                },
+                evidence=evidence,
             )
             accepted = (
                 receipt["state"] == "running"
@@ -785,9 +816,11 @@ class CollaborationConsumer:
             if accepted:
                 item["native_epoch"] = epoch
             else:
+                if receipt.get("claim") == item.get("claim") and receipt.get("execution_pending"):
+                    receipt = await self.undispatched(item, evidence)
+                if receipt["state"] == "running":
+                    await self.update(item, "queued")
                 self.release_ownership(key)
-                if receipt["state"] == "cancelling" or key in self.cancelled_claims:
-                    await self.update(item, "cancelled", "Cancelled before native dispatch")
             return accepted
         finally:
             self.reserving.discard(key)
@@ -949,7 +982,7 @@ class CollaborationConsumer:
             + f"Full result and evidence: `mm-work show {item['project']}`."
         ).replace("@", "@\u200b")
         receipt = await self.update(
-            item, "dispatch", evidence={"delivery": "posted", "origin_thread_id": thread}
+            item, "post_dispatch", evidence={"delivery": "posted", "origin_thread_id": thread}
         )
         if receipt["state"] != "running" or receipt.get("claim") != item.get("claim"):
             if receipt["state"] == "cancelling" and receipt.get("claim") == item.get("claim"):

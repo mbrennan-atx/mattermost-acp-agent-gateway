@@ -982,6 +982,8 @@ async def test_cancel_during_dispatch_reservation_rejects_stale_success(tmp_path
         assert not await reservation
         await asyncio.wait_for(cancellation, 3)
         assert store.get_message(request["id"], "alpha")["state"] == "cancelled"
+        assert not store.get_message(request["id"], "alpha")["execution_pending"]
+        assert store.active_claims("beta", consumer.instance) == []
         gateway.sessions.cancel.assert_not_awaited()
     finally:
         release.set()
