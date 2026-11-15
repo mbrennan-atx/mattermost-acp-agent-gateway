@@ -19,6 +19,7 @@ from mattermost_acp.store import ThreadStore
 
 
 def project(store, owner="alpha", **limits):
+    suffix = str(len(store.list_projects(owner)))
     return store.create_project(
         owner,
         {
@@ -26,7 +27,7 @@ def project(store, owner="alpha", **limits):
             "objective": "Find the failing dependency",
             "members": ["alpha", "beta", "gamma"],
             "channel_id": "floor",
-            "thread_id": "discussion",
+            "thread_id": "discussion" if suffix == "0" else "discussion-" + suffix,
             "origin_channel_id": "home",
             "origin_thread_id": "origin",
             "limits": limits,
@@ -84,7 +85,12 @@ async def api_fixture(tmp_path):
             "message": "@beta ASK: Verify the dependency",
         }
 
-    server = TestServer(build_app(store, actors, verify_post=verify_post))
+    async def verify_recipient(actor):
+        return {"id": actor + "-user", "username": actor}
+
+    server = TestServer(
+        build_app(store, actors, verify_post=verify_post, verify_recipient=verify_recipient)
+    )
     await server.start_server()
     clients = {
         name: HubClient(Settings(str(server.make_url("/")).rstrip("/"), data["token"]))
@@ -591,3 +597,300 @@ async def test_final_native_dispatch_callback_can_cancel_without_prompt(tmp_path
     assert result.stop_reason == "cancelled" and "before native dispatch" in result.answer_text
     callback.assert_awaited_once_with("reserved-native")
     broker.prompt_turn.assert_not_awaited()
+
+
+def test_worker_bindings_are_exclusive_but_owner_origins_can_be_shared(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    first = project(store)
+    second = project(store)
+    assert first["bindings"]["alpha"] == second["bindings"]["alpha"]
+    with pytest.raises(ValueError, match="another project"):
+        store.bind(second["id"], "beta", {"thread_id": "discussion", "channel_id": "floor"})
+    store.cancel(first["id"], "alpha")
+    store.bind(second["id"], "beta", {"thread_id": "discussion", "channel_id": "floor"})
+    store.close()
+
+
+def test_cancelled_result_and_owner_request_do_not_stop_owner_native_work(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    p = project(store)
+    work = ask(store, p["id"])
+    store.claim_next("beta", "worker")
+    store.reply(work["id"], "beta", "Verified")
+    delivery = store.claim_next("alpha", "owner")
+    question = ask(store, p["id"], sender="beta", recipient="alpha", key="owner-question")
+    store.claim_next("alpha", "owner")
+    store.cancel(p["id"], "alpha")
+    state = store.show(p["id"], "alpha")
+    assert store.get_message(delivery["id"], "alpha")["state"] == "cancelled"
+    assert store.get_message(question["id"], "alpha")["state"] == "cancelled"
+    assert not [m for m in state["messages"] if m["kind"] == "cancel"]
+    assert state["status"] == "cancelled"
+    store.close()
+
+
+def test_cancellation_preserves_uncertainty_on_shutdown_and_terminal_failure(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    p = project(store)
+    m = ask(store, p["id"])
+    store.claim_next("beta", "worker")
+    store.cancel(p["id"], "alpha")
+    store.update(m["id"], "beta", "worker", "interrupted", "Gateway shutting down")
+    assert store.show(p["id"], "alpha")["status"] == "cancelling"
+    assert store.get_message(m["id"], "alpha")["state"] == "cancelling"
+    store.update(
+        m["id"],
+        "beta",
+        "worker",
+        "failed",
+        "Native limit reached",
+        {"stop_reason": "max_tokens", "pending": False},
+    )
+    assert store.get_message(m["id"], "alpha")["state"] == "failed"
+    assert store.show(p["id"], "alpha")["status"] == "cancelled"
+    store.close()
+
+
+def test_attempt_evidence_notes_reserved_keys_and_whitespace(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    p = project(store)
+    m = ask(store, p["id"])
+    store.claim_next("beta", "worker")
+    store.update(m["id"], "beta", "worker", "dispatch", evidence={"session_id": "old"})
+    store.update(m["id"], "beta", "worker", "queued")
+    assert not store.get_message(m["id"], "alpha")["evidence"]
+    now = store.clock()
+    store.clock = lambda: now + 3
+    store.claim_next("beta", "worker")
+    claim = store.get_message(m["id"], "alpha")["claim"]
+    store.update(m["id"], "beta", "worker", "done", "Verified.\n", claim=claim)
+    store.update(m["id"], "beta", "worker", "done", "Verified.\n", claim=claim)
+    with pytest.raises(ValueError, match="Reserved"):
+        ask(store, p["id"], sender="beta", key="result:" + m["id"])
+    first = store.note(p["id"], "alpha", "Decision", key="note-1")
+    assert store.note(p["id"], "alpha", "Decision", key="note-1")["id"] == first["id"]
+    with pytest.raises(ValueError, match="note idempotency"):
+        store.note(p["id"], "alpha", "Other decision", key="note-1")
+    store.close()
+
+
+async def test_cancel_without_native_reservation_settles_and_reused_turn_is_preserved(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    consumer = CollaborationConsumer(active_gateway(), clients["beta"].settings)
+    try:
+        p = project(store)
+        m = ask(store, p["id"])
+        store.claim_next("beta", consumer.instance)
+        store.cancel(p["id"], "alpha")
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(m["id"], "alpha")["state"] == "cancelled"
+        consumer.gateway.sessions.cancel.assert_not_awaited()
+        other = project(store)
+        m = ask(store, other["id"])
+        claim = store.claim_next("beta", consumer.instance)
+        consumer.gateway._reports["existing-native"] = {"execution_id": "first"}
+        await consumer.reserve(claim, "existing-native")
+        consumer.gateway._reports["existing-native"] = {"execution_id": "later"}
+        consumer.gateway._last_terminal["discussion-1"] = {
+            "session_id": "existing-native",
+            "execution_id": "later",
+            "completed_at": store.clock() + 1,
+            "pending": False,
+            "stop_reason": "end_turn",
+            "answer": "Unrelated later answer",
+        }
+        store.cancel(other["id"], "alpha")
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(m["id"], "alpha")["state"] == "cancelling"
+        consumer.gateway.sessions.cancel.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_cli_creation_scopes_keys_to_owner(tmp_path, monkeypatch):
+    from mattermost_acp.collaboration.cli import execute, parser
+
+    store, server, clients = await api_fixture(tmp_path)
+    try:
+        p = project(store)
+        p["key"] = "shared-key"
+        store.save_project(p)
+        monkeypatch.setenv("MATTERMOST_PEER_CHANNEL_ID", "floor")
+        args = parser().parse_args(
+            [
+                "create",
+                "--title",
+                "Peer-owned project",
+                "--objective",
+                "Verify the outcome",
+                "--members",
+                "alpha,beta",
+                "--origin-thread",
+                "beta-origin",
+                "--origin-channel",
+                "floor",
+                "--discussion-thread",
+                "other-root",
+                "--key",
+                "shared-key",
+            ]
+        )
+        created = await execute(args, clients["beta"])
+        assert created["owner"] == "beta" and created["id"] != p["id"]
+    finally:
+        await close_api(store, server, clients)
+
+
+async def test_auto_completion_preserves_full_long_answer(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(steering=False, busy=False)
+    answer = "Long result.\n" * 2000
+    gateway.run_prompt.return_value = {
+        "answer": answer,
+        "session_id": "native",
+        "model": "model",
+        "stop_reason": "end_turn",
+        "pending": False,
+    }
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        p = project(store)
+        m = ask(store, p["id"])
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        saved = store.get_message(m["id"], "alpha")
+        assert saved["state"] == "done"
+        assert Path(saved["evidence"]["result_file"]).read_text() == answer
+        assert len(saved["result"]) < 16000
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_ordinary_prompt_is_not_queued_behind_active_thread():
+    gateway = active_gateway()
+    gateway.run_prompt = MattermostGateway.run_prompt.__get__(gateway)
+    lock = asyncio.Lock()
+    gateway._prompt_locks["discussion"] = lock
+    gateway._run_prompt = AsyncMock()
+    async with lock:
+        await gateway.run_prompt(thread_id="discussion", channel_id="floor", prompt="more work")
+    gateway._run_prompt.assert_not_awaited()
+    assert "Already working" in gateway.client.posts[-1][1]
+
+
+async def test_hub_rejects_real_post_without_addressed_request_intent(tmp_path):
+    from mattermost_acp.collaboration.client import HubError
+
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    project(store)
+    actors = {name: {"token": name * 32, "user_id": name + "-user"} for name in store.actors}
+    body = {
+        "author_id": "alpha-user",
+        "channel_id": "floor",
+        "thread_id": "discussion",
+        "post_id": "real-post",
+        "text": "@gamma ASK: Verify it",
+    }
+
+    async def verify(_post, _actor):
+        return {
+            "user_id": body["author_id"],
+            "channel_id": body["channel_id"],
+            "root_id": body["thread_id"],
+            "message": body["text"],
+        }
+
+    async def verify_recipient(actor):
+        return {"id": actor + "-user", "username": "actual-" + actor}
+
+    server = TestServer(
+        build_app(store, actors, verify_post=verify, verify_recipient=verify_recipient)
+    )
+    await server.start_server()
+    client = HubClient(Settings(str(server.make_url("/")).rstrip("/"), actors["beta"]["token"]))
+    try:
+        with pytest.raises(HubError, match="403"):
+            await client.request("POST", "/mentions", body)
+        assert not store.list_projects("alpha")[0].get("messages")
+        body["text"] = "@beta ASK: Actor label is not the recipient username"
+        with pytest.raises(HubError, match="403"):
+            await client.request("POST", "/mentions", body)
+        body["text"] = "@actual-beta ASK: Verify the dependency"
+        accepted = await client.request("POST", "/mentions", body)
+        assert accepted["recipient"] == "beta"
+    finally:
+        await client.close()
+        await server.close()
+        store.close()
+
+
+async def test_workspace_race_rejects_session_created_while_consumer_waited(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.run_prompt = MattermostGateway.run_prompt.__get__(gateway)
+    workspace = tmp_path / "isolated"
+    workspace.mkdir()
+    p = project(store)
+    store.bind(
+        p["id"],
+        "beta",
+        {"thread_id": "discussion", "channel_id": "floor", "workspace": str(workspace)},
+    )
+    m = ask(store, p["id"])
+    gateway.sessions.store.get.side_effect = [None, SimpleNamespace(cwd=str(tmp_path))]
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(m["id"], "alpha")["state"] == "interrupted"
+        gateway.sessions.hint.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_cancelled_foreground_receipt_waits_for_pending_workers(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.run_prompt.return_value = {
+        "answer": "",
+        "session_id": "native",
+        "stop_reason": "cancelled",
+        "pending": True,
+    }
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    consumer.injected_wait = AsyncMock()
+    try:
+        p = project(store)
+        m = ask(store, p["id"])
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(m["id"], "alpha")["state"] == "running"
+        consumer.injected_wait.assert_awaited_once()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_injected_request_does_not_own_ordinary_user_turn(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway()
+    gateway._reports["existing-native"] = {
+        "execution_id": "ordinary",
+        "collaboration_project": None,
+    }
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    try:
+        p = project(store)
+        m = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        await consumer.reserve(claimed, "existing-native")
+        store.cancel(p["id"], "alpha")
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(m["id"], "alpha")["state"] == "cancelling"
+        gateway.sessions.cancel.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)

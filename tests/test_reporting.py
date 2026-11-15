@@ -167,7 +167,8 @@ async def test_child_progress_survives_parent_rpc_return_and_quiet_goal_continue
         assert all("private reasoning" not in message for message in messages)
         gateway._stop_reports("root")
         sessions.broker.update_observer(SessionUpdate(session_id="root-session", kind="tool_call"))
-        assert "root-session" not in gateway._reports
+        assert gateway._reports["root-session"]["suppressed"]
+        assert gateway._last_terminal["root"]["pending"]
     finally:
         await gateway.close()
         await asyncio.sleep(0)

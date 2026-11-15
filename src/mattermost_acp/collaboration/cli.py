@@ -53,6 +53,7 @@ async def execute(args, hub):
     if command == "show":
         return await hub.request("GET", f"/projects/{args.project}")
     if command == "create":
+        actor = (await hub.request("GET", "/identity"))["actor"]
         members = args.members.split(",") if args.members else await hub.request("GET", "/actors")
         body = {
             "title": args.title,
@@ -68,7 +69,7 @@ async def execute(args, hub):
         }
         # A retry with the same key reuses the first discussion and project.
         for existing in await hub.request("GET", "/projects"):
-            if existing.get("key") == args.key:
+            if existing.get("key") == args.key and existing["owner"] == actor:
                 if any(
                     existing[name] != body[name]
                     for name in (
@@ -113,6 +114,7 @@ async def execute(args, hub):
             {
                 "text": content(args),
                 "artifacts": args.artifact or [],
+                "key": args.key,
             },
         )
     if command == "bind":
@@ -190,6 +192,7 @@ def parser():
     command.add_argument("project")
     text_options(command)
     command.add_argument("--artifact", action="append")
+    command.add_argument("--key", default=uuid.uuid4().hex)
     command = commands.add_parser("bind")
     command.add_argument("project")
     command.add_argument("--thread", required=True)

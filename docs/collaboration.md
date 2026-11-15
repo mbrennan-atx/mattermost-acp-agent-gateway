@@ -55,13 +55,13 @@ For text with quotes, shell syntax or several paragraphs, use `--text-file /path
 
 ## Busy sessions and results
 
-The consumer tries the existing active-only steering capability first. An injected question belongs to the ongoing session and requires an explicit correlated reply:
+The consumer tries the existing active-only steering capability first. Every question asks for an explicit correlated reply, including work that continues in background tools or workers:
 
 ```sh
 mm-work reply REQUEST_ID --claim CLAIM_NONCE --text 'Verified result and evidence' --artifact https://example.com/proof
 ```
 
-The request prompt includes its ID and claim nonce. Use `--state blocked` or `--state failed` when appropriate. The receiver sees the result status, parent request and evidence. A fresh collaboration turn saves its normal final answer automatically; ongoing native work remains pending until an explicit reply supplies its result.
+The request prompt includes its ID and claim nonce. Use `--state blocked` or `--state failed` when appropriate. The receiver sees the result status, parent request and evidence. A fresh collaboration turn also saves a terminal final answer automatically when no required work remains pending. Long automatic results retain their full text in a private runtime file and deliver a bounded preview plus its path. Ongoing native work remains pending until an explicit reply supplies its result.
 
 Unsupported busy steering leaves the message queued. A timeout or unknown injection outcome leaves it `unconfirmed`, since the adapter may have accepted it. Neither case triggers a competing native prompt. Independent threads can continue, while preparation and execution for one native thread are serialized.
 
@@ -75,17 +75,17 @@ Create an isolated worktree using the target repository's existing workflow befo
 mm-work bind PROJECT_ID --thread PROJECT_DISCUSSION_ROOT --channel EXAMPLE_FLOOR --workspace /absolute/path/to/isolated/worktree
 ```
 
-Bindings cannot change while that actor has active requests. An existing native session retains its original working directory; a mismatched workspace is rejected before work starts. Share artifact links and verified results through project state.
+Bindings cannot change while that actor has active requests. Worker threads belong to one project until cancellation settles. Multiple projects may return results to the same owner's originating conversation. An existing native session retains its original working directory; a mismatched workspace is rejected before work starts. Share artifact links and verified results through project state.
 
 ## Recovery and limits
 
-Queued requests survive a hub restart. In-progress requests become `interrupted`; the service cannot prove which actions a crashed native process completed. Inspect the native conversation, files and external receipts, then reconcile before retrying:
+Queued requests survive a hub restart. Unconfirmed or interrupted work retains its worker slot and blocks new requests to that participant until reconciliation. In-progress requests become `interrupted`; the service cannot prove which actions a crashed native process completed. Inspect the native conversation, files and external receipts, then reconcile before retrying:
 
 ```sh
 mm-work retry REQUEST_ID --reconciliation 'Verified the previous attempt made no change'
 ```
 
-Retry creates a new claim nonce, so an old worker cannot settle the new attempt. Reply submission is idempotent for the same result. Keep completed work and evidence when rolling back the executable; never restore an older database over newer state.
+Retry retains old dispatch evidence as history and clears it for the new attempt. It creates a new claim nonce, so an old worker cannot settle the new attempt. Reply submission is idempotent for the same result. Keep completed work and evidence when rolling back the executable; never restore an older database over newer state.
 
 Default project limits are three simultaneous collaboration requests, 24 allocated requests, delegation depth two and one hour. Set other positive limits with the create command's `--max-workers`, `--max-turns`, `--max-depth` and `--max-seconds` options. Dependencies block dispatch until their requests finish successfully. Result and cancellation deliveries bypass the worker limit so a full project can still settle.
 
@@ -97,6 +97,6 @@ Request-count limits bound collaboration activation. They do not enforce an exac
 mm-work cancel PROJECT_ID
 ```
 
-Stopping the owner's originating thread also requests cancellation for its linked projects. Queued work cancels immediately. For active work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session replaced it, cancellation is blocked rather than sent to that newer work.
+Stopping the owner's originating thread also requests cancellation for its linked projects. Queued work cancels immediately. Result deliveries and requests addressed to the owner stop routing without cancelling the owner's ongoing conversation. For active worker work, the consumer targets the recorded native session and repeats cancellation until it sees terminal evidence. If a newer session or native turn replaced it, or the gateway cannot prove turn ownership after a restart, cancellation stays blocked to preserve that work. Reconcile its native outcome before proceeding.
 
 A native result racing cancellation is retained as completed work. It does not establish that effects were prevented. The project remains `cancelling` while any execution lacks terminal evidence; the state makes that uncertainty visible. Cancellation of one project preserves unrelated sessions and projects.

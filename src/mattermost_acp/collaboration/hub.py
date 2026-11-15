@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import fcntl
 import json
+import re
 import secrets
 from pathlib import Path
 
@@ -36,7 +37,13 @@ def load_actors(path: Path) -> dict:
     return loaded
 
 
-def build_app(store: CollaborationStore, actors: dict, *, verify_post=None) -> web.Application:
+def build_app(
+    store: CollaborationStore,
+    actors: dict,
+    *,
+    verify_post=None,
+    verify_recipient=None,
+) -> web.Application:
     changed = asyncio.Event()
 
     @web.middleware
@@ -91,7 +98,9 @@ def build_app(store: CollaborationStore, actors: dict, *, verify_post=None) -> w
         elif action == "bindings":
             result = store.bind(pid, actor, body)
         elif action == "notes":
-            result = store.note(pid, actor, body.get("text"), body.get("artifacts", []))
+            result = store.note(
+                pid, actor, body.get("text"), body.get("artifacts", []), body.get("key")
+            )
         elif action == "cancel":
             result = store.cancel(pid, actor)
         else:
@@ -167,6 +176,9 @@ def build_app(store: CollaborationStore, actors: dict, *, verify_post=None) -> w
             return web.json_response(None)
         if verify_post is not None:
             verified = await verify_post(body["post_id"], request["actor"])
+            if verify_recipient is None:
+                raise PermissionError("Recipient identity verifier is required")
+            recipient = await verify_recipient(request["actor"])
         else:
             settings = actors[request["actor"]]
             base = settings.get("mattermost_url")
@@ -184,6 +196,12 @@ def build_app(store: CollaborationStore, actors: dict, *, verify_post=None) -> w
                     if resp.status != 200:
                         raise PermissionError("Mention source could not be verified")
                     verified = await resp.json()
+                async with session.get(
+                    base.rstrip("/") + "/api/v4/users/" + settings["user_id"]
+                ) as resp:
+                    if resp.status != 200:
+                        raise PermissionError("Recipient identity could not be verified")
+                    recipient = await resp.json()
         if any(
             verified.get(source) != body.get(supplied)
             for source, supplied in (
@@ -194,6 +212,16 @@ def build_app(store: CollaborationStore, actors: dict, *, verify_post=None) -> w
             )
         ):
             raise PermissionError("Mention source does not match the real post")
+        if recipient.get("id") != actors[request["actor"]]["user_id"] or not recipient.get(
+            "username"
+        ):
+            raise PermissionError("Recipient identity does not match the authenticated actor")
+        if not re.match(
+            r"^\s*@" + re.escape(recipient["username"]) + r"\s+ASK:\s+\S",
+            verified.get("message", ""),
+            re.IGNORECASE,
+        ):
+            raise PermissionError("Mention must explicitly address this actor with ASK:")
         return web.json_response(
             store.mention(
                 sender,
@@ -211,7 +239,11 @@ def build_app(store: CollaborationStore, actors: dict, *, verify_post=None) -> w
     async def directory(_request):
         return web.json_response(sorted(actors))
 
+    async def identity(request):
+        return web.json_response({"actor": request["actor"]})
+
     app.router.add_get("/actors", directory)
+    app.router.add_get("/identity", identity)
     app.router.add_get("/healthz", health)
     app.router.add_route("*", "/projects", projects)
     app.router.add_get("/projects/{pid}", show)

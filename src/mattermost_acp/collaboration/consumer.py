@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
+from pathlib import Path
 
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
 
@@ -20,6 +21,7 @@ class CollaborationConsumer:
         self.task = None
         self.workers: dict[str, asyncio.Task] = {}
         self.closing = False
+        self.ownership = {}
 
     def start(self):
         self.task = asyncio.create_task(self.run(), name="collaboration-mailbox")
@@ -91,11 +93,16 @@ class CollaborationConsumer:
             if state["state"] not in {"running", "cancelling"}:
                 return
             terminal = self.gateway._last_terminal.get(item["binding"]["thread_id"])
+            receipt = state.get("evidence", {})
             if (
                 state["state"] == "cancelling"
+                and receipt.get("session_id")
                 and terminal
+                and terminal.get("session_id") == receipt["session_id"]
+                and terminal.get("execution_id") == receipt.get("execution_id")
                 and terminal["stop_reason"] == "cancelled"
-                and terminal["completed_at"] > item["created"]
+                and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
+                and not terminal.get("pending")
             ):
                 await self.update(item, "cancelled", "Native stop=cancelled", terminal)
                 return
@@ -110,13 +117,14 @@ class CollaborationConsumer:
         )
         if item["kind"] in {"ask", "work"}:
             instructions += (
-                "Return the substantive result and verification. If this request was injected "
-                "into ongoing work, you MUST submit its result with `mm-work reply "
+                "Return the substantive result and verification. You MUST submit its result "
+                "with `mm-work reply "
                 + item["id"]
                 + " --claim "
                 + item.get("claim", "")
                 + " --text '<result and evidence>'`; a normal final answer alone cannot identify "
                 "which injected request it answers. "
+                "If you launch background work, submit that reply when all required work finishes. "
                 "Use --state blocked or failed when appropriate. "
                 "Further delegation uses `mm-work ask "
                 + item["project"]
@@ -219,6 +227,7 @@ class CollaborationConsumer:
                 author_id="project:" + item["project"],
                 author_name=item["sender"],
                 workspace=binding.get("workspace"),
+                collaboration_project=item["project"],
                 before_native=lambda session: self.reserve(item, session),
             )
             # Explicit mm-work reply may already have settled the request.
@@ -227,23 +236,33 @@ class CollaborationConsumer:
                 return
             if result is None:
                 await self.update(item, "interrupted", "No confirmed native terminal receipt")
-            elif result["stop_reason"] == "cancelled":
-                await self.update(item, "cancelled", "Native stop=cancelled", result)
             elif result.get("pending"):
                 await self.update(item, "heartbeat", evidence=result)
                 await self.injected_wait(item)
+            elif result["stop_reason"] == "cancelled":
+                await self.update(item, "cancelled", "Native stop=cancelled", result)
             else:
                 state = "done" if result["stop_reason"] == "end_turn" else "failed"
+                answer = result["answer"] or "No substantive answer"
+                evidence = {
+                    "session_id": result["session_id"],
+                    "model": result["model"],
+                    "stop_reason": result["stop_reason"],
+                    "delivery": "continuation",
+                }
+                if len(answer) > 8000:
+                    folder = Path.home() / ".local/state/mattermost-acp-collaboration/results"
+                    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    path = folder / (item["id"] + ".txt")
+                    path.write_text(answer)
+                    path.chmod(0o600)
+                    evidence["result_file"] = str(path)
+                    answer = answer[:8000] + "\nFull result saved at " + str(path)
                 await self.update(
                     item,
                     state,
-                    result["answer"] or "No substantive answer",
-                    {
-                        "session_id": result["session_id"],
-                        "model": result["model"],
-                        "stop_reason": result["stop_reason"],
-                        "delivery": "continuation",
-                    },
+                    answer,
+                    evidence,
                 )
         except asyncio.CancelledError:
             try:
@@ -266,8 +285,16 @@ class CollaborationConsumer:
             await asyncio.gather(renewal, return_exceptions=True)
 
     async def reserve(self, item, session):
-        receipt = await self.update(item, "dispatch", evidence={"session_id": session})
-        return receipt["state"] == "running" and receipt.get("claim") == item.get("claim")
+        report = self.gateway._reports.get(session)
+        receipt = await self.update(
+            item,
+            "dispatch",
+            evidence={"session_id": session, "execution_id": (report or {}).get("execution_id")},
+        )
+        accepted = receipt["state"] == "running" and receipt.get("claim") == item.get("claim")
+        if accepted:
+            self.ownership[(item["id"], item.get("claim"))] = report
+        return accepted
 
     async def handle_cancel(self, item):
         for _ in range(20):
@@ -277,16 +304,31 @@ class CollaborationConsumer:
                 return
             binding = target.get("binding", item["binding"])
             expected = target.get("evidence", {}).get("session_id")
+            if not expected:
+                await self.hub.request(
+                    "POST",
+                    f"/messages/{target['id']}/update",
+                    {
+                        "instance": target.get("instance"),
+                        "claim": target.get("claim"),
+                        "state": "cancelled",
+                        "result": "No native dispatch was reserved",
+                    },
+                )
+                continue
             started = target.get("evidence", {}).get("dispatch_started", target["created"])
             terminal = self.gateway._last_terminal.get(binding["thread_id"])
             if (
                 expected
                 and terminal
                 and terminal.get("session_id") == expected
+                and terminal.get("execution_id") == target.get("evidence", {}).get("execution_id")
                 and terminal["completed_at"] >= started
                 and not terminal.get("pending")
             ):
-                state = "cancelled" if terminal["stop_reason"] == "cancelled" else "done"
+                state = {"cancelled": "cancelled", "end_turn": "done"}.get(
+                    terminal["stop_reason"], "failed"
+                )
                 await self.hub.request(
                     "POST",
                     f"/messages/{target['id']}/update",
@@ -301,6 +343,16 @@ class CollaborationConsumer:
                 continue
             record = await self.gateway.sessions.store.get(binding["thread_id"])
             if expected and record is not None and record.session_id == expected:
+                owned = self.ownership.get((target["id"], target.get("claim")))
+                current = self.gateway._reports.get(expected)
+                if owned is None or current is not owned:
+                    await self.update(item, "blocked", "Native turn ownership changed or unknown")
+                    return
+                if current.get("collaboration_project") != target["project"]:
+                    await self.update(
+                        item, "blocked", "Shared native turn; preserve unrelated work"
+                    )
+                    return
                 # Repeat an idempotent cancellation until actual termination is observed.
                 await self.gateway.sessions.cancel(binding["thread_id"])
             elif expected and record is not None and record.session_id != expected:

@@ -76,8 +76,11 @@ class CollaborationStore:
 
     def save_message(self, item):
         self.db.execute(
-            """INSERT OR REPLACE INTO messages
-            VALUES(?,?,?,?,?,?,?,?,?)""",
+            """INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+            project=excluded.project,sender=excluded.sender,recipient=excluded.recipient,
+            kind=excluded.kind,state=excluded.state,created=excluded.created,
+            key=excluded.key,data=excluded.data""",
             (
                 item["id"],
                 item["project"],
@@ -165,8 +168,23 @@ class CollaborationStore:
             "channel_id": item["origin_channel_id"],
         }
         with self.transaction():
+            for member, binding in item["bindings"].items():
+                self.check_binding(item, member, binding)
             self.save_project(item)
         return item
+
+    def check_binding(self, project, actor, binding):
+        for other in self.list_projects(actor):
+            if other["id"] == project["id"] or other["status"] == "cancelled":
+                continue
+            existing = other["bindings"][actor]
+            if existing["thread_id"] != binding["thread_id"]:
+                continue
+            # Results may return to the same owner's conversation. Worker sessions
+            # must remain exclusive, including sessions awaiting reconciliation.
+            if project["owner"] == actor == other["owner"]:
+                continue
+            raise ValueError("Native worker binding belongs to another project")
 
     def list_projects(self, actor):
         return [
@@ -194,7 +212,7 @@ class CollaborationStore:
             project = self.get_project(pid, actor)
             if self.db.execute(
                 "SELECT 1 FROM messages WHERE project=? AND recipient=? "
-                "AND state IN ('running','unconfirmed','cancelling')",
+                "AND state IN ('running','unconfirmed','interrupted','cancelling')",
                 (pid, actor),
             ).fetchone():
                 raise ValueError("Cannot change a binding with active requests")
@@ -206,7 +224,8 @@ class CollaborationStore:
                 workspace = Path(body["workspace"])
                 if not workspace.is_absolute() or not workspace.is_dir():
                     raise ValueError("workspace must be an existing absolute directory")
-                binding["workspace"] = str(workspace)
+                binding["workspace"] = str(workspace.resolve())
+            self.check_binding(project, actor, binding)
             project["bindings"][actor] = binding
             self.save_project(project)
             return binding
@@ -218,6 +237,8 @@ class CollaborationStore:
             if kind not in WORK:
                 raise ValueError("Only substantive ask/work requests can be submitted")
             key = text(body.get("key"), "idempotency key", 200)
+            if key.startswith(("result:", "cancel:")):
+                raise ValueError("Reserved delivery key namespace")
             fingerprint = hashlib.sha256(
                 json.dumps({k: v for k, v in body.items() if k != "key"}, sort_keys=True).encode()
             ).hexdigest()
@@ -227,7 +248,7 @@ class CollaborationStore:
             ).fetchone()
             if row:
                 existing = json.loads(row[0])
-                if existing["fingerprint"] != fingerprint:
+                if existing.get("fingerprint") != fingerprint:
                     raise ValueError("Conflicting idempotency key payload")
                 return existing
             if project["status"] != "active" or project["deadline"] <= self.clock():
@@ -299,7 +320,7 @@ class CollaborationStore:
             self.save_message(item)
             return item
 
-    def note(self, pid, actor, body, artifacts=None):
+    def note(self, pid, actor, body, artifacts=None, key=None):
         with self.transaction():
             self.get_project(pid, actor)
             if not isinstance(artifacts or [], list):
@@ -311,7 +332,17 @@ class CollaborationStore:
                 "text": text(body),
                 "artifacts": artifacts or [],
                 "created": self.clock(),
+                "key": text(key, "note idempotency key", 200) if key else identifier(),
             }
+            for (raw,) in self.db.execute("SELECT data FROM notes WHERE project=?", (pid,)):
+                existing = json.loads(raw)
+                if existing["actor"] == actor and existing.get("key") == item["key"]:
+                    if (
+                        existing["text"] != item["text"]
+                        or existing["artifacts"] != item["artifacts"]
+                    ):
+                        raise ValueError("Conflicting note idempotency key")
+                    return existing
             self.db.execute("INSERT INTO notes VALUES(?,?,?)", (item["id"], pid, json.dumps(item)))
             return item
 
@@ -345,6 +376,12 @@ class CollaborationStore:
                 if item["kind"] in WORK:
                     if project["status"] != "active":
                         continue
+                    if self.db.execute(
+                        "SELECT 1 FROM messages WHERE project=? AND recipient=? "
+                        "AND state IN ('unconfirmed','interrupted')",
+                        (project["id"], actor),
+                    ).fetchone():
+                        continue
                     if any(
                         self.get_message(dep, actor)["state"] != "done"
                         for dep in item["dependencies"]
@@ -353,7 +390,7 @@ class CollaborationStore:
                     active = self.db.execute(
                         "SELECT count(*) FROM messages WHERE project=? "
                         "AND kind IN ('ask','work') AND state IN "
-                        "('running','unconfirmed','cancelling')",
+                        "('running','unconfirmed','interrupted','cancelling')",
                         (project["id"],),
                     ).fetchone()[0]
                     if active >= project["limits"]["max_workers"]:
@@ -364,7 +401,7 @@ class CollaborationStore:
                         and self.db.execute(
                             "SELECT 1 FROM messages WHERE project=? AND recipient=? "
                             "AND kind IN ('ask','work') AND state IN "
-                            "('running','unconfirmed','cancelling')",
+                            "('running','unconfirmed','interrupted','cancelling')",
                             (project["id"], actor),
                         ).fetchone()
                     ):
@@ -387,6 +424,8 @@ class CollaborationStore:
 
     def update(self, mid, actor, instance, state, result="", evidence=None, claim=None):
         with self.transaction():
+            if isinstance(result, str):
+                result = result.strip()
             item = self.get_message(mid, actor)
             if (
                 item["recipient"] != actor
@@ -413,14 +452,18 @@ class CollaborationStore:
                 if evidence:
                     item["evidence"].update(evidence)
             elif state == "queued" and item["state"] == "running":
+                item.setdefault("delivery_history", []).append(item["evidence"])
+                item["evidence"] = {}
                 item.update(state="queued", not_before=self.clock() + 2)
             elif state in {"unconfirmed", "interrupted"}:
-                item.update(state=state, recovery=text(result, "recovery"))
+                item["recovery"] = text(result, "recovery")
+                if item["state"] != "cancelling":
+                    item["state"] = state
             elif state in TERMINAL:
                 if item["state"] == "cancelling" and state != "cancelled":
-                    if (evidence or {}).get("stop_reason") == "end_turn":
+                    if (evidence or {}).get("stop_reason") and not (evidence or {}).get("pending"):
                         item.update(
-                            state="done",
+                            state=state,
                             result=result,
                             evidence=evidence,
                             completion_during_cancellation=True,
@@ -504,6 +547,8 @@ class CollaborationStore:
                 raise ValueError("Project dispatch limit reached")
             project["dispatched"] += 1
             self.save_project(project)
+            item.setdefault("delivery_history", []).append(item["evidence"])
+            item["evidence"] = {}
             item.update(
                 state="queued",
                 reconciliation=text(reconciliation, "reconciliation"),
@@ -528,7 +573,12 @@ class CollaborationStore:
                 item = json.loads(row[0])
                 if item["kind"] not in WORK and item["kind"] != "result":
                     continue
-                if item["state"] in {"queued", "open"}:
+                if item["state"] in {"queued", "open"} or (
+                    item["state"] not in TERMINAL
+                    and (item["kind"] == "result" or item["recipient"] == project["owner"])
+                ):
+                    # Stop routing into the owner's conversation without stopping
+                    # its existing work. Origin /stop separately cancels that turn.
                     item["state"] = "cancelled"
                     self.save_message(item)
                 elif item["state"] in {"running", "unconfirmed", "interrupted"}:

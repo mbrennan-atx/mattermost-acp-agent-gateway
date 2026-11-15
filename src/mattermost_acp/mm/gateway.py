@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -219,7 +220,7 @@ class MattermostGateway:
 
     def _observe_background_update(self, update: SessionUpdate) -> None:
         report = self._reports.get(update.session_id)
-        if report is None or report["active"] or report.get("suppressed"):
+        if report is None or report["active"]:
             return
         if update.kind not in {
             "agent_message_chunk",
@@ -229,6 +230,13 @@ class MattermostGateway:
         }:
             return
         report["reporter"].observe(update)
+        receipt = self._last_terminal.get(report["thread_id"])
+        if receipt and receipt.get("session_id") == update.session_id and receipt.get("pending"):
+            receipt["pending"] = report["reporter"].has_pending_work()
+            if not receipt["pending"]:
+                receipt["completed_at"] = time.time()
+        if report.get("suppressed"):
+            return
         if report.get("task") is None or report["task"].done():
             report["task"] = asyncio.create_task(
                 self._publish_progress(report), name=f"progress-{report['thread_id']}"
@@ -264,7 +272,8 @@ class MattermostGateway:
                 report["suppressed"] = True
                 if report.get("task"):
                     report["task"].cancel()
-                self._reports.pop(session_id, None)
+                if not report["active"] and not report["reporter"].has_pending_work():
+                    self._reports.pop(session_id, None)
 
     async def _ensure_peer_membership(self) -> None:
         peer = self.config.peer_channel_id
@@ -457,10 +466,13 @@ class MattermostGateway:
                 await reply("There is no active turn now. Send your hint as a normal message.")
             return
         if cmd == "stop":
-            if self.collaboration is not None:
-                await self.collaboration.cancel_thread(thread_id)
             self._stop_reports(thread_id)
             ok = await self.sessions.cancel(thread_id)
+            if self.collaboration is not None:
+                try:
+                    await self.collaboration.cancel_thread(thread_id)
+                except Exception:
+                    logger.warning("Project cancellation unavailable; stopping native work")
             await reply("⏹ Cancelled." if ok else "Nothing to cancel.")
             return
         if cmd in {"new", "clear"}:
@@ -525,11 +537,16 @@ class MattermostGateway:
         await reply(f"Unknown command `/{cmd}`. Try `/help`.")
 
     async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
-        async with self._prompt_locks.setdefault(thread_id, asyncio.Lock()):
-            result = await self._run_prompt(thread_id=thread_id, **kwargs)
-            if result is not None:
-                self._last_terminal[thread_id] = {**result, "completed_at": time.time()}
-            return result
+        lock = self._prompt_locks.setdefault(thread_id, asyncio.Lock())
+        if lock.locked() and kwargs.get("before_native") is None:
+            await self._post(
+                kwargs["channel_id"],
+                "Already working in this thread. Use /hint or /stop.",
+                root_id=thread_id,
+            )
+            return None
+        async with lock:
+            return await self._run_prompt(thread_id=thread_id, **kwargs)
 
     async def _run_prompt(
         self,
@@ -542,6 +559,7 @@ class MattermostGateway:
         passthrough: bool = False,
         has_attachments: bool = False,
         workspace: str | None = None,
+        collaboration_project: str | None = None,
         before_native=None,
     ) -> dict | None:
         if self.sessions.is_busy(thread_id):
@@ -589,9 +607,15 @@ class MattermostGateway:
         try:
             options = {"channel_id": channel_id, "route": route}
             if workspace:
+                record = await self.sessions.store.get(thread_id)
+                if record is not None and Path(record.cwd).resolve() != Path(workspace).resolve():
+                    raise ValueError("Existing native session uses a different workspace")
                 options["cwd"] = Path(workspace)
             await self.sessions.ensure_session(thread_id, **options)
         except Exception:
+            if workspace:
+                logger.warning("Project workspace preparation failed; no native work started")
+                return None
             logger.debug("ensure_session before model stamp failed", exc_info=True)
         session_status = await self.sessions.status(thread_id)
         model_label = pretty_model_name(str(session_status.get("model") or "") or None)
@@ -665,6 +689,8 @@ class MattermostGateway:
         if previous and previous.get("task"):
             previous["task"].cancel()
         report = {
+            "execution_id": uuid.uuid4().hex,
+            "collaboration_project": collaboration_project,
             "reporter": reporter,
             "thread_id": thread_id,
             "channel_id": channel_id,
@@ -728,6 +754,7 @@ class MattermostGateway:
 
         public_answer = answer
         receipt = {
+            "execution_id": report["execution_id"],
             "answer": public_answer,
             "stop_reason": result.stop_reason,
             "session_id": result.session_id,

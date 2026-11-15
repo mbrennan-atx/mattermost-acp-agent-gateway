@@ -49,6 +49,11 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/AGENTS.md",
+    "/docs/collaboration.md",
+    "/src/mattermost_acp/collaboration/*.py",
+    "/tests/test_collaboration.py",
+    "/specs/001-project-collaboration/**",
     "/.env.example",
     "/.github/workflows/checks.yml",
     "/.gitignore",
