@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -46,7 +47,7 @@ def hub_config(tmp_path):
     return config
 
 
-@pytest.mark.parametrize("alias", ["file", "directory"])
+@pytest.mark.parametrize("alias", ["file", "directory", "hard-link"])
 def test_hub_alias_lock_precedes_store_recovery(tmp_path, monkeypatch, alias):
     config = hub_config(tmp_path)
     state = tmp_path / "state"
@@ -70,6 +71,9 @@ def test_hub_alias_lock_precedes_store_recovery(tmp_path, monkeypatch, alias):
         if alias == "file":
             aliased = tmp_path / "alias.db"
             aliased.symlink_to(db)
+        elif alias == "hard-link":
+            aliased = tmp_path / "alias.db"
+            os.link(db, aliased)
         else:
             directory = tmp_path / "alias-directory"
             directory.symlink_to(state, target_is_directory=True)
@@ -86,6 +90,21 @@ def test_hub_alias_lock_precedes_store_recovery(tmp_path, monkeypatch, alias):
     monkeypatch.setattr(sys, "argv", hub_arguments(config, db))
     hub.main()
     assert db.with_name(db.name + ".lock").exists()
+
+
+def test_hard_linked_database_refuses_recovery_without_an_existing_hub(tmp_path, monkeypatch):
+    config = hub_config(tmp_path)
+    db = tmp_path / "hub.db"
+    db.write_bytes(b"")
+    alias = tmp_path / "alias.db"
+    os.link(db, alias)
+    stores = []
+    monkeypatch.setattr(hub, "CollaborationStore", lambda *args: stores.append(args))
+    monkeypatch.setattr(sys, "argv", hub_arguments(config, alias))
+    with pytest.raises(ValueError, match="hard-link aliases"):
+        hub.main()
+    assert stores == [], "A hard-link alias must not initialize a separate SQLite WAL"
+    assert not alias.with_name(alias.name + "-wal").exists()
 
 
 def test_distinct_database_extensions_use_independent_hub_locks(tmp_path, monkeypatch):

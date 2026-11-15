@@ -27,6 +27,51 @@ from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.session_service import SessionService
 
 
+def test_result_retry_at_full_work_budget_preserves_result_and_requires_reconciliation(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    try:
+        p = project(store, max_turns=1)
+        requested = ask(store, p["id"])
+        claimed = store.claim_next("beta", "worker")
+        store.reply(
+            requested["id"],
+            "beta",
+            "Verified dependency",
+            evidence={"artifact": "https://example.com/proof"},
+            claim=claimed["claim"],
+        )
+        delivery = store.claim_next("alpha", "owner")
+        store.update(
+            delivery["id"],
+            "alpha",
+            "owner",
+            "evidence",
+            evidence={"post_id": "uncertain-post"},
+            claim=delivery["claim"],
+        )
+        store.update(
+            delivery["id"],
+            "alpha",
+            "owner",
+            "unconfirmed",
+            "Result posting was ambiguous",
+            claim=delivery["claim"],
+        )
+        retried = store.retry(delivery["id"], "alpha", "Verified no result post exists")
+        assert retried["state"] == "queued"
+        assert retried["result_evidence"]["artifact"] == "https://example.com/proof"
+        assert retried["delivery_history"][-1]["post_id"] == "uncertain-post"
+        assert store.show(p["id"], "alpha")["dispatched"] == 1
+        replay = store.claim_next("alpha", "new-owner")
+        assert replay["id"] == delivery["id"] and replay["claim"] != delivery["claim"]
+        assert replay["text"] == "Verified dependency"
+        assert store.get_message(requested["id"], "beta")["state"] == "done"
+        with pytest.raises(ValueError, match="dispatch limit"):
+            ask(store, p["id"], key="another-request")
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("delivery", ["foreground", "injected"])
 @pytest.mark.parametrize("background", ["tool", "worker"])
 async def test_early_reply_keeps_native_owner_until_background_finishes(
@@ -273,7 +318,7 @@ async def test_late_reply_cannot_reconcile_with_receipt_before_new_injection(tmp
         assert final["evidence"]["foreground_answer"] == "Output after the new injection"
 
 
-@pytest.mark.parametrize("limit", ["dispatch", "depth", "membership"])
+@pytest.mark.parametrize("limit", ["dispatch", "depth", "membership", "sender-membership"])
 async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wake(tmp_path, limit):
     store, server, clients = await api_fixture(tmp_path)
     gateway = active_gateway(busy=False)
@@ -285,13 +330,15 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
     consumer = CollaborationConsumer(gateway, clients["beta"].settings)
     gateway.collaboration = consumer
     try:
-        if limit == "membership":
+        if "membership" in limit:
             p = store.create_project(
-                "alpha",
+                "gamma" if limit == "sender-membership" else "alpha",
                 {
                     "title": "Restricted participants",
                     "objective": "Verify project admission",
-                    "members": ["alpha", "gamma"],
+                    "members": ["beta", "gamma"]
+                    if limit == "sender-membership"
+                    else ["alpha", "gamma"],
                     "channel_id": "floor",
                     "thread_id": "discussion",
                     "origin_channel_id": "home",
@@ -314,7 +361,7 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
             message="@beta ASK: Verify the dependency",
             root_id="discussion",
         )
-        with pytest.raises(HubError, match="HTTP 403" if limit == "membership" else "HTTP 409"):
+        with pytest.raises(HubError, match="HTTP 403" if "membership" in limit else "HTTP 409"):
             await clients["beta"].request(
                 "POST",
                 "/mentions",
@@ -326,10 +373,10 @@ async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wa
                     "text": posted.message,
                 },
             )
-        before = store.show(p["id"], "alpha")["messages"]
+        before = store.show(p["id"], p["owner"])["messages"]
         await gateway.handle_posted(posted)
         gateway.run_prompt.assert_not_awaited()
-        assert store.show(p["id"], "alpha")["messages"] == before
+        assert store.show(p["id"], p["owner"])["messages"] == before
 
         unregistered = PostedEvent(
             post_id="post-2",

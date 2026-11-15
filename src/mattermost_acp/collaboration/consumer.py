@@ -368,7 +368,7 @@ class CollaborationConsumer:
                     "blocked",
                     "cancelled",
                 }:
-                    self.release_ownership(key)
+                    report["cancel_requested"] = True
                     continue
                 raise
             if receipt["state"] == "cancelling":
@@ -382,21 +382,29 @@ class CollaborationConsumer:
         for parent in info["parents"]:
             key = (parent["id"], parent.get("claim"))
             owned = self.ownership.get(key)
-            if owned is old or owned is None:
+            if owned is None:
                 continue
             current = await self.hub.request("GET", "/messages/" + parent["id"])
             if current.get("claim") != key[1] or current.get("instance") != self.instance:
                 continue
-            if current["state"] in {"done", "failed", "blocked", "cancelled"}:
-                self.release_ownership(key)
-                continue
-            if current.get("evidence", {}).get("execution_id") != owned.get("execution_id"):
+            if current.get("evidence", {}).get("execution_id") not in {
+                owned.get("execution_id"),
+                parent.get("evidence", {}).get("execution_id"),
+            }:
                 raise NativeDispatchChanged("Continuation rollback ownership changed")
             evidence = dict(parent.get("evidence", {}))
             evidence["native_epoch"] = getattr(self.gateway.sessions, "native_epoch", lambda _t: 0)(
                 info["thread"]
             )
-            await self.update(current, "heartbeat", evidence=evidence)
+            # Preparation can advance the session epoch before any ownership
+            # transfer. Restore its cancellation fence even in that case, and
+            # retain terminal parents until their restored native work settles.
+            state = (
+                "evidence"
+                if current["state"] in {"done", "failed", "blocked", "cancelled"}
+                else "heartbeat"
+            )
+            await self.update(current, state, evidence=evidence)
             if self.ownership.get(key) is owned:
                 self.ownership[key] = old
         self.gateway.prune_reports()

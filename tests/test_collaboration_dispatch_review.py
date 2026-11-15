@@ -101,8 +101,10 @@ async def test_repeated_harness_switches_share_one_idle_restart_waiter(monkeypat
     monkeypatch.setattr(harness_switch, "find_agent", lambda *a, **kw: {"username": "alpha"})
     monkeypatch.setattr(harness_switch, "apply_switch", lambda *a, **kw: plan)
     gate = asyncio.Event()
+
     async def waiter(*args):
         await gate.wait()
+
     gateway._restart_when_idle = AsyncMock(side_effect=waiter)
     reply = AsyncMock()
     try:

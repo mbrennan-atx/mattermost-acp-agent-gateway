@@ -288,6 +288,91 @@ async def test_before_prompt_rejection_has_false_dispatch_flag_and_no_native_wri
     assert not sessions.is_busy("discussion")
 
 
+@pytest.mark.parametrize("refusal", ["workspace", "background"])
+async def test_rejected_preparation_refreshes_parent_epoch_before_cancellation(tmp_path, refusal):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, old):
+        delivery = child_result(store, p, parent, consumer)
+        broker, writer = memory_broker()
+        broker.capabilities.steering = False
+        sessions = SessionService(broker, gateway.sessions.store, default_cwd=tmp_path)
+        sessions._native_epochs["discussion"] = 7
+        sessions.status = AsyncMock(return_value={"session_id": "existing-native"})
+        preparations = 0
+
+        async def prepare(*args, **kwargs):
+            nonlocal preparations
+            preparations += 1
+            if preparations == 2:
+                if refusal == "workspace":
+                    raise NativeDispatchChanged("Workspace configuration changed before dispatch")
+                old["reporter"].has_pending_work = lambda: True
+            return "existing-native"
+
+        sessions.ensure_session = AsyncMock(side_effect=prepare)
+        gateway.sessions = sessions
+        gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+        await consumer.handle(delivery)
+        assert preparations == 2 and sessions.native_epoch("discussion") == 8
+        assert writer.messages == []
+        assert store.get_message(delivery["id"], "beta")["state"] == "queued"
+        assert consumer.ownership[(parent["id"], parent["claim"])] is old
+        evidence = store.get_message(parent["id"], "beta")["evidence"]
+        assert evidence["execution_id"] == old["execution_id"]
+        assert evidence["native_epoch"] == sessions.native_epoch("discussion")
+
+        cancel = broker.cancel
+
+        async def confirmed_cancel(*args, **kwargs):
+            await cancel(*args, **kwargs)
+            old["reporter"].has_pending_work = lambda: False
+            gateway._last_terminal["discussion"] = terminal(stop_reason="cancelled")
+
+        broker.cancel = AsyncMock(side_effect=confirmed_cancel)
+        store.cancel(p["id"], "alpha")
+        control = store.claim_next("beta", consumer.instance)
+        await consumer.handle(control)
+        broker.cancel.assert_awaited_once()
+        assert writer.messages[0]["method"] == "session/cancel"
+        assert store.get_message(parent["id"], "beta")["state"] == "cancelled"
+        assert store.get_message(control["id"], "beta")["state"] == "done"
+        assert not consumer.owns_thread("discussion")
+
+
+@pytest.mark.parametrize("settle_before", ["reservation", "rollback"])
+async def test_terminal_parent_rollback_retains_restored_background_ownership(
+    tmp_path, settle_before
+):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, old):
+        delivery = child_result(store, p, parent, consumer)
+        info = await consumer.continuation(delivery)
+        new = report(p["id"], "rejected-continuation")
+        gateway._reports["existing-native"] = new
+        if settle_before == "reservation":
+            store.reply(parent["id"], "beta", "Explicit result", claim=parent["claim"])
+        accepted = await consumer.reserve_continuation(delivery, "existing-native", info)
+        assert accepted is (settle_before == "rollback")
+        if settle_before == "rollback":
+            store.reply(parent["id"], "beta", "Explicit result", claim=parent["claim"])
+        old["reporter"].has_pending_work = lambda: True
+        gateway._reports["existing-native"] = old
+        gateway._last_terminal["discussion"]["pending"] = True
+        await consumer.rollback_continuation(info)
+        consumer.reserving.difference_update(
+            (state["id"], state.get("claim")) for state in info["parents"]
+        )
+        key = (parent["id"], parent["claim"])
+        assert consumer.ownership[key] is old
+        evidence = store.get_message(parent["id"], "beta")["evidence"]
+        assert evidence["execution_id"] == old["execution_id"]
+        await consumer.reconcile_ownership()
+        assert consumer.ownership[key] is old
+        old["reporter"].has_pending_work = lambda: False
+        gateway._last_terminal["discussion"] = terminal()
+        await consumer.reconcile_ownership()
+        assert key not in consumer.ownership
+        assert store.get_message(parent["id"], "beta")["result"] == "Explicit result"
+
+
 async def test_warmed_native_without_goal_queue_evidence_refuses_maintenance_seal():
     gateway = maintenance_gateway()
     broker, _writer = memory_broker()

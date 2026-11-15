@@ -157,6 +157,7 @@ class CollaborationStore:
         """Persist intent before external posting; uncertain posts need reconciliation."""
         key = text(body.get("key"), "project idempotency key", 200)
         canonical = {k: v for k, v in body.items() if k != "thread_id"}
+        canonical["key"] = key
         canonical.setdefault("owner_in_discussion", False)
         with self.transaction():
             row = self.db.execute(
@@ -164,6 +165,7 @@ class CollaborationStore:
             ).fetchone()
             if row:
                 intent = json.loads(row[0])
+                intent["body"]["key"] = key
                 intent["body"].setdefault("owner_in_discussion", False)
                 if intent["body"] != canonical:
                     raise ValueError("Conflicting project creation key")
@@ -184,6 +186,7 @@ class CollaborationStore:
             return intent, True
 
     def save_creation(self, actor, key, intent):
+        key = text(key, "project idempotency key", 200)
         with self.transaction():
             self.db.execute(
                 "INSERT OR REPLACE INTO creations VALUES(?,?,?)", (actor, key, json.dumps(intent))
@@ -205,7 +208,7 @@ class CollaborationStore:
             json.dumps({k: v for k, v in body.items() if k != "key"}, sort_keys=True).encode()
         ).hexdigest()
         if key:
-            text(key, "project idempotency key", 200)
+            key = text(key, "project idempotency key", 200)
             for existing in self.list_projects(actor):
                 if existing["owner"] == actor and existing.get("key") == key:
                     if existing.get("fingerprint") != fingerprint:
@@ -738,10 +741,11 @@ class CollaborationStore:
                 raise ValueError("Only interrupted/unconfirmed delivery can be retried")
             if project["status"] != "active" or project["deadline"] <= self.clock():
                 raise ValueError("Project is inactive")
-            if project["dispatched"] >= project["limits"]["max_turns"]:
-                raise ValueError("Project dispatch limit reached")
-            project["dispatched"] += 1
-            self.save_project(project)
+            if item["kind"] in WORK:
+                if project["dispatched"] >= project["limits"]["max_turns"]:
+                    raise ValueError("Project dispatch limit reached")
+                project["dispatched"] += 1
+                self.save_project(project)
             item.setdefault("delivery_history", []).append(item["evidence"])
             item["evidence"] = {}
             item.update(
@@ -831,9 +835,15 @@ class CollaborationStore:
     def mention(self, actor, channel, thread, recipient, body, key):
         projects = [
             project
-            for project in self.list_projects(actor)
+            for (raw,) in self.db.execute("SELECT data FROM projects")
+            if (project := json.loads(raw))
             if project["channel_id"] == channel and project["thread_id"] == thread
         ]
+        if not projects:
+            return None
+        projects = [project for project in projects if actor in project["members"]]
+        if not projects:
+            raise PermissionError("Actor is not a project participant")
         request = {"recipient": recipient, "kind": "ask", "text": body, "key": key}
         for project in projects:
             if self.db.execute(

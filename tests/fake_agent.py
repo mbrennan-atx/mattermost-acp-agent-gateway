@@ -175,7 +175,10 @@ class FakeAcpAgent:
                         "update": {
                             "sessionUpdate": "agent_message_chunk",
                             "messageId": "m1",
-                            "content": {"type": "text", "text": f"from fake agent.\n\nYou said: {text}"},
+                            "content": {
+                                "type": "text",
+                                "text": f"from fake agent.\n\nYou said: {text}",
+                            },
                         },
                     },
                 }

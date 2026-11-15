@@ -61,8 +61,7 @@ async def restart_gateway(
 
     if under_systemd():
         msg = (
-            f"♻️ Restarting `{unit}`… "
-            "I'll post back in this thread when I'm up."
+            f"♻️ Restarting `{unit}`… I'll post back in this thread when I'm up."
             if pending and pending.thread_id
             else f"♻️ Restarting `{unit}`…"
         )

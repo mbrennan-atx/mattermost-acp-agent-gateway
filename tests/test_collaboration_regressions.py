@@ -915,19 +915,26 @@ async def test_creation_conflicting_explicit_root_does_not_replace_first_discuss
         await close_creation(store, server, client)
 
 
-async def test_created_discussion_readback_failure_retries_verification_without_reposting(tmp_path):
+@pytest.mark.parametrize("key", ["creation-key", " creation-key "])
+async def test_created_discussion_readback_failure_retries_verification_without_reposting(
+    tmp_path, key
+):
     post = AsyncMock(return_value={"id": "first-root", "channel_id": "floor"})
     verify = AsyncMock(return_value={"id": "first-root", "channel_id": "wrong-channel"})
     store, server, client = await creation_api(tmp_path / "hub.db", post, verify)
     try:
         with pytest.raises(HubError, match="409"):
-            await client.request("POST", "/creations", creation_body())
+            await client.request("POST", "/creations", {**creation_body(), "key": key})
         assert store.list_projects("alpha") == []
         verify.return_value = {"id": "first-root", "channel_id": "floor", "root_id": ""}
-        created = await client.request("POST", "/creations", creation_body())
+        created = await client.request("POST", "/creations", {**creation_body(), "key": key})
         assert created["thread_id"] == "first-root"
         post.assert_awaited_once()
         assert verify.await_count == 2
+        assert created["key"] == "creation-key"
+        repeated = await client.request("POST", "/creations", creation_body())
+        assert repeated["id"] == created["id"]
+        assert store.db.execute("SELECT COUNT(*) FROM creations").fetchone()[0] == 1
     finally:
         await close_creation(store, server, client)
 

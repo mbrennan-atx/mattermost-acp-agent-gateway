@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import fcntl
 import json
+import os
 import re
 import secrets
 from pathlib import Path
@@ -388,11 +389,19 @@ def main():
     args.db.parent.mkdir(parents=True, exist_ok=True)
     with args.db.with_name(args.db.name + ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        store = CollaborationStore(args.db, set(actors))
-        try:
-            web.run_app(build_app(store, actors), host="127.0.0.1", port=args.port, access_log=None)
-        finally:
-            store.close()
+        # The path fence also covers creation; the inode fence covers hard-link
+        # aliases before recovery can touch a running database.
+        with args.db.open("a+b") as database:
+            fcntl.flock(database, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.fstat(database.fileno()).st_nlink != 1:
+                raise ValueError("Collaboration databases must not have hard-link aliases")
+            store = CollaborationStore(args.db, set(actors))
+            try:
+                web.run_app(
+                    build_app(store, actors), host="127.0.0.1", port=args.port, access_log=None
+                )
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":
