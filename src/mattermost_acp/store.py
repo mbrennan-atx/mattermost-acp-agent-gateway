@@ -137,14 +137,20 @@ class ThreadStore:
                 if "channel_id" in keys and row["channel_id"] is not None
                 else None
             ),
-            model_override=(
-                row["model_override"] if "model_override" in keys else None
-            ),
-            effort_override=(
-                row["effort_override"] if "effort_override" in keys else None
-            ),
+            model_override=(row["model_override"] if "model_override" in keys else None),
+            effort_override=(row["effort_override"] if "effort_override" in keys else None),
             harness=row["harness"] if "harness" in keys else None,
         )
+
+    async def save_model_if_session(self, thread_id: str, session_id: str, model: str) -> bool:
+        """A late turn can update its model, but cannot restore a replaced session."""
+        cursor = await self._conn().execute(
+            "UPDATE threads SET model=?, updated_at=datetime('now') "
+            "WHERE thread_id=? AND session_id=? AND harness=?",
+            (model, thread_id, session_id, self.harness),
+        )
+        await self._conn().commit()
+        return cursor.rowcount > 0
 
     async def save(
         self,

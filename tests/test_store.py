@@ -5,6 +5,40 @@ import pytest
 from mattermost_acp.store import ThreadStore
 
 
+@pytest.mark.parametrize("current", ["same", "replaced", "foreign", "deleted"])
+async def test_late_model_update_preserves_current_thread_identity_and_metadata(tmp_path, current):
+    store = ThreadStore(tmp_path / "native.db", harness="claude")
+    await store.open()
+    try:
+        await store.save(
+            "thread",
+            "old-session",
+            "/isolated",
+            model="old-model",
+            effort="high",
+            channel_id="home",
+            title="Existing title",
+        )
+        if current == "replaced":
+            await store.save("thread", "new-session", "/replacement", model="new-model")
+        elif current == "foreign":
+            store.harness = "codex"
+            await store.save("thread", "old-session", "/replacement", model="new-model")
+            store.harness = "claude"
+        elif current == "deleted":
+            await store.delete("thread")
+        before = await store.get("thread")
+        changed = await store.save_model_if_session("thread", "old-session", "observed-model")
+        after = await store.get("thread")
+        assert changed is (current == "same")
+        if current == "same":
+            assert after.model == "observed-model"
+            after.model = before.model
+        assert after == before
+    finally:
+        await store.close()
+
+
 @pytest.mark.asyncio
 async def test_store_roundtrip(tmp_path: Path) -> None:
     store = ThreadStore(tmp_path / "t.db")

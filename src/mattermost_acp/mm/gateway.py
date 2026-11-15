@@ -59,6 +59,7 @@ from mattermost_acp.mm.status import (
 )
 from mattermost_acp.mm.wake import classify_wake
 from mattermost_acp.model_router import RouteRequest
+from mattermost_acp.session_service import ThreadBusy
 from mattermost_acp.thread_title import (
     MAX_RENAME_ATTEMPTS,
     compose_titled_root,
@@ -419,6 +420,13 @@ class MattermostGateway:
         )
 
     async def handle_slash(self, req: SlashRequest) -> dict[str, str]:
+        self._active_controls += 1
+        try:
+            return await self._handle_slash(req)
+        finally:
+            self._active_controls -= 1
+
+    async def _handle_slash(self, req: SlashRequest) -> dict[str, str]:
         if getattr(self.config, "collab_sidecar", False):
             return ephemeral("Use mm-work for shared project work.")
         if self.sealed or (self.draining and req.command != "stop"):
@@ -791,6 +799,8 @@ class MattermostGateway:
         if before_native is not None and self.background_pending(thread_id):
             return {"queued": True}
         if self.sessions.is_busy(thread_id):
+            if before_native is not None:
+                return {"queued": True, "native_dispatched": False}
             await self._post(
                 channel_id,
                 "⏳ Already working in this thread. `/hint <text>` to add guidance; "
@@ -976,6 +986,8 @@ class MattermostGateway:
             await _publish_status(status.render(), force=True)
             try:
                 turn_options = {"channel_id": channel_id, "on_update": on_update, "route": route}
+                if workspace:
+                    turn_options["cwd"] = Path(workspace)
                 if before_native is not None:
 
                     async def bind_native(actual_session):
@@ -1025,6 +1037,13 @@ class MattermostGateway:
             logger.warning("ACP error thread=%s: %s", thread_id, exc)
             await _publish_status(status.render(phase="failed"), force=True)
             await self._post(channel_id, f"❌ ACP error: {exc}", root_id=thread_id)
+            return
+        except ThreadBusy as exc:
+            if before_native is not None:
+                await restore_undispatched()
+                return {"queued": True, "native_dispatched": False}
+            logger.warning("turn busy thread=%s: %s", thread_id, exc)
+            await self._post(channel_id, f"⏳ {exc}", root_id=thread_id)
             return
         except RuntimeError as exc:
             logger.warning("turn busy/runtime thread=%s: %s", thread_id, exc)

@@ -31,6 +31,10 @@ COMPACT_PROMPT = "/compact"
 CompactionOutcome = Literal["not_needed", "compacted", "failed"]
 
 
+class ThreadBusy(RuntimeError):
+    """A turn was refused before any native preparation or dispatch."""
+
+
 @dataclass(frozen=True)
 class ModelSwitch:
     """Result of ``SessionService.switch_model``."""
@@ -144,6 +148,7 @@ class SessionService:
         self._global_sem = asyncio.Semaphore(max_parallel_turns)
         self._busy: set[str] = set()
         self._thread_locks: dict[str, asyncio.Lock] = {}
+        self._preparation_locks: dict[str, asyncio.Lock] = {}
         self._native_epochs: dict[str, int] = {}
         # Threads whose live ACP model has been synced this agent process.
         self._pinned: set[str] = set()
@@ -191,9 +196,24 @@ class SessionService:
         channel_id: str | None = None,
         route: RouteRequest | None = None,
     ) -> str:
+        async with self._preparation_locks.setdefault(thread_id, asyncio.Lock()):
+            return await self._ensure_session(
+                thread_id, cwd=cwd, channel_id=channel_id, route=route
+            )
+
+    async def _ensure_session(
+        self,
+        thread_id: str,
+        *,
+        cwd: Path | None = None,
+        channel_id: str | None = None,
+        route: RouteRequest | None = None,
+    ) -> str:
         record = await self.store.get(thread_id)
         work_cwd = Path(record.cwd) if record else (cwd or self.default_cwd)
         work_cwd = work_cwd.expanduser().resolve()
+        if cwd is not None and work_cwd != cwd.expanduser().resolve():
+            raise NativeDispatchChanged("Existing native session uses a different workspace")
 
         if self.workspace_guard is not None:
             prior_session = (
@@ -292,9 +312,10 @@ class SessionService:
         route: RouteRequest | None = None,
         before_prompt=None,
         dispatch_guard=None,
+        cwd: Path | None = None,
     ) -> TurnResult:
         if thread_id in self._busy:
-            raise RuntimeError("This thread already has a turn in progress. Use /stop.")
+            raise ThreadBusy("This thread already has a turn in progress. Use /stop.")
 
         async with self._thread_locks.setdefault(thread_id, asyncio.Lock()), self._global_sem:
             self._advance_native(thread_id)
@@ -302,7 +323,10 @@ class SessionService:
             self._write_busy_marker()
             try:
                 session_id = await self.ensure_session(
-                    thread_id, channel_id=channel_id, route=route
+                    thread_id,
+                    channel_id=channel_id,
+                    route=route,
+                    **({"cwd": cwd} if cwd is not None else {}),
                 )
                 epoch = self.native_epoch(thread_id)
                 if before_prompt is not None and not await before_prompt(session_id):
@@ -329,11 +353,8 @@ class SessionService:
                         else {}
                     ),
                 )
-                if result.model_id:
-                    record = await self.store.get(thread_id)
-                    cwd = record.cwd if record else str(self.default_cwd)
-                    if record is None or record.model != result.model_id:
-                        await self.store.save(thread_id, session_id, cwd, model=result.model_id)
+                if result.model_id and self.native_epoch(thread_id) == epoch:
+                    await self.store.save_model_if_session(thread_id, session_id, result.model_id)
                 return result
             finally:
                 self._busy.discard(thread_id)
@@ -486,6 +507,17 @@ class SessionService:
         return True
 
     async def new_session(
+        self,
+        thread_id: str,
+        *,
+        cwd: Path | None = None,
+        channel_id: str | None = None,
+    ) -> str:
+        # Separate from the turn lock: /new must be able to cancel a running turn.
+        async with self._preparation_locks.setdefault(thread_id, asyncio.Lock()):
+            return await self._new_session(thread_id, cwd=cwd, channel_id=channel_id)
+
+    async def _new_session(
         self,
         thread_id: str,
         *,

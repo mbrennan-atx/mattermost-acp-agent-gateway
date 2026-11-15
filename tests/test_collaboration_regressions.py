@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+from fake_agent import spawn_fake_agent_process
 from test_collaboration import (
     active_gateway,
     api_fixture,
@@ -25,6 +26,7 @@ from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.http import build_slash_app
 from mattermost_acp.session_service import SessionService
+from mattermost_acp.store import ThreadStore
 
 
 class MemoryAdapter:
@@ -1246,6 +1248,166 @@ async def test_background_reopening_during_preparation_preserves_old_report():
     assert result == {"queued": True}
     assert gateway._reports["existing-native"] is previous
     gateway.sessions.run_turn.assert_not_awaited()
+
+
+@pytest.mark.parametrize("phase", ["prompt_lock", "status_post"])
+async def test_compaction_busy_refusal_requeues_collaboration_without_native_debt(tmp_path, phase):
+    store, server, clients = await api_fixture(tmp_path)
+    native = ThreadStore(tmp_path / "native.db")
+    await native.open()
+    broker = AcpBroker(process_factory=spawn_fake_agent_process)
+    sessions = SessionService(broker, native, default_cwd=tmp_path, inject_channel_context=False)
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions = sessions
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    native_prompt = type(gateway).run_prompt.__get__(gateway)
+    awaiting_lock, compacting, finish_compaction = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    compaction = None
+    delivery = None
+    lock = asyncio.Lock()
+    gateway._prompt_locks["discussion"] = lock
+
+    async def compact(session, text, **kwargs):
+        assert text == "/compact"
+        compacting.set()
+        await finish_compaction.wait()
+        return TurnResult(
+            session_id=session, stop_reason="end_turn", answer_text="", thought_text=""
+        )
+
+    async def start_compaction():
+        nonlocal compaction
+        compaction = asyncio.create_task(sessions.switch_model("discussion", "grok-4.6"))
+        await asyncio.wait_for(compacting.wait(), 2)
+
+    async def prompt(**kwargs):
+        awaiting_lock.set()
+        return await native_prompt(**kwargs)
+
+    original_post = gateway.client.create_post
+
+    async def publish(*args, **kwargs):
+        if phase == "status_post" and compaction is None:
+            await start_compaction()
+        return await original_post(*args, **kwargs)
+
+    gateway.run_prompt = prompt
+    gateway.client.create_post = publish
+    try:
+        await sessions.ensure_session("discussion")
+        await sessions.switch_model("discussion", "claude-opus-5")
+        broker.prompt_turn = AsyncMock(side_effect=compact)
+        p = project(store)
+        request = ask(store, p["id"])
+        if phase == "prompt_lock":
+            await lock.acquire()
+        delivery = asyncio.create_task(consumer.handle(store.claim_next("beta", consumer.instance)))
+        await asyncio.wait_for(awaiting_lock.wait(), 2)
+        if phase == "prompt_lock":
+            await start_compaction()
+            lock.release()
+        await asyncio.wait_for(delivery, 3)
+        receipt = store.get_message(request["id"], "alpha")
+        assert receipt["state"] == "queued" and not receipt["execution_pending"]
+        assert store.active_claims("beta", consumer.instance) == [] and not consumer.ownership
+        assert all("Already working" not in post[1] for post in gateway.client.posts)
+        assert broker.prompt_turn.await_count == 1 and not compaction.done()
+        finish_compaction.set()
+        assert (await asyncio.wait_for(compaction, 3)).compaction == "compacted"
+        store.clock = lambda: receipt["not_before"] + 1
+        assert store.claim_next("beta", consumer.instance)["id"] == request["id"]
+    finally:
+        if lock.locked():
+            lock.release()
+        finish_compaction.set()
+        tasks = [task for task in [delivery, compaction] if task is not None]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for report in gateway.live_reports():
+            if report.get("task"):
+                report["task"].cancel()
+                await asyncio.gather(report["task"], return_exceptions=True)
+        await consumer.close()
+        await broker.stop()
+        await native.close()
+        await close_api(store, server, clients)
+
+
+async def test_unproven_runtime_failure_keeps_collaboration_interrupted(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+    gateway.sessions.ensure_session = AsyncMock(return_value="existing-native")
+    gateway.sessions.status = AsyncMock(return_value={"session_id": "existing-native"})
+    gateway.sessions.run_turn = AsyncMock(side_effect=RuntimeError("Unknown native failure"))
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        await consumer.handle(store.claim_next("beta", consumer.instance))
+        assert store.get_message(request["id"], "alpha")["state"] == "interrupted"
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+async def test_slash_root_creation_blocks_seal_and_releases_handler_counter(outcome):
+    gateway = maintenance_gateway()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def root(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        if outcome == "failure":
+            raise RuntimeError("Root creation failed")
+        return {"id": "new-root"}
+
+    gateway.client.create_post = AsyncMock(side_effect=root)
+    gateway._dispatch_command = AsyncMock()
+    client = await maintenance_client(gateway)
+    handler = asyncio.create_task(
+        gateway.handle_slash(
+            SimpleNamespace(
+                command="help",
+                user_id="human",
+                channel_id="home",
+                root_id="",
+                text="",
+                user_name="human",
+            )
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert not gateway._slash_tasks and gateway.maintenance_state()["commands"] == 1
+        await client.post("/maintenance", json={"action": "drain"}, headers=auth())
+        response = await client.post("/maintenance", json={"action": "seal"}, headers=auth())
+        assert response.status == 409 and not gateway.sealed
+        if outcome == "cancel":
+            handler.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await handler
+        else:
+            release.set()
+            if outcome == "failure":
+                with pytest.raises(RuntimeError, match="Root creation failed"):
+                    await handler
+            else:
+                await handler
+                await asyncio.gather(*list(gateway._slash_tasks))
+                await asyncio.sleep(0)
+        assert gateway.maintenance_state()["commands"] == 0
+        response = await client.post("/maintenance", json={"action": "seal"}, headers=auth())
+        assert response.status == 200 and gateway.sealed
+        gateway._dispatch_command.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.gather(handler, return_exceptions=True)
+        await client.close()
 
 
 @pytest.mark.parametrize("mismatch", ["actor", "user", "mode"])

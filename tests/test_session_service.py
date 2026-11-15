@@ -13,6 +13,7 @@ from urllib.parse import quote
 import pytest
 from fake_agent import spawn_fake_agent_process
 
+from mattermost_acp.acp import TurnResult
 from mattermost_acp.acp.broker import AcpBroker, AcpError, NativeDispatchChanged
 from mattermost_acp.commands.models_catalog import ModelCatalog, ModelInfo
 from mattermost_acp.main import build_workspace_guard
@@ -90,6 +91,170 @@ async def test_workspace_guard_precedes_native_start_and_resume(service):
     assert await service.ensure_session("guarded") == sid
     assert events[0] == ("guarded", service.default_cwd.resolve(), sid)
     assert events[1] == "start"
+
+
+@pytest.mark.parametrize("first", ["prepare", "replace"])
+async def test_session_creation_and_replacement_serialize_workspace_selection(service, first):
+    workspace = service.default_cwd / "isolated"
+    workspace.mkdir()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = service._create_and_pin
+    selected = []
+
+    async def create(thread, cwd, **kwargs):
+        selected.append(cwd)
+        if len(selected) == 1:
+            entered.set()
+            await release.wait()
+        return await original(thread, cwd, **kwargs)
+
+    service._create_and_pin = create
+    operations = {
+        "prepare": lambda: service.ensure_session("fresh", cwd=workspace),
+        "replace": lambda: service.new_session("fresh"),
+    }
+    other = "replace" if first == "prepare" else "prepare"
+    leading = asyncio.create_task(operations[first]())
+    trailing = None
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        trailing = asyncio.create_task(operations[other]())
+        await asyncio.sleep(0)
+        assert len(selected) == 1 and not trailing.done()
+        release.set()
+        await asyncio.wait_for(leading, 2)
+        if first == "replace":
+            with pytest.raises(NativeDispatchChanged, match="different workspace"):
+                await asyncio.wait_for(trailing, 2)
+            assert selected == [service.default_cwd.resolve()]
+        else:
+            await asyncio.wait_for(trailing, 2)
+            assert selected == [workspace, workspace]
+        record = await service.store.get("fresh")
+        assert Path(record.cwd) == (workspace if first == "prepare" else service.default_cwd)
+    finally:
+        release.set()
+        await asyncio.gather(leading, *([trailing] if trailing else []), return_exceptions=True)
+
+
+async def test_final_turn_preparation_rechecks_bound_workspace_before_reserving(service):
+    await service.new_session("project")
+    workspace = service.default_cwd / "isolated"
+    workspace.mkdir()
+    reserve = AsyncMock(return_value=True)
+    with patch.object(service.broker, "prompt_turn", new_callable=AsyncMock) as prompt:
+        with pytest.raises(NativeDispatchChanged, match="different workspace"):
+            await service.run_turn("project", "Work", cwd=workspace, before_prompt=reserve)
+        prompt.assert_not_awaited()
+    reserve.assert_not_awaited()
+    assert not service.is_busy("project")
+
+
+async def test_replacement_can_cancel_running_turn_without_waiting_for_its_lock(service):
+    sid = await service.ensure_session("active")
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def prompt(session, text, **kwargs):
+        entered.set()
+        await cancelled.wait()
+        return TurnResult(
+            session_id=session, stop_reason="cancelled", answer_text="", thought_text=""
+        )
+
+    async def cancel(session):
+        assert session == sid
+        cancelled.set()
+
+    service.broker.prompt_turn = prompt
+    service.broker.cancel = AsyncMock(side_effect=cancel)
+    turn = asyncio.create_task(service.run_turn("active", "Long work"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        old_epoch = service.native_epoch("active")
+        replacement = await asyncio.wait_for(service.new_session("active"), 2)
+        assert replacement != sid and service.native_epoch("active") > old_epoch
+        assert (await asyncio.wait_for(turn, 2)).stop_reason == "cancelled"
+        service.broker.cancel.assert_awaited_once_with(sid)
+    finally:
+        cancelled.set()
+        await asyncio.gather(turn, return_exceptions=True)
+
+
+async def test_replacement_during_reservation_invalidates_the_prepared_turn(service):
+    entered, release = asyncio.Event(), asyncio.Event()
+    prepared = []
+
+    async def reserve(session):
+        prepared.append(session)
+        entered.set()
+        await release.wait()
+        return True
+
+    workspace = service.default_cwd / "isolated"
+    workspace.mkdir()
+    turn = asyncio.create_task(
+        service.run_turn("project", "Work", cwd=workspace, before_prompt=reserve)
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        epoch = service.native_epoch("project")
+        replacement = await asyncio.wait_for(service.new_session("project"), 2)
+        assert replacement != prepared[0] and service.native_epoch("project") > epoch
+        assert Path((await service.store.get("project")).cwd) == workspace
+        release.set()
+        with pytest.raises(NativeDispatchChanged):
+            await asyncio.wait_for(turn, 2)
+        assert not service.is_busy("project")
+        assert (await service.store.get("project")).session_id == replacement
+    finally:
+        release.set()
+        await asyncio.gather(turn, return_exceptions=True)
+
+
+@pytest.mark.parametrize("phase", ["native_result", "model_write"])
+async def test_late_cancelled_turn_model_cannot_restore_a_replaced_session(service, phase):
+    sid = await service.ensure_session("active")
+    entered, finish_old = asyncio.Event(), asyncio.Event()
+    updating, finish_update = asyncio.Event(), asyncio.Event()
+    original_update = service.store.save_model_if_session
+
+    async def update(*args):
+        updating.set()
+        await finish_update.wait()
+        return await original_update(*args)
+
+    if phase == "model_write":
+        service.store.save_model_if_session = update
+
+    async def prompt(session, text, **kwargs):
+        entered.set()
+        await finish_old.wait()
+        return TurnResult(
+            session_id=session,
+            stop_reason="cancelled",
+            answer_text="",
+            thought_text="",
+            model_id="old-model",
+        )
+
+    service.broker.prompt_turn = prompt
+    turn = asyncio.create_task(service.run_turn("active", "Old work"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if phase == "model_write":
+            finish_old.set()
+            await asyncio.wait_for(updating.wait(), 2)
+        replacement = await asyncio.wait_for(service.new_session("active"), 2)
+        assert replacement != sid
+        saved = await service.store.get("active")
+        finish_old.set()
+        finish_update.set()
+        assert (await asyncio.wait_for(turn, 2)).model_id == "old-model"
+        assert await service.store.get("active") == saved
+    finally:
+        finish_old.set()
+        finish_update.set()
+        await asyncio.gather(turn, return_exceptions=True)
 
 
 @pytest.mark.parametrize("operation", ["create", "resume", "replace"])
