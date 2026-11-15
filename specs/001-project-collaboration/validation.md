@@ -2,7 +2,7 @@
 
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 685 tests pass, one optional installed Codex adapter fixture skipped, 95.98 seconds.
+- Python 3.12.15 with locked dependencies: 705 tests pass, one optional installed Codex adapter fixture skipped, 99.58 seconds.
 - Ruff passes across the repository. Formatting passes for all 31 changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
 - Preceding full-branch Sol/high reports and finalized synthesis were inspected. All supported findings have fixes and meaningful regressions. Latest fixes reject unknown and unverified authors in registered discussions, retain ordinary behavior outside projects, and apply expiry inside dispatch transactions after native preparation. A fresh committed-source review precedes publication.
@@ -34,6 +34,8 @@ Creation intent records its admission timestamp. Origin cancellation retains the
 Steering requires a same-harness session successfully loaded by the current broker process, with a final guarded check at the native write. Restart clears loaded-session evidence. Stop suppresses report publication while preserving every pending predecessor observer.
 
 Steering also requires a recorded execution report and nonempty execution ID, rechecked at the native write boundary. Missing reports retain existing unresolved execution and create no null ownership. Owner cancellation exemptions require the delivery's recorded original thread and channel; rebinding the owner receives normal native cancellation, including after an early result. Explicit delegation and task claiming reject participants on the parent chain before changing state or request budgets. A blocked correlated result returns missing-information requests to the parent. Twenty-five regressions cover these conditions and settlement.
+
+Twenty further regressions cover terminal dispatch rejection, retained settled history, unresolved old and legacy execution, failed reconciliation reads, surviving guard children, artifact-storage failure and peer-floor join ordering. Rejected provisional ownership can reconcile after a transient read failure without replaying native work. Long-answer storage errors preserve terminal evidence and complete chat output, with a bounded receipt preview and separate error. A parent independent gateway rerun passed all five new delivery cases. Worker affected runs passed 182 dispatch/guard/caller tests and 77 gateway/result tests.
 
 Session creation and replacement share a separate per-thread preparation lock. Final turn preparation receives the expected workspace and rejects a stored mismatch before reservation. Replacement can still cancel a running turn; terminal model persistence cannot resurrect or overwrite a replaced session. Known busy refusals queue quietly, and the full accepted slash-handler lifetime blocks maintenance during root creation.
 

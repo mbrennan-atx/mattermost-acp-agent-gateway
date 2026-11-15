@@ -17,6 +17,7 @@ from test_collaboration_continuation_review import terminal
 from test_collaboration_dispatch_review import close_reports, native_gateway
 
 from mattermost_acp.acp import TurnResult
+from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
 
@@ -432,4 +433,249 @@ async def test_blocked_child_result_returns_to_parent_and_allows_corrected_reque
     finally:
         if consumer:
             await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("mode", ["steering", "preparation"])
+@pytest.mark.parametrize("state", ["done", "failed", "blocked"])
+async def test_reply_before_dispatch_rejection_releases_only_provisional_ownership(
+    tmp_path, mode, state
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.get = AsyncMock(
+        return_value=SimpleNamespace(session_id="existing-native", harness="claude")
+    )
+    gateway.sessions.store.harness = "claude"
+    gateway.sessions.hint = AsyncMock(wraps=gateway.sessions.hint)
+    broker.capabilities.steering = mode == "steering"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    original_update = consumer.update
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        previous = execution_report(None, "previous-execution")
+        previous_terminal = terminal("previous-execution")
+        gateway._reports["existing-native"] = previous
+        gateway._last_terminal["discussion"] = previous_terminal
+
+        async def reply_before_dispatch(item, update, *args, **kwargs):
+            if update == "dispatch":
+                store.reply(
+                    requested["id"],
+                    "beta",
+                    "Explicit result before native dispatch",
+                    state=state,
+                    claim=claimed["claim"],
+                )
+            return await original_update(item, update, *args, **kwargs)
+
+        consumer.update = reply_before_dispatch
+        await consumer.handle(claimed)
+        gateway.sessions.hint.assert_not_awaited()
+        assert writer.messages == []
+        receipt = store.get_message(requested["id"], "beta")
+        assert receipt["state"] == state and not receipt.get("execution_pending")
+        assert receipt["result"] == "Explicit result before native dispatch"
+        assert receipt["evidence"] == {} and "reservation_evidence" not in claimed
+        assert not consumer.ownership and not consumer.ownership_threads
+        assert not consumer.rejected_reservations and not consumer.active("discussion")
+        assert gateway._reports["existing-native"] is previous
+        assert gateway._last_terminal["discussion"] is previous_terminal
+        followup = ask(store, p["id"], key="followup")
+        assert store.claim_next("beta", consumer.instance)["id"] == followup["id"]
+    finally:
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_terminal_dispatch_rejection_after_historical_settlement_creates_no_owner(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        store.update(
+            requested["id"],
+            "beta",
+            consumer.instance,
+            "dispatch",
+            evidence={"session_id": "existing-native", "execution_id": "historical-execution"},
+            claim=claimed["claim"],
+        )
+        store.reply(requested["id"], "beta", "Historical result", claim=claimed["claim"])
+        old_terminal = terminal("historical-execution")
+        store.update(
+            requested["id"],
+            "beta",
+            consumer.instance,
+            "execution_settled",
+            evidence=old_terminal,
+            claim=claimed["claim"],
+        )
+        before = store.get_message(requested["id"], "beta")
+        assert not before["execution_pending"] and before["evidence"]["dispatch_started"]
+        gateway._last_terminal["discussion"] = old_terminal
+        gateway._reports["existing-native"] = execution_report(p["id"], "new-provisional-execution")
+        assert not await consumer.reserve(claimed, "existing-native")
+        assert store.get_message(requested["id"], "beta") == before
+        assert not consumer.ownership and not consumer.ownership_threads
+        assert "reservation_evidence" not in claimed and not consumer.rejected_reservations
+        assert gateway._last_terminal["discussion"] is old_terminal
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("local_owner", [False, True])
+async def test_rejected_new_dispatch_preserves_existing_native_execution_debt(
+    tmp_path, legacy, local_owner
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        old = execution_report(p["id"], "existing-execution")
+        old.update(active=True, foreground_complete=False)
+        gateway._reports["existing-native"] = old
+        if local_owner:
+            assert await consumer.reserve(claimed, "existing-native")
+        else:
+            store.update(
+                requested["id"],
+                "beta",
+                consumer.instance,
+                "dispatch",
+                evidence={"session_id": "existing-native", "execution_id": "existing-execution"},
+                claim=claimed["claim"],
+            )
+        store.reply(requested["id"], "beta", "Early native result", claim=claimed["claim"])
+        if legacy:
+            with store.transaction():
+                current = store.get_message(requested["id"], "beta")
+                current.pop("execution_pending")
+                store.save_message(current)
+        before = store.get_message(requested["id"], "beta")
+        old_terminal = terminal("existing-execution")
+        gateway._last_terminal["discussion"] = old_terminal
+        provisional = execution_report(p["id"], "new-provisional-execution")
+        provisional["previous"] = old
+        gateway._reports["existing-native"] = provisional
+        with pytest.raises(HubError, match="HTTP 409"):
+            await consumer.reserve(claimed, "existing-native")
+        key = (requested["id"], claimed["claim"])
+        assert store.get_message(requested["id"], "beta") == before
+        assert gateway._last_terminal["discussion"] is old_terminal
+        assert not consumer.rejected_reservations
+        if local_owner:
+            assert consumer.ownership[key] is old
+            assert claimed["reservation_evidence"]["execution_id"] == "existing-execution"
+            assert consumer.ownership_pending(key)
+            old.update(active=False, foreground_complete=True)
+            await consumer.reconcile_ownership()
+            assert not store.get_message(requested["id"], "beta")["execution_pending"]
+            assert not consumer.owns_thread("discussion")
+        else:
+            assert not consumer.ownership and not consumer.ownership_threads
+            assert "reservation_evidence" not in claimed
+            assert before.get("execution_pending", True)
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_conflicting_response_after_accepted_reservation_keeps_matching_native_owner(
+    tmp_path,
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    original_update = consumer.update
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        owned = execution_report(p["id"])
+        gateway._reports["existing-native"] = owned
+
+        async def accepted_then_conflict(item, update, *args, **kwargs):
+            receipt = await original_update(item, update, *args, **kwargs)
+            if update == "dispatch":
+                store.reply(
+                    requested["id"], "beta", "Accepted early result", claim=claimed["claim"]
+                )
+                raise HubError("Response rejected after accepted reservation", status=409)
+            return receipt
+
+        consumer.update = accepted_then_conflict
+        with pytest.raises(HubError, match="Response rejected"):
+            await consumer.reserve(claimed, "existing-native")
+        key = (requested["id"], claimed["claim"])
+        current = store.get_message(requested["id"], "beta")
+        assert current["state"] == "done" and current["execution_pending"]
+        assert consumer.ownership[key] is owned and not consumer.rejected_reservations
+        assert current["evidence"]["execution_id"] == owned["execution_id"]
+        assert claimed["reservation_evidence"]["execution_id"] == owned["execution_id"]
+        gateway._last_terminal["discussion"] = terminal(owned["execution_id"])
+        await consumer.reconcile_ownership()
+        assert (
+            not consumer.ownership
+            and not store.get_message(requested["id"], "beta")["execution_pending"]
+        )
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_rejected_dispatch_with_failed_read_recovers_on_ownership_reconciliation(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    original_update, original_request = consumer.update, consumer.hub.request
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        claimed = store.claim_next("beta", consumer.instance)
+        owned = execution_report(p["id"])
+        gateway._reports["existing-native"] = owned
+        previous_terminal = terminal("previous-execution")
+        gateway._last_terminal["discussion"] = previous_terminal
+
+        async def reply_before_dispatch(item, update, *args, **kwargs):
+            store.reply(requested["id"], "beta", "Early result", claim=claimed["claim"])
+            return await original_update(item, update, *args, **kwargs)
+
+        async def unreadable(method, path, body=None):
+            if method == "GET":
+                raise TimeoutError("Reservation verification unavailable")
+            return await original_request(method, path, body)
+
+        consumer.update, consumer.hub.request = reply_before_dispatch, unreadable
+        with pytest.raises(TimeoutError, match="verification unavailable"):
+            await consumer.reserve(claimed, "existing-native")
+        key = (requested["id"], claimed["claim"])
+        assert consumer.ownership[key] is owned and key in consumer.rejected_reservations
+        consumer.hub.request, consumer.update = original_request, original_update
+        await consumer.reconcile_ownership()
+        assert not consumer.ownership and not consumer.ownership_threads
+        assert not consumer.rejected_reservations and "reservation_evidence" not in claimed
+        assert gateway._last_terminal["discussion"] is previous_terminal
+        settled = store.get_message(requested["id"], "beta")
+        assert settled["state"] == "done" and settled["evidence"] == {}
+    finally:
+        await consumer.close()
         await close_api(store, server, clients)

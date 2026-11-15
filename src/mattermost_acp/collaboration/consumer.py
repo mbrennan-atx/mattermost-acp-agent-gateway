@@ -33,6 +33,7 @@ class CollaborationConsumer:
         self.closing = False
         self.ownership = {}
         self.ownership_threads = {}
+        self.rejected_reservations = {}
         self.reserving = set()
         self.cancelled_claims = set()
         self.claiming = False
@@ -217,6 +218,7 @@ class CollaborationConsumer:
         )
 
     def release_ownership(self, key):
+        self.rejected_reservations.pop(key, None)
         report = self.ownership.pop(key, None)
         thread = self.ownership_threads.pop(key, None) or (report or {}).get("thread_id")
         self.gateway.prune_reports()
@@ -252,9 +254,11 @@ class CollaborationConsumer:
         )
 
     async def settle_ownership(self, key, state):
-        report = self.ownership.get(key)
         if state.get("claim") != key[1] or key in self.reserving:
             return
+        if self.settle_rejected_reservation(key, state):
+            return
+        report = self.ownership.get(key)
         thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
         terminal = self.gateway._last_terminal.get(thread)
         evidence = state.get("evidence", {})
@@ -290,6 +294,49 @@ class CollaborationConsumer:
                 )
             if self.ownership.get(key) is report and key not in self.reserving:
                 self.release_ownership(key)
+
+    def settle_rejected_reservation(self, key, state):
+        attempt = self.rejected_reservations.get(key)
+        if (
+            attempt is None
+            or state.get("claim") != key[1]
+            or state.get("instance") != self.instance
+            or state["state"] not in {"done", "failed", "blocked", "cancelled"}
+        ):
+            return False
+        reserved = state.get("evidence", {})
+        has_execution = bool(
+            state.get("execution_pending", reserved.get("dispatch_started") is not None)
+        )
+        prior = attempt["prior_owned"]
+        prior_matches = (
+            prior is not None
+            and reserved.get("session_id") == attempt["session"]
+            and reserved.get("execution_id") == prior.get("execution_id")
+        )
+        attempt_matches = reserved.get("session_id") == attempt["session"] and reserved.get(
+            "execution_id"
+        ) == attempt["report"].get("execution_id")
+        if (not has_execution or prior_matches or not attempt_matches) and self.ownership.get(
+            key
+        ) is attempt["report"]:
+            # Roll back the provisional mapping without discarding an earlier
+            # execution owner or its terminal receipts.
+            if prior is None:
+                self.ownership.pop(key, None)
+            else:
+                self.ownership[key] = prior
+            if attempt["prior_thread"] is None:
+                self.ownership_threads.pop(key, None)
+            else:
+                self.ownership_threads[key] = attempt["prior_thread"]
+            if attempt["prior_reservation"] is None:
+                attempt["item"].pop("reservation_evidence", None)
+            else:
+                attempt["item"]["reservation_evidence"] = attempt["prior_reservation"]
+            self.gateway.prune_reports()
+        self.rejected_reservations.pop(key, None)
+        return not has_execution
 
     async def continuation(self, item):
         parent_id = item.get("continuation_parent")
@@ -822,6 +869,9 @@ class CollaborationConsumer:
             item["binding"]["thread_id"]
         )
         key = (item["id"], item.get("claim"))
+        prior_owned = self.ownership.get(key)
+        prior_thread = self.ownership_threads.get(key)
+        prior_reservation = item.get("reservation_evidence")
         self.reserving.add(key)
         self.ownership[key] = report
         self.ownership_threads[key] = item["binding"]["thread_id"]
@@ -832,11 +882,27 @@ class CollaborationConsumer:
         }
         item["reservation_evidence"] = evidence
         try:
-            receipt = await self.update(
-                item,
-                "dispatch",
-                evidence=evidence,
-            )
+            try:
+                receipt = await self.update(
+                    item,
+                    "dispatch",
+                    evidence=evidence,
+                )
+            except HubError as exc:
+                if exc.status != 409:
+                    raise
+                self.rejected_reservations[key] = {
+                    "report": report,
+                    "session": session,
+                    "item": item,
+                    "prior_owned": prior_owned,
+                    "prior_thread": prior_thread,
+                    "prior_reservation": prior_reservation,
+                }
+                current = await self.hub.request("GET", "/messages/" + item["id"])
+                if self.settle_rejected_reservation(key, current):
+                    return False
+                raise
             accepted = (
                 receipt["state"] == "running"
                 and receipt.get("claim") == item.get("claim")

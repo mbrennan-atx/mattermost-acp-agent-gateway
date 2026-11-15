@@ -127,6 +127,7 @@ class MattermostGateway:
         settings = Settings.load()
         if getattr(self.config, "collab_sidecar", False) and settings is None:
             raise ValueError("A collaboration sidecar requires a configured hub")
+        await self._ensure_peer_membership()
         if settings is not None:
             self.collaboration = CollaborationConsumer(self, settings)
             self.collaboration.start()
@@ -140,7 +141,6 @@ class MattermostGateway:
             "ALL" if self.config.all_channels else sorted(self.config.channel_ids),
             self.config.peer_channel_id or "-",
         )
-        await self._ensure_peer_membership()
         if self.config.auto_join_channels and not getattr(self.config, "collab_sidecar", False):
             asyncio.create_task(self._join_all_public_channels(), name="auto-join")
         async for payload in self.client.events(stop=self._stop):
@@ -1094,16 +1094,22 @@ class MattermostGateway:
             or before_native is not None
             or (self.collaboration is not None and self.collaboration.owns_thread(thread_id))
         ):
+            self._last_terminal[thread_id] = receipt
             # Keep a bounded preview and durable full output while ownership is unresolved.
             if len(public_answer) > 8000:
                 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 
-                evidence = CollaborationConsumer.foreground(
-                    {"id": report["execution_id"], "claim": "terminal"}, receipt
-                )
-                receipt["result_file"] = evidence["result_file"]
                 receipt["answer"] = public_answer[:8000]
-            self._last_terminal[thread_id] = receipt
+                try:
+                    evidence = CollaborationConsumer.foreground(
+                        {"id": report["execution_id"], "claim": "terminal"},
+                        {**receipt, "answer": public_answer},
+                    )
+                except OSError as exc:
+                    receipt["result_file_error"] = f"{type(exc).__name__}: {exc}"
+                    logger.exception("foreground artifact failed thread=%s", thread_id)
+                else:
+                    receipt["result_file"] = evidence["result_file"]
 
         if self.config.show_thoughts and result.thought_text:
             answer = f"_{result.thought_text.strip()}_\n\n{answer}".strip()

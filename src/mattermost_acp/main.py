@@ -57,11 +57,12 @@ def build_workspace_guard(command, *, timeout_s=15):
                 if await process.wait():
                     raise NativeDispatchChanged("Workspace verification refused native preparation")
         except BaseException as exc:
-            if process is not None and process.returncode is None:
+            if process is not None:
                 try:
                     if os.name == "posix":
+                        # Descendants can outlive an exited guard in its owned group.
                         os.killpg(process.pid, signal.SIGKILL)
-                    else:
+                    elif process.returncode is None:
                         process.kill()
                 except ProcessLookupError:
                     pass
