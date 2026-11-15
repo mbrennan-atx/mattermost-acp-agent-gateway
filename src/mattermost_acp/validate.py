@@ -12,6 +12,9 @@ from mattermost_acp.config import Config
 
 def check() -> None:
     config = Config.load()
+    from mattermost_acp.collaboration.client import Settings
+
+    Settings.load()
     if not config.grok_cwd.is_dir():
         raise ValueError("AGENT_CWD must select an existing directory")
     if not shutil.which(config.grok_command):

@@ -16,6 +16,8 @@ dependencies = [
 
 [project.scripts]
 mattermost-acp-gateway = "mattermost_acp.main:main"
+mm-work = "mattermost_acp.collaboration.cli:main"
+mattermost-acp-collaboration = "mattermost_acp.collaboration.hub:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mattermost_acp"]

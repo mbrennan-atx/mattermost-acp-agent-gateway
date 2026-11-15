@@ -140,6 +140,7 @@ class SessionService:
         self.inject_channel_context = inject_channel_context
         self._global_sem = asyncio.Semaphore(max_parallel_turns)
         self._busy: set[str] = set()
+        self._thread_locks: dict[str, asyncio.Lock] = {}
         # Threads whose live ACP model has been synced this agent process.
         self._pinned: set[str] = set()
 
@@ -275,17 +276,23 @@ class SessionService:
         channel_id: str | None = None,
         on_update: UpdateCallback | None = None,
         route: RouteRequest | None = None,
+        before_prompt=None,
     ) -> TurnResult:
         if thread_id in self._busy:
             raise RuntimeError("This thread already has a turn in progress. Use /stop.")
 
-        async with self._global_sem:
+        async with self._thread_locks.setdefault(thread_id, asyncio.Lock()), self._global_sem:
             self._busy.add(thread_id)
             self._write_busy_marker()
             try:
                 session_id = await self.ensure_session(
                     thread_id, channel_id=channel_id, route=route
                 )
+                if before_prompt is not None and not await before_prompt(session_id):
+                    return TurnResult(
+                        session_id=session_id, stop_reason="cancelled",
+                        answer_text="Cancelled before native dispatch", thought_text="",
+                    )
                 result = await self.broker.prompt_turn(
                     session_id, prompt, on_update=on_update
                 )

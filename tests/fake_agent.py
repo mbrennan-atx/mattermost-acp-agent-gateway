@@ -276,6 +276,7 @@ for line in sys.stdin:
         prompt = params.get("prompt") or []
         text = prompt[0].get("text","") if prompt else ""
         notify("session/update", {"sessionId": s, "update": {"sessionUpdate":"tool_call","toolCallId":"t1","title":"read_file vault","kind":"read","status":"pending"}})
+        notify("session/update", {"sessionId": s, "update": {"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}})
         notify("session/update", {"sessionId": s, "update": {"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"Hello "}}})
         notify("session/update", {"sessionId": s, "update": {"sessionUpdate":"agent_message_chunk","messageId":"m1","content":{"type":"text","text":"from fake agent.\n\nYou said: "+text}}})
         notify("session/update", {"sessionId": s, "update": {"sessionUpdate":"usage_update","used":1200,"size":200000}})

@@ -1,10 +1,12 @@
-# Exact public candidate inputs. Source must be committed before export.
 .env.example
 .github/workflows/checks.yml
 .gitignore
+.specify/memory/constitution.md
+AGENTS.md
 LICENSE
 README.md
 docs/codex.md
+docs/collaboration.md
 docs/deployment.md
 docs/harness-switching.md
 docs/harnesses/README.md
@@ -37,6 +39,15 @@ scripts/register-hint-command.py
 scripts/release_check.py
 scripts/retire-agent.py
 scripts/set-harness
+specs/001-project-collaboration/checklists/requirements.md
+specs/001-project-collaboration/contracts/api.md
+specs/001-project-collaboration/data-model.md
+specs/001-project-collaboration/plan.md
+specs/001-project-collaboration/quickstart.md
+specs/001-project-collaboration/research.md
+specs/001-project-collaboration/spec.md
+specs/001-project-collaboration/tasks.md
+specs/001-project-collaboration/validation.md
 src/mattermost_acp/__init__.py
 src/mattermost_acp/__main__.py
 src/mattermost_acp/acp/__init__.py
@@ -47,6 +58,12 @@ src/mattermost_acp/attachments.py
 src/mattermost_acp/backends/__init__.py
 src/mattermost_acp/backends/grok.py
 src/mattermost_acp/channel_context.py
+src/mattermost_acp/collaboration/__init__.py
+src/mattermost_acp/collaboration/cli.py
+src/mattermost_acp/collaboration/client.py
+src/mattermost_acp/collaboration/consumer.py
+src/mattermost_acp/collaboration/hub.py
+src/mattermost_acp/collaboration/store.py
 src/mattermost_acp/commands/__init__.py
 src/mattermost_acp/commands/cursor_models.py
 src/mattermost_acp/commands/defs.py
@@ -86,6 +103,7 @@ tests/test_channel_context.py
 tests/test_chunk.py
 tests/test_codex_catalog.py
 tests/test_codex_steering_patch.py
+tests/test_collaboration.py
 tests/test_commands.py
 tests/test_config.py
 tests/test_cursor.py

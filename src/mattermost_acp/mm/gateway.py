@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from mattermost_acp import harness_switch
@@ -53,7 +55,7 @@ from mattermost_acp.mm.status import (
     pretty_model_name,
     stamp_answer,
 )
-from mattermost_acp.mm.wake import classify_wake
+from mattermost_acp.mm.wake import classify_wake, sole_mention
 from mattermost_acp.model_router import RouteRequest
 from mattermost_acp.thread_title import (
     MAX_RENAME_ATTEMPTS,
@@ -89,6 +91,9 @@ class MattermostGateway:
         self._status_lock = asyncio.Lock()
         self._rename_attempts: dict[str, int] = {}
         self._reports: dict[str, dict] = {}
+        self._prompt_locks: dict[str, asyncio.Lock] = {}
+        self._last_terminal: dict[str, dict] = {}
+        self.collaboration = None
         broker = getattr(self.sessions, "broker", None)
         if broker is not None:
             broker.update_observer = self._observe_background_update
@@ -107,6 +112,13 @@ class MattermostGateway:
 
     async def run(self) -> None:
         await self.client.get_me()
+        from mattermost_acp.collaboration.client import Settings
+        from mattermost_acp.collaboration.consumer import CollaborationConsumer
+
+        settings = Settings.load()
+        if settings is not None:
+            self.collaboration = CollaborationConsumer(self, settings)
+            self.collaboration.start()
         asyncio.create_task(self._handle_pending_restart_bump(), name="post-restart-bump")
         logger.info(
             "Gateway online as %s (%s) harness=%s home=%s peer=%s",
@@ -198,6 +210,8 @@ class MattermostGateway:
 
     async def close(self) -> None:
         self._stop.set()
+        if self.collaboration is not None:
+            await self.collaboration.close()
         for report in self._reports.values():
             if report.get("task"):
                 report["task"].cancel()
@@ -279,6 +293,16 @@ class MattermostGateway:
         return str(root.get("user_id") or "")
 
     async def handle_posted(self, posted: PostedEvent) -> None:
+        if (
+            self.collaboration is not None
+            and posted.root_id
+            and posted.channel_id == self.config.peer_channel_id
+            and sole_mention(posted.message) == self.client.username
+            and re.match(r"^@[A-Za-z0-9._-]+\s+ASK:\s+", posted.message, re.IGNORECASE)
+            and posted.user_id != self.client.user_id
+        ):
+            if await self.collaboration.mention(posted):
+                return
         _kind, reason = classify_wake(
             channel_id=posted.channel_id,
             author_id=posted.user_id,
@@ -433,6 +457,8 @@ class MattermostGateway:
                 await reply("There is no active turn now. Send your hint as a normal message.")
             return
         if cmd == "stop":
+            if self.collaboration is not None:
+                await self.collaboration.cancel_thread(thread_id)
             self._stop_reports(thread_id)
             ok = await self.sessions.cancel(thread_id)
             await reply("⏹ Cancelled." if ok else "Nothing to cancel.")
@@ -498,7 +524,14 @@ class MattermostGateway:
             return
         await reply(f"Unknown command `/{cmd}`. Try `/help`.")
 
-    async def run_prompt(
+    async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
+        async with self._prompt_locks.setdefault(thread_id, asyncio.Lock()):
+            result = await self._run_prompt(thread_id=thread_id, **kwargs)
+            if result is not None:
+                self._last_terminal[thread_id] = {**result, "completed_at": time.time()}
+            return result
+
+    async def _run_prompt(
         self,
         *,
         thread_id: str,
@@ -508,7 +541,9 @@ class MattermostGateway:
         author_name: str,
         passthrough: bool = False,
         has_attachments: bool = False,
-    ) -> None:
+        workspace: str | None = None,
+        before_native=None,
+    ) -> dict | None:
         if self.sessions.is_busy(thread_id):
             await self._post(
                 channel_id,
@@ -552,7 +587,10 @@ class MattermostGateway:
             else RouteRequest(prompt, channel_id=channel_id, has_attachments=has_attachments)
         )
         try:
-            await self.sessions.ensure_session(thread_id, channel_id=channel_id, route=route)
+            options = {"channel_id": channel_id, "route": route}
+            if workspace:
+                options["cwd"] = Path(workspace)
+            await self.sessions.ensure_session(thread_id, **options)
         except Exception:
             logger.debug("ensure_session before model stamp failed", exc_info=True)
         session_status = await self.sessions.status(thread_id)
@@ -642,9 +680,10 @@ class MattermostGateway:
         try:
             await _publish_status(status.render(), force=True)
             try:
-                result = await self.sessions.run_turn(
-                    thread_id, text, channel_id=channel_id, on_update=on_update, route=route
-                )
+                turn_options = {"channel_id": channel_id, "on_update": on_update, "route": route}
+                if before_native is not None:
+                    turn_options["before_prompt"] = before_native
+                result = await self.sessions.run_turn(thread_id, text, **turn_options)
             finally:
                 report["active"] = False
                 if not reporter.has_pending_work():
@@ -687,6 +726,17 @@ class MattermostGateway:
             except Exception:
                 logger.exception("model set from agent failed")
 
+        public_answer = answer
+        receipt = {
+            "answer": public_answer,
+            "stop_reason": result.stop_reason,
+            "session_id": result.session_id,
+            "model": result.model_id or str(session_status.get("model") or ""),
+            "pending": reporter.has_pending_work(),
+            "completed_at": time.time(),
+        }
+        self._last_terminal[thread_id] = receipt
+
         if self.config.show_thoughts and result.thought_text:
             answer = f"_{result.thought_text.strip()}_\n\n{answer}".strip()
 
@@ -714,7 +764,7 @@ class MattermostGateway:
                 f"Buffered {len(answer)} chars, {len(parts)} parts.",
                 root_id=thread_id,
             )
-            return
+            return receipt
 
         if result.usage_used is not None:
             status.usage_used = result.usage_used
@@ -735,6 +785,7 @@ class MattermostGateway:
             status.render(phase="done", stop_reason=result.stop_reason, extra=extra),
             force=True,
         )
+        return receipt
 
     async def _root_preview(self, thread_id: str) -> tuple[str, str]:
         rec = await self.sessions.store.get(thread_id)
