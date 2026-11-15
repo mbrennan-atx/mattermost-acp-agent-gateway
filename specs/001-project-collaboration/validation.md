@@ -2,10 +2,10 @@
 
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 624 tests pass, one optional installed Codex adapter fixture skipped, 87.53 seconds.
-- Ruff passes across the repository. Formatting passes for all changed Python files. Existing formatting differences in untouched files are outside this change.
+- Python 3.12.15 with locked dependencies: 641 tests pass, one optional installed Codex adapter fixture skipped, 90.42 seconds.
+- Ruff passes across the repository. Formatting passes for all 31 changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
-- Both reports and synthesis from the preceding full-branch Sol/high reviews were inspected. All supported findings have implementation fixes and meaningful regressions. The latest report and synthesis have three additional fixes: separate posted-result delivery from native reservation, block rebinding while terminal requests retain native execution, and clear only matching reservations after a proven prewrite refusal. The 253 affected checks pass. Normalized creation retries and seven byte-verified extracted-source admission tests remain verified. A fresh review of the committed branch precedes publication.
+- Both reports and synthesis from the preceding full-branch Sol/high reviews were inspected. All supported findings have implementation fixes and meaningful regressions. The latest report and synthesis have three additional fixes: enforce the bound workspace during serialized final preparation, queue known busy refusals without native dispatch, and count the full slash-handler lifetime before its first await. A reproduced late-model persistence race also has a fix through a conditional session/harness SQL update without the preparation lock. The 304 affected checks pass. Normalized creation retries and seven byte-verified extracted-source admission tests remain verified. A fresh review of the committed branch precedes publication.
 - The prior immutable candidate passed committed-source export, wheel-from-sdist policy checks, parity for all 46 installed Python files and Config imports for seven actual original profiles. The amended source requires a new immutable build before activation.
 - Temporary real-profile staging verified seven generated sidecar configurations, enabled workspace guards and eight units through the actual systemd parser. It installed and started no services.
 
@@ -30,6 +30,8 @@ Registered project requests reject non-member senders and recipients instead of 
 Creation intent records its admission timestamp. Origin cancellation retains the latest boundary in the hub, including across restart, so posting/read-back delays cannot move earlier admitted work beyond the stop cutoff. Later projects remain active.
 
 Steering requires a same-harness session successfully loaded by the current broker process, with a final guarded check at the native write. Restart clears loaded-session evidence. Stop suppresses report publication while preserving every pending predecessor observer.
+
+Session creation and replacement share a separate per-thread preparation lock. Final turn preparation receives the expected workspace and rejects a stored mismatch before reservation. Replacement can still cancel a running turn; terminal model persistence cannot resurrect or overwrite a replaced session. Known busy refusals queue quietly, and the full accepted slash-handler lifetime blocks maintenance during root creation.
 
 Native project bindings stay on the project discussion, including the owner's. Owner results require originating-thread post read-back; sidecars never load the original owner's native session. Shared cancellation for legacy home gateways uses `mm-work cancel`; their `/stop` does not propagate to sidecars.
 
