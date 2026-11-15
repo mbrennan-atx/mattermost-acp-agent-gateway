@@ -963,7 +963,16 @@ class MattermostGateway:
                             self._reports.pop(old_session, None)
                         self._reports[actual_session] = report
                         session_status["session_id"] = actual_session
-                        return await before_native(actual_session)
+                        try:
+                            return await before_native(actual_session)
+                        except Exception as exc:
+                            # Preparation callbacks run before session/prompt can
+                            # write anything. A lost hub response is recoverable
+                            # without claiming native termination or repeating an
+                            # operation that could have reached the native client.
+                            raise NativeDispatchChanged(
+                                "Native reservation did not finish"
+                            ) from exc
 
                     turn_options["before_prompt"] = bind_native
                     turn_options["dispatch_guard"] = lambda: (

@@ -767,13 +767,8 @@ class CollaborationStore:
                     continue
                 if item["state"] in {"queued", "open"} or (
                     item["state"] not in TERMINAL
-                    and (
-                        item["kind"] == "result"
-                        or (
-                            item["recipient"] == project["owner"]
-                            and not project.get("owner_in_discussion")
-                        )
-                    )
+                    and item["recipient"] == project["owner"]
+                    and not project.get("owner_in_discussion")
                 ):
                     # Stop routing into the owner's conversation without stopping
                     # its existing work. Origin /stop separately cancels that turn.

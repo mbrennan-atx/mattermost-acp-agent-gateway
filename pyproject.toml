@@ -59,6 +59,7 @@ include = [
     "/tests/test_collaboration_continuation_review.py",
     "/tests/test_collaboration_dispatch_review.py",
     "/tests/test_collaboration_retirement_review.py",
+    "/tests/test_collaboration_result_review.py",
     "/specs/001-project-collaboration/**",
     "/.env.example",
     "/.github/workflows/checks.yml",

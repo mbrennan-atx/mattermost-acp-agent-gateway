@@ -224,6 +224,20 @@ class CollaborationConsumer:
             thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
             terminal = self.gateway._last_terminal.get(thread)
             evidence = state.get("evidence", {})
+            cancelled_retry = (
+                state["state"] == "cancelled"
+                and state.get("instance") is None
+                and bool(state.get("reconciliation"))
+            )
+            if cancelled_retry and report is not None and terminal:
+                evidence = next(
+                    (
+                        prior for prior in reversed(state.get("delivery_history", []))
+                        if prior.get("execution_id") == report.get("execution_id")
+                        and prior.get("session_id") == terminal.get("session_id")
+                    ),
+                    evidence,
+                )
             if (
                 report is not None
                 and report.get("foreground_complete")
@@ -236,7 +250,8 @@ class CollaborationConsumer:
                 and not terminal.get("pending")
                 and terminal.get("native_dispatched", True)
             ):
-                await self.update(state, "evidence", evidence=self.foreground(state, terminal))
+                if not cancelled_retry:
+                    await self.update(state, "evidence", evidence=self.foreground(state, terminal))
                 self.release_ownership(key)
 
     async def continuation(self, item):
@@ -400,17 +415,22 @@ class CollaborationConsumer:
                 and terminal
                 and terminal.get("session_id") == receipt["session_id"]
                 and terminal.get("execution_id") == receipt.get("execution_id")
-                and terminal["stop_reason"] != "end_turn"
+                and (terminal["stop_reason"] != "end_turn" or item["kind"] == "result")
                 and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
                 and not terminal.get("pending")
                 and terminal.get("native_dispatched", True)
             ):
-                state = "cancelled" if terminal["stop_reason"] == "cancelled" else "failed"
+                state = {
+                    "cancelled": "cancelled", "end_turn": "done"
+                }.get(terminal["stop_reason"], "failed")
+                evidence = self.foreground(item, terminal)
                 await self.update(
                     item,
                     state,
-                    "Native stop=" + terminal["stop_reason"],
-                    self.foreground(item, terminal),
+                    evidence["foreground_answer"]
+                    if state == "done"
+                    else "Native stop=" + terminal["stop_reason"],
+                    evidence,
                 )
                 return
 
