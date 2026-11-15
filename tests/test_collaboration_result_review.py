@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import stat
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -20,7 +22,187 @@ from test_collaboration_regressions import (
 from mattermost_acp.acp import SessionUpdate, TurnResult
 from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
+from mattermost_acp.collaboration.store import CollaborationStore
+from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.session_service import SessionService
+
+
+@pytest.mark.parametrize("missing", [None, "completed_at", "dispatch_started"])
+async def test_late_reply_cannot_reconcile_with_receipt_before_new_injection(tmp_path, missing):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, _p, parent, old):
+        initial = store.get_message(parent["id"], "beta")["evidence"]["dispatch_started"]
+        receipt = gateway._last_terminal["discussion"]
+        receipt["completed_at"] = initial
+        receipt["answer"] = "Output before the new injection"
+        store.clock = lambda: initial + 1
+        assert await consumer.reserve(parent, "existing-native")
+        await consumer.update(parent, "unconfirmed", "New injection receipt unavailable")
+        settled = store.reply(parent["id"], "beta", "Explicit late result", claim=parent["claim"])
+        expected = dict(settled["evidence"])
+        if missing == "completed_at":
+            receipt.pop("completed_at")
+        elif missing == "dispatch_started":
+            settled["evidence"].pop("dispatch_started")
+            with store.transaction():
+                store.save_message(settled)
+            expected = dict(settled["evidence"])
+
+        await consumer.reconcile_ownership()
+        assert consumer.ownership[(parent["id"], parent["claim"])] is old
+        assert consumer.owns_thread("discussion")
+        assert store.get_message(parent["id"], "beta")["evidence"] == expected
+
+        if missing == "dispatch_started":
+            settled["evidence"]["dispatch_started"] = initial + 1
+            with store.transaction():
+                store.save_message(settled)
+        receipt.update(completed_at=initial + 1, answer="Output after the new injection")
+        await consumer.reconcile_ownership()
+        assert not consumer.owns_thread("discussion")
+        final = store.get_message(parent["id"], "beta")
+        assert final["result"] == "Explicit late result"
+        assert final["evidence"]["foreground_answer"] == "Output after the new injection"
+
+
+@pytest.mark.parametrize("limit", ["dispatch", "depth"])
+async def test_rejected_project_ask_cannot_fall_through_to_allowlisted_native_wake(tmp_path, limit):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.allow_user_ids = frozenset({"alpha-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    try:
+        p = project(store, **({"max_turns": 1} if limit == "dispatch" else {"max_depth": 1}))
+        if limit == "dispatch":
+            ask(store, p["id"])
+        else:
+            ask(store, p["id"])
+            store.claim_next("beta", "peer-parent-worker")
+            ask(store, p["id"], sender="beta", recipient="alpha")
+            store.claim_next("alpha", "parent-worker")
+        posted = PostedEvent(
+            post_id="post-1",
+            channel_id="floor",
+            user_id="alpha-user",
+            message="@beta ASK: Verify the dependency",
+            root_id="discussion",
+        )
+        with pytest.raises(HubError, match="HTTP 409"):
+            await clients["beta"].request(
+                "POST",
+                "/mentions",
+                {
+                    "post_id": posted.post_id,
+                    "author_id": posted.user_id,
+                    "channel_id": posted.channel_id,
+                    "thread_id": posted.root_id,
+                    "text": posted.message,
+                },
+            )
+        before = store.show(p["id"], "alpha")["messages"]
+        await gateway.handle_posted(posted)
+        gateway.run_prompt.assert_not_awaited()
+        assert store.show(p["id"], "alpha")["messages"] == before
+
+        unregistered = PostedEvent(
+            post_id="post-2",
+            channel_id="floor",
+            user_id="alpha-user",
+            message=posted.message,
+            root_id="unregistered",
+        )
+        await gateway.handle_posted(unregistered)
+        gateway.run_prompt.assert_awaited_once()
+        assert gateway.run_prompt.call_args.kwargs["thread_id"] == "unregistered"
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+def test_message_expiry_index_upgrades_history_and_preserves_stale_lease_expiry(tmp_path):
+    now = [1000.0]
+    path = tmp_path / "hub.db"
+    actors = {"alpha", "beta", "gamma"}
+    store = CollaborationStore(path, actors, clock=lambda: now[0])
+    try:
+        p = project(store)
+        completed = ask(store, p["id"])
+        store.claim_next("beta", "history-worker")
+        store.reply(completed["id"], "beta", "Completed historical task")
+        completed = store.get_message(completed["id"], "beta")
+        with store.transaction():
+            for index in range(256):
+                store.save_message(
+                    {**completed, "id": f"history-{index}", "key": f"history-{index}"}
+                )
+            store.db.execute("DROP INDEX IF EXISTS message_expiry")
+    finally:
+        store.close()
+
+    reopened = CollaborationStore(path, actors, clock=lambda: now[0])
+    try:
+        plan = reopened.db.execute(
+            "EXPLAIN QUERY PLAN SELECT data FROM messages WHERE state='running'"
+        ).fetchall()
+        assert any("SEARCH messages USING INDEX message_expiry" in row[3] for row in plan)
+        request = ask(reopened, p["id"], key="current-request")
+        assert reopened.claim_next("beta", "current-worker")["id"] == request["id"]
+        now[0] += 46
+        reopened.expire()
+        assert reopened.get_message(request["id"], "beta")["state"] == "interrupted"
+        assert (
+            reopened.db.execute("SELECT count(*) FROM messages WHERE state='done'").fetchone()[0]
+            == 257
+        )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("directory_failure", [False, True])
+async def test_stop_intent_syncs_directory_after_replacement_and_closes_on_failure(
+    tmp_path, monkeypatch, directory_failure
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway()
+    gateway.config.db_path = tmp_path / "nested" / "project.db"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    calls = []
+    real_fsync = os.fsync
+
+    def sync(descriptor):
+        directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+        calls.append((descriptor, directory))
+        if directory:
+            assert json.loads(consumer.stops_path.read_text()) == consumer.pending_stops
+            if directory_failure:
+                raise OSError("Directory synchronization unavailable")
+        real_fsync(descriptor)
+
+    try:
+        consumer.pending_stops = {"origin": 1000.0}
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "fsync", sync)
+            if directory_failure:
+                with pytest.raises(OSError, match="Directory synchronization unavailable"):
+                    consumer.save_stops()
+            else:
+                consumer.save_stops()
+        assert [directory for _descriptor, directory in calls] == [False, True]
+        with pytest.raises(OSError):
+            os.fstat(calls[-1][0])
+        assert consumer.pending_stops == {"origin": 1000.0}
+        restarted = CollaborationConsumer(gateway, clients["beta"].settings)
+        try:
+            assert restarted.pending_stops == consumer.pending_stops
+        finally:
+            await restarted.close()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
 
 
 @asynccontextmanager

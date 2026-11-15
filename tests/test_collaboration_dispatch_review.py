@@ -72,6 +72,25 @@ async def test_sealed_native_admission_is_closed_even_without_draining_flag():
     gateway._run_prompt.assert_not_awaited()
 
 
+async def test_ordinary_followup_preserves_unresolved_project_report_and_terminal_receipt():
+    gateway = active_gateway(busy=False)
+    gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+    gateway._run_prompt = AsyncMock()
+    owned = idle_report()
+    receipt = {"execution_id": "project-execution", "completed_at": 10}
+    gateway._reports["project-native"] = owned
+    gateway._last_terminal["discussion"] = receipt
+    gateway.collaboration = SimpleNamespace(owns_thread=lambda thread: thread == "discussion")
+    result = await gateway.run_prompt(
+        thread_id="discussion", channel_id="floor", prompt="An ordinary follow-up"
+    )
+    assert result is None
+    gateway._run_prompt.assert_not_awaited()
+    assert gateway._reports["project-native"] is owned
+    assert gateway._last_terminal["discussion"] is receipt
+    assert "still pending" in gateway.client.posts[-1][1]
+
+
 async def test_repeated_harness_switches_share_one_idle_restart_waiter(monkeypatch):
     gateway = maintenance_gateway()
     gateway.config.harness = "codex"

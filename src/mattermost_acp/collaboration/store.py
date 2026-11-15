@@ -46,6 +46,7 @@ class CollaborationStore:
                 created REAL NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL,
                 UNIQUE(project, sender, key));
             CREATE INDEX IF NOT EXISTS mailbox ON messages(recipient,state,created);
+            CREATE INDEX IF NOT EXISTS message_expiry ON messages(state);
             CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY, project TEXT, data TEXT);
             CREATE TABLE IF NOT EXISTS creations(actor TEXT, key TEXT, data TEXT,
                 PRIMARY KEY(actor,key));

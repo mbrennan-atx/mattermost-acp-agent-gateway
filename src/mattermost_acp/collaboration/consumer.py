@@ -251,6 +251,8 @@ class CollaborationConsumer:
                 and terminal
                 and terminal.get("session_id") == evidence.get("session_id")
                 and terminal.get("execution_id") == evidence.get("execution_id")
+                and terminal.get("completed_at", float("-inf"))
+                >= evidence.get("dispatch_started", float("inf"))
                 and not terminal.get("pending")
                 and terminal.get("native_dispatched", True)
             ):
@@ -853,6 +855,11 @@ class CollaborationConsumer:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, self.stops_path)
+        directory = os.open(self.stops_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     async def post_result(self, item):
         thread, channel = item["origin_thread_id"], item["origin_channel_id"]
@@ -903,5 +910,10 @@ class CollaborationConsumer:
                     },
                 )
             )
-        except HubError:
+        except HubError as exc:
+            if str(exc).startswith("Collaboration HTTP 409:"):
+                # A registered project's rejected request must not bypass its
+                # limits by falling through to an ordinary addressed wake.
+                logger.warning("Project mention rejected; ordinary wake suppressed")
+                return True
             return False

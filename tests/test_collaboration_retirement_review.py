@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 from test_collaboration import active_gateway, api_fixture, ask, close_api, project
 from test_collaboration_continuation_review import child_result, retained_parent
 from test_collaboration_dispatch_review import (
@@ -27,6 +29,7 @@ from mattermost_acp.acp import SessionUpdate, TurnResult
 from mattermost_acp.collaboration import hub
 from mattermost_acp.collaboration.client import HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
+from mattermost_acp.mm.http import build_slash_app
 from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
 
@@ -255,7 +258,7 @@ async def test_cold_drain_settles_mailbox_claim_before_sealing(tmp_path):
 
     consumer.hub.request = delayed_mailbox
     client = await maintenance_client(gateway)
-    draining = None
+    draining = sealing = None
     try:
         p = project(store)
         request = ask(store, p["id"])
@@ -270,11 +273,18 @@ async def test_cold_drain_settles_mailbox_claim_before_sealing(tmp_path):
         async with asyncio.timeout(2):
             while not gateway.draining:
                 await asyncio.sleep(0)
-        sealed = await client.post("/maintenance", json={"action": "seal"}, headers=headers)
-        assert sealed.status == 409 and not gateway.sealed
+        sealing = asyncio.create_task(
+            client.post("/maintenance", json={"action": "seal"}, headers=headers)
+        )
+        await asyncio.sleep(0.05)
+        assert not sealing.done() and not gateway.sealed
         release.set()
         drained = await asyncio.wait_for(draining, 3)
         assert drained.status == 200
+        first_seal = await asyncio.wait_for(sealing, 3)
+        assert first_seal.status in {200, 409}
+        if first_seal.status == 200:
+            assert gateway.sealed and gateway.maintenance_state()["idle"]
         async with asyncio.timeout(3):
             while (
                 store.get_message(request["id"], "alpha")["state"] != "queued"
@@ -287,10 +297,11 @@ async def test_cold_drain_settles_mailbox_claim_before_sealing(tmp_path):
         assert sealed.status == 200 and gateway.sealed
     finally:
         release.set()
-        if draining and not draining.done():
-            draining.cancel()
-        if draining:
-            await asyncio.gather(draining, return_exceptions=True)
+        tasks = [task for task in [draining, sealing] if task]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await consumer.close()
         await client.close()
         await close_api(store, server, clients)
@@ -381,6 +392,90 @@ async def test_failed_admission_keeps_uncertainty_until_successful_drain(tmp_pat
         sealed = await client.post("/maintenance", json={"action": "seal"}, headers=headers)
         assert sealed.status == 200 and gateway.sealed
     finally:
+        await consumer.close()
+        await client.close()
+        await close_api(store, server, clients)
+
+
+async def test_concurrent_resume_and_drain_keep_local_and_hub_admission_ordered(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = maintenance_gateway()
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.draining = gateway.sealed = True
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    consumer.actor = "beta"
+    gateway.collaboration = consumer
+    gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
+    gateway._run_prompt = AsyncMock(return_value={"stop_reason": "end_turn"})
+    headers = {"Authorization": "Bearer " + consumer.hub.settings.token}
+    resume_entered, drain_received, drain_entered = (asyncio.Event() for _ in range(3))
+    resume_release, drain_release = asyncio.Event(), asyncio.Event()
+    actual_request = consumer.hub.request
+    modes = []
+
+    async def delayed_admission(method, path, body=None):
+        result = await actual_request(method, path, body)
+        if path == "/mailbox/admission":
+            modes.append(body["mode"])
+            if body["mode"] == "normal":
+                resume_entered.set()
+                await resume_release.wait()
+            elif body["mode"] == "controls":
+                drain_entered.set()
+                await drain_release.wait()
+        return result
+
+    @web.middleware
+    async def observe_request(request, handler):
+        if request.path == "/maintenance" and (await request.json()).get("action") == "drain":
+            drain_received.set()
+        return await handler(request)
+
+    consumer.hub.request = delayed_admission
+    app = build_slash_app(gateway.config, gateway.handle_slash)
+    app.middlewares.append(observe_request)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    consumer.start()
+    resume = drain = None
+    try:
+        resume = asyncio.create_task(
+            client.post("/maintenance", json={"action": "resume"}, headers=headers)
+        )
+        await asyncio.wait_for(resume_entered.wait(), 2)
+        drain = asyncio.create_task(
+            client.post("/maintenance", json={"action": "drain"}, headers=headers)
+        )
+        await asyncio.wait_for(drain_received.wait(), 2)
+        resume_release.set()
+        await asyncio.wait_for(drain_entered.wait(), 2)
+        assert (await asyncio.wait_for(resume, 2)).status == 200
+        assert gateway.draining
+        await gateway.run_prompt(
+            thread_id="origin", channel_id="home", prompt="User work during drain"
+        )
+        gateway._run_prompt.assert_not_awaited()
+        drain_release.set()
+        assert (await asyncio.wait_for(drain, 2)).status == 200
+        assert modes == ["normal", "controls"]
+        assert gateway.draining and not gateway.sealed
+        p = project(store)
+        request = ask(store, p["id"])
+        assert (
+            await clients["beta"].request(
+                "GET", "/mailbox?instance=" + consumer.instance + "&wait=0"
+            )
+            is None
+        )
+        assert store.get_message(request["id"], "beta")["state"] == "queued"
+    finally:
+        resume_release.set()
+        drain_release.set()
+        tasks = [task for task in [resume, drain] if task]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await consumer.close()
         await client.close()
         await close_api(store, server, clients)

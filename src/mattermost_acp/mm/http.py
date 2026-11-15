@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import logging
 import secrets
@@ -78,6 +79,7 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
 
     app.router.add_post("/slash", slash)
     app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
+    maintenance_lock = asyncio.Lock()
 
     async def maintenance(request):
         gateway = getattr(handler, "__self__", None)
@@ -100,29 +102,32 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
         action = body.get("action", "state")
         if not isinstance(action, str) or action not in {"state", "drain", "resume", "seal"}:
             raise web.HTTPBadRequest()
-        if action == "seal":
-            if not gateway.draining or not gateway.maintenance_state()["idle"]:
-                raise web.HTTPConflict(text="Gateway must be drained and idle")
-            try:
-                await consumer.set_admission("sealed")
-            except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
-                raise web.HTTPConflict(text="Mailbox admission could not settle") from None
-            if not gateway.maintenance_state()["idle"]:
-                await consumer.set_admission("controls")
-                raise web.HTTPConflict(text="Gateway has pending work")
-            gateway.sealed = True
-        elif action != "state":
-            # Keep local admission closed throughout a hub fence transition.
-            gateway.draining = True
-            try:
-                await consumer.set_admission("controls" if action == "drain" else "normal")
-            except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+        # Local flags and the hub fence are one transition, including overlapping
+        # operator requests. The consumer's lock covers only its hub operation.
+        async with maintenance_lock:
+            if action == "seal":
+                if not gateway.draining or not gateway.maintenance_state()["idle"]:
+                    raise web.HTTPConflict(text="Gateway must be drained and idle")
+                try:
+                    await consumer.set_admission("sealed")
+                except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+                    raise web.HTTPConflict(text="Mailbox admission could not settle") from None
+                if not gateway.maintenance_state()["idle"]:
+                    await consumer.set_admission("controls")
+                    raise web.HTTPConflict(text="Gateway has pending work")
+                gateway.sealed = True
+            elif action != "state":
+                # Keep local admission closed throughout a hub fence transition.
                 gateway.draining = True
-                raise web.HTTPConflict(text="Mailbox admission could not settle") from None
-            if action == "resume":
-                gateway.sealed = False
-                gateway.draining = False
-        return web.json_response(gateway.maintenance_state())
+                try:
+                    await consumer.set_admission("controls" if action == "drain" else "normal")
+                except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+                    gateway.draining = True
+                    raise web.HTTPConflict(text="Mailbox admission could not settle") from None
+                if action == "resume":
+                    gateway.sealed = False
+                    gateway.draining = False
+            return web.json_response(gateway.maintenance_state())
 
     app.router.add_post("/maintenance", maintenance)
 

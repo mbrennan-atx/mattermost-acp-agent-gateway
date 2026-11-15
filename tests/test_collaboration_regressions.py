@@ -347,6 +347,7 @@ async def test_owned_terminal_preview_is_bounded_and_full_evidence_survives_rele
             prompt="Work",
             author_id="human",
             author_name="human",
+            ownership_guard=lambda: True,
         )
         cached = gateway._last_terminal["root"]
         assert len(cached["answer"]) == 8000

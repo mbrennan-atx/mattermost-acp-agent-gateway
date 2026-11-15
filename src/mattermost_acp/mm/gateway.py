@@ -655,11 +655,17 @@ class MattermostGateway:
                 )
                 return None
             if (
-                kwargs.get("before_native") is not None
-                and self.collaboration is not None
+                self.collaboration is not None
                 and self.collaboration.owns_thread(thread_id)
                 and not (kwargs.get("ownership_guard") and kwargs["ownership_guard"]())
             ):
+                if kwargs.get("before_native") is None:
+                    await self._post(
+                        kwargs["channel_id"],
+                        "Project work is still pending in this thread. Use /hint or /stop.",
+                        root_id=thread_id,
+                    )
+                    return None
                 return {"queued": True}
             try:
                 return await self._run_prompt(thread_id=thread_id, **kwargs)
