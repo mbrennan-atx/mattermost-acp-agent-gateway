@@ -57,7 +57,7 @@ from mattermost_acp.mm.status import (
     pretty_model_name,
     stamp_answer,
 )
-from mattermost_acp.mm.wake import classify_wake, sole_mention
+from mattermost_acp.mm.wake import classify_wake
 from mattermost_acp.model_router import RouteRequest
 from mattermost_acp.thread_title import (
     MAX_RENAME_ATTEMPTS,
@@ -244,13 +244,13 @@ class MattermostGateway:
         while previous is not None:
             previous["reporter"].observe(update)
             previous = previous.get("previous")
-        if report["active"]:
-            if update.session_id not in getattr(
-                self.sessions.broker, "prompt_subscriptions", set()
-            ):
-                report["reporter"].observe(update)
-            return
+        # Observe native work before a queued prompt callback or final write
+        # guard can run. The callback consumes the same event without applying
+        # its pending-work state again after newer notifications.
         report["reporter"].observe(update)
+        update.report_observed = True
+        if report["active"]:
+            return
         receipt = self._last_terminal.get(report["thread_id"])
         if (
             receipt
@@ -344,8 +344,11 @@ class MattermostGateway:
             self.collaboration is not None
             and posted.root_id
             and posted.channel_id == self.config.peer_channel_id
-            and sole_mention(posted.message) == self.client.username
-            and re.match(r"^@[A-Za-z0-9._-]+\s+ASK:\s+", posted.message, re.IGNORECASE)
+            and re.match(
+                r"^\s*@" + re.escape(self.client.username) + r"\s+ASK:\s+\S",
+                posted.message,
+                re.IGNORECASE,
+            )
             and posted.user_id != self.client.user_id
         ):
             if await self.collaboration.mention(posted):
@@ -533,6 +536,13 @@ class MattermostGateway:
             return
         if cmd == "stop":
             self._stop_reports(thread_id)
+            project_stop = None
+            if self.collaboration is not None:
+                cutoff = self.collaboration.record_stop(thread_id)
+                project_stop = self._track_control(
+                    self.collaboration.cancel_thread(thread_id, retry=True, cutoff=cutoff),
+                    "project-stop-" + thread_id,
+                )
             ok = False
             native_error = None
             try:
@@ -540,9 +550,9 @@ class MattermostGateway:
             except Exception as exc:
                 native_error = type(exc).__name__
             project_error = False
-            if self.collaboration is not None:
+            if project_stop is not None:
                 try:
-                    await self.collaboration.cancel_thread(thread_id)
+                    await project_stop
                 except Exception:
                     project_error = True
                     logger.warning("Project cancellation unconfirmed; retry intent retained")
@@ -825,11 +835,12 @@ class MattermostGateway:
             # Never let status UX abort the ACP turn.
             try:
                 status.observe(update)
-                reporter.observe(update)
-                prior = report.get("previous")
-                while prior is not None:
-                    prior["reporter"].observe(update)
-                    prior = prior.get("previous")
+                if not update.report_observed:
+                    reporter.observe(update)
+                    prior = report.get("previous")
+                    while prior is not None:
+                        prior["reporter"].observe(update)
+                        prior = prior.get("previous")
                 if update.kind == "agent_message_chunk":
                     if not update.text:
                         return
@@ -868,7 +879,9 @@ class MattermostGateway:
             "channel_id": channel_id,
             "active": True,
             "foreground_complete": False,
-            "previous": previous if previous and self.background_pending(thread_id) else None,
+            "previous": previous
+            if previous and (before_native is not None or self.background_pending(thread_id))
+            else None,
             "task": None,
         }
         if session_id:
@@ -1250,11 +1263,9 @@ class MattermostGateway:
         except harness_switch.SwitchError as exc:
             await reply(f"❌ {exc}")
             return
-        busy = self.sessions.busy_threads
-        wait_note = f" after {len(busy)} running turn(s) finish" if busy else ""
         await reply(
             f"🔀 `{plan.old_harness}` → `{plan.new_harness}` (model `{plan.model}`). "
-            f"Restarting{wait_note}."
+            "Saved. Automatic restart requires verified idle status."
         )
         self._track_control(
             self._restart_when_idle(thread_id, channel_id, user_id),
@@ -1265,21 +1276,52 @@ class MattermostGateway:
         self, thread_id: str, channel_id: str, user_id: str, *, timeout_s: float = 900
     ) -> None:
         deadline = time.monotonic() + timeout_s
-        while self.sessions.busy_threads and time.monotonic() < deadline:
-            await asyncio.sleep(5)
-        if self.sessions.busy_threads:
-            await self._post(
-                channel_id,
-                "⏳ Still busy after 15 minutes. The new harness is saved; `/restart` when ready.",
-                root_id=thread_id,
+        while True:
+            state = self.maintenance_state()
+            # This helper is the control deciding whether it may restart.
+            state["commands"] -= int(asyncio.current_task() in self._slash_tasks)
+            if state["native_boundary_unknown"]:
+                await self._post(
+                    channel_id,
+                    "The new harness is saved. Native goal/queue idle status is unknown; "
+                    "automatic restart is deferred.",
+                    root_id=thread_id,
+                )
+                return
+            if not any(
+                state[key]
+                for key in (
+                    "foreground",
+                    "responses",
+                    "inbound",
+                    "commands",
+                    "native_rpc",
+                    "background",
+                    "collaboration",
+                )
+            ):
+                break
+            if time.monotonic() >= deadline:
+                await self._post(
+                    channel_id,
+                    "The new harness is saved. Pending work prevents automatic restart.",
+                    root_id=thread_id,
+                )
+                return
+            await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+        # No await separates the idle check from closing native admission.
+        previous_flags = self.draining, self.sealed
+        self.draining = self.sealed = True
+        try:
+            msg = await self._request_restart(
+                thread_id=thread_id,
+                channel_id=channel_id,
+                user_id=user_id,
+                reason="harness_switch",
             )
-            return
-        msg = await self._request_restart(
-            thread_id=thread_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            reason="harness_switch",
-        )
+        except BaseException:
+            self.draining, self.sealed = previous_flags
+            raise
         logger.info("harness switch restart: %s", msg)
 
     def _format_status(self, st: dict[str, object]) -> str:

@@ -415,6 +415,8 @@ class CollaborationStore:
     def claim_open(self, mid, actor):
         with self.transaction():
             item = self.get_message(mid, actor)
+            if item.get("recipient") == actor and item["kind"] == "work":
+                return item
             if item["state"] != "open" or item.get("recipient"):
                 raise ValueError("Task is already claimed")
             if item["sender"] == actor:

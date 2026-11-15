@@ -39,6 +39,7 @@ async def execute(args, hub):
                 for name in ("max_workers", "max_turns", "max_depth", "max_seconds")
             },
             "key": args.key,
+            "channel_id": os.environ.get("MATTERMOST_PEER_CHANNEL_ID", ""),
         }
         # A retry with the same key reuses the first discussion and project.
         for existing in await hub.request("GET", "/projects"):
@@ -51,6 +52,7 @@ async def execute(args, hub):
                         "origin_thread_id",
                         "origin_channel_id",
                         "limits",
+                        "channel_id",
                     )
                 ):
                     raise ValueError("Conflicting project creation key")
@@ -59,10 +61,7 @@ async def execute(args, hub):
                 if args.discussion_thread and existing["thread_id"] != args.discussion_thread:
                     raise ValueError("Conflicting project discussion for creation key")
                 return existing
-        body.update(
-            channel_id=os.environ.get("MATTERMOST_PEER_CHANNEL_ID", ""),
-            thread_id=args.discussion_thread,
-        )
+        body["thread_id"] = args.discussion_thread
         return await hub.request("POST", "/creations", body)
     if command in {"ask", "task"}:
         recipient = args.recipient if command == "ask" else args.to

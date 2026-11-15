@@ -702,14 +702,20 @@ class CollaborationConsumer:
         # Cancellation remains visible and receives another deterministic delivery attempt.
         await self.update(item, "queued")
 
-    async def cancel_thread(self, thread, *, retry=False):
-        if not retry:
-            self.pending_stops[thread] = time.time()
-        cutoff = self.pending_stops[thread]
+    def record_stop(self, thread):
+        cutoff = time.time()
+        self.pending_stops[thread] = cutoff
         try:
             self.save_stops()
         except OSError:
             logger.warning("Project stop intent retained in memory; persistence unavailable")
+        return cutoff
+
+    async def cancel_thread(self, thread, *, retry=False, cutoff=None):
+        if not retry:
+            cutoff = self.record_stop(thread)
+        elif cutoff is None:
+            cutoff = self.pending_stops[thread]
         result = await self.hub.request(
             "POST", "/cancel-thread", {"thread_id": thread, "cutoff": cutoff}
         )

@@ -65,3 +65,11 @@ SC-001 through SC-003 require that live evidence. Local tests establish implemen
 - Warmed native clients without authoritative goal and queue idle evidence report native_boundary_unknown. Maintenance counts this as pending background work and refuses sealing, retirement or refresh. This preserves their running work while ordinary collaboration remains available. Cold sidecars can be retired before their first native task.
 - Durable origin-stop retries preserve their original project creation cutoff, including reconstruction and overlapping newer stops. Delayed restart tasks remain counted through exit. CLI wait deadlines bound every request and sleep.
 - All nine supported findings from the previous full-branch review have implementation fixes and meaningful regressions. A fresh review of this committed source, final-source CI, immutable installation and live acceptance remain required.
+
+## Dispatch admission and stop convergence
+
+- Python 3.12.15 with locked dependencies: 496 tests pass, one optional adapter fixture skipped, 62.57 seconds. Ruff and diff checks pass. Nineteen new regressions use real broker notifications, guarded writes, local HTTP hubs and fake native processes.
+- Native notifications and initial worker snapshots update reports synchronously before guarded dispatch. Queued callbacks do not reapply older pending states. An idle previous reporter remains observed during guarded preparation, preserving new background work when dispatch is rejected.
+- Origin stop intent is captured and persisted before awaiting native cancellation, and hub cancellation runs independently. Automatic harness restart checks all native/project counters, excludes only its own deciding control and closes admission before verified idle shutdown. Warmed uncertainty remains after ACP process exit.
+- Addressed floor prefixes match the hub with leading whitespace and additional mentions in the question. Task claim retries return the current task for the same actor without changing its native claim. Creation retries validate the configured floor.
+- Both findings and synthesis from the last Sol/high review were inspected; all seven supported findings have implementation fixes and meaningful regressions. Fresh full-branch review, exact-source CI, final immutable installation and live acceptance remain required.

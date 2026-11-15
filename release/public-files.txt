@@ -107,6 +107,7 @@ tests/test_collaboration.py
 tests/test_collaboration_regressions.py
 tests/test_collaboration_state_review.py
 tests/test_collaboration_continuation_review.py
+tests/test_collaboration_dispatch_review.py
 tests/test_commands.py
 tests/test_config.py
 tests/test_cursor.py

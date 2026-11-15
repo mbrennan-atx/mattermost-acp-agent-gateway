@@ -226,6 +226,7 @@ class AcpBroker:
         )
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._native_spawned = False
         self._reader_task: asyncio.Task[None] | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -254,7 +255,7 @@ class AcpBroker:
     @property
     def native_boundary_idle(self) -> bool:
         """ACP foreground completion does not prove native goals/queues are idle."""
-        return not self.is_running
+        return not self._native_spawned and not self.is_running
 
     def set_permission_handler(self, handler: PermissionHandler | None) -> None:
         self._permission_handler = handler
@@ -305,6 +306,8 @@ class AcpBroker:
                     limit=16 * 1024 * 1024,
                 )
 
+            # Process exit alone cannot prove native descendants or goals idle.
+            self._native_spawned = True
             assert self._proc.stdout is not None
             self._reader_task = asyncio.create_task(self._read_loop(), name="acp-broker-reader")
             # Drain stderr in background so the pipe cannot fill
@@ -618,6 +621,11 @@ class AcpBroker:
             self._session_queues.setdefault(session_id, []).append(q)
             self.prompt_subscriptions.add(session_id)
             for snapshot in self.subagents.snapshots(session_id):
+                if self.update_observer is not None:
+                    try:
+                        self.update_observer(snapshot)
+                    except Exception:
+                        logger.exception("background snapshot observer failed")
                 q.put_nowait(snapshot)
 
             answer_parts: list[str] = []
