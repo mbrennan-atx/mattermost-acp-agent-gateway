@@ -19,7 +19,7 @@ This repository contains the generic Mattermost ACP gateway. Read this file befo
 - Inspect Git status first and use an isolated branch or worktree. Preserve other writers' changes and stage only owned paths.
 - For substantial features, use the installed Spec Kit workflow. Keep requirements, plans, tasks and acceptance evidence under specs/. Existing user authorization governs which stages may proceed.
 - Run `uv sync --locked --group dev`, relevant tests, `uv run ruff check .`, and package/release checks appropriate to the change. Before completion, run the full suite and verify CI at the final source commit.
-- Code changes require the locally configured BugShark full-branch review before pushing. Read the findings, fix valid in-scope issues and repeat relevant checks and review. Use the configured launcher with `gpt-6.1-sol` for both review and synthesis. A successful exit alone does not establish a clean review.
+- BugShark is mandatory only for code destined for GitLab. GitHub-only code and documentation skip automatic review unless the owner explicitly requests it. For GitLab, review one tested full-branch candidate, batch valid fixes and use focused rechecks. Another full review requires broader changes, missing coverage or concrete unresolved evidence. Use `gpt-6.1-sol` for review and synthesis; retain relevant tests and final-source CI.
 - Keep documentation plain and precise. State verified behavior and material capability limits; avoid promises of exactly-once execution across native-process crashes.
 
 ## Deployment
