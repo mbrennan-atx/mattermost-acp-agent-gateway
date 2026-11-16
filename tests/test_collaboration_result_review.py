@@ -660,6 +660,8 @@ def test_mailbox_claim_bounds_payload_reads_and_crosses_ineligible_batches(tmp_p
             assert ledger.payload_reads == len(work)
             store.reply(claimed["id"], "beta", "Completed eligible request", claim=claimed["claim"])
             now[0] += 2000
+            prior_elapsed = store.elapsed
+            store.elapsed = lambda: prior_elapsed() + 2000
             assert store.claim_next("beta", "worker")["id"] == work[0]["id"]
     finally:
         store.close()
@@ -694,6 +696,8 @@ def test_mailbox_batches_preserve_priority_creation_and_id_ties(tmp_path):
         assert observed == expected
         assert store.claim_next("beta", "worker") is None
         now += 200
+        prior_elapsed = store.elapsed
+        store.elapsed = lambda: prior_elapsed() + 200
         tied = store.claim_next("beta", "worker", controls_only=True)
         assert tied["id"] == "cancel-000"
     finally:
@@ -902,7 +906,7 @@ async def test_project_cancel_stops_native_execution_after_early_result(tmp_path
 
 
 @pytest.mark.parametrize(
-    "mismatch", ["session", "execution", "pending", "started", "no_dispatch", "nan"]
+    "mismatch", ["session", "execution", "pending", "reservation", "no_dispatch", "nan"]
 )
 async def test_native_settlement_cannot_clear_early_result_cancellation_with_invalid_receipt(
     tmp_path, mismatch
@@ -910,15 +914,15 @@ async def test_native_settlement_cannot_clear_early_result_cancellation_with_inv
     async with retained_parent(tmp_path) as (store, _clients, _gateway, consumer, p, parent, _old):
         store.reply(parent["id"], "beta", "Explicit early result", claim=parent["claim"])
         store.cancel(p["id"], "alpha")
-        evidence = terminal()
+        evidence = consumer.foreground(parent, terminal())
         if mismatch == "session":
             evidence["session_id"] = "another-session"
         elif mismatch == "execution":
             evidence["execution_id"] = "another-execution"
         elif mismatch == "pending":
             evidence["pending"] = True
-        elif mismatch == "started":
-            evidence["completed_at"] = 0
+        elif mismatch == "reservation":
+            evidence["reservation_id"] = "stale-reservation"
         elif mismatch == "no_dispatch":
             evidence["not_dispatched"] = True
         else:
@@ -941,7 +945,7 @@ async def test_native_settlement_cannot_clear_early_result_cancellation_with_inv
             "beta",
             consumer.instance,
             "execution_settled",
-            evidence=terminal(),
+            evidence=consumer.foreground(parent, terminal()),
             claim=parent["claim"],
         )
         assert store.show(p["id"], "alpha")["status"] == "cancelled"
@@ -966,7 +970,7 @@ async def test_early_result_retains_worker_slot_and_admission_claim_until_native
             "beta",
             consumer.instance,
             "execution_settled",
-            evidence=terminal(),
+            evidence=consumer.foreground(parent, terminal()),
             claim=parent["claim"],
         )
         assert store.active_claims("beta", consumer.instance) == []
@@ -1274,7 +1278,7 @@ async def test_binding_cannot_move_early_replys_pending_native_execution(tmp_pat
             "beta",
             consumer.instance,
             "execution_settled",
-            evidence=terminal(),
+            evidence=consumer.foreground(parent, terminal()),
             claim=parent["claim"],
         )
         assert store.bind(p["id"], "beta", binding) == binding
@@ -2027,6 +2031,8 @@ async def test_lost_parent_dispatch_response_restores_ownership_before_native_wr
         assert not consumer.reserving
         clock = store.clock
         store.clock = lambda: clock() + 3
+        prior_elapsed = store.elapsed
+        store.elapsed = lambda: prior_elapsed() + 3
         retried = store.claim_next("beta", consumer.instance)
         assert retried["id"] == delivery["id"]
         assert (await consumer.continuation(retried))["report"] is old

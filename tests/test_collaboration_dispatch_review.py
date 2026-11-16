@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -20,7 +19,7 @@ from test_collaboration_regressions import (
 from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpBroker, SessionUpdate, TurnResult
 from mattermost_acp.collaboration.cli import execute, parser
-from mattermost_acp.collaboration.client import HubClient, HubError, Settings
+from mattermost_acp.collaboration.client import HubClient, HubError, Settings, elapsed_clock
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
@@ -644,7 +643,7 @@ async def test_task_claim_retry_returns_current_task_for_same_actor(tmp_path, st
         assert receipt.pop("project_deadline") == p["deadline"]
         remaining = receipt.pop("project_remaining_seconds")
         assert 0 < remaining <= p["deadline"] - p["created"]
-        assert receipt.pop("local_project_deadline") <= time.monotonic() + remaining
+        assert receipt.pop("local_project_deadline") <= elapsed_clock() + remaining
         assert receipt == current
         assert current["state"] == state
         with pytest.raises(HubError):

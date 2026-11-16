@@ -1019,12 +1019,44 @@ class CollaborationStore:
             last = rows[-1]
             after = last["priority"], last["created"], last["id"]
 
+    def defer_retry(self, item):
+        now = self.elapsed()
+        item["not_before"] = self.clock() + 2
+        item["retry_delay"] = {
+            "epoch": self.elapsed_epoch,
+            "started": now,
+            "deadline": now + 2,
+        }
+
+    def retry_ready(self, item):
+        delay = item.get("retry_delay")
+        now = self.elapsed()
+        if (
+            isinstance(delay, dict)
+            and delay.get("epoch") == self.elapsed_epoch
+            and all(
+                type(delay.get(field)) in {int, float} and math.isfinite(delay[field])
+                for field in ("started", "deadline")
+            )
+            and delay["started"] <= now
+            and 0 <= delay["deadline"] - delay["started"] <= 2
+        ):
+            return now >= delay["deadline"]
+        if delay is None and item.get("not_before", 0) <= self.clock():
+            return True
+        # Legacy wall deadlines or another boot/process cannot establish the
+        # remaining delay. Persist one fresh bounded backoff, rather than wait
+        # for a rolled-back wall clock or reset the delay on every mailbox poll.
+        self.defer_retry(item)
+        self.save_message(item)
+        return False
+
     def claim_next(self, actor, instance, *, controls_only=False):
         with self.transaction():
             self.expire()
             for item in self.queued_candidates(actor, controls_only):
                 project = self.get_project(item["project"], actor)
-                if item.get("not_before", 0) > self.clock():
+                if not self.retry_ready(item):
                     continue
                 if item["kind"] in WORK:
                     if project["status"] != "active":
@@ -1267,7 +1299,10 @@ class CollaborationStore:
                         or not math.isfinite(completed)
                         or (
                             not linked
-                            and completed < reserved.get("dispatch_started", float("inf"))
+                            and (
+                                reserved.get("reservation_id")
+                                or completed < reserved.get("dispatch_started", float("inf"))
+                            )
                         )
                     ):
                         raise ValueError("Native settlement must match the reserved execution")
@@ -1338,13 +1373,14 @@ class CollaborationStore:
                 self.archive_delivery(item)
                 item["evidence"] = {}
                 item["execution_pending"] = False
-                item.update(state="queued", not_before=self.clock() + 2)
+                item["state"] = "queued"
+                self.defer_retry(item)
             elif state in {"unconfirmed", "interrupted"}:
                 item["recovery"] = text(result, "recovery")
                 if item["state"] != "cancelling":
                     item["state"] = "queued" if item["kind"] == "cancel" else state
                     if item["kind"] == "cancel":
-                        item["not_before"] = self.clock() + 2
+                        self.defer_retry(item)
             elif state in TERMINAL:
                 if item["state"] == "cancelling" and state != "cancelled":
                     if (evidence or {}).get("stop_reason") and not (evidence or {}).get("pending"):
@@ -1741,6 +1777,6 @@ class CollaborationStore:
             # distinguish generations when a discussion root is reused.
             if type(post_created_at) is not int or post_created_at <= 0:
                 raise PermissionError("Mention source creation time could not be verified")
-            if post_created_at < selected.get("discussion_created_at", 0):
+            if project_id is None and post_created_at < selected.get("discussion_created_at", 0):
                 raise PermissionError("Mention source predates this project discussion generation")
             return self.send(selected["id"], actor, request)

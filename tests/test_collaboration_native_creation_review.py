@@ -28,7 +28,7 @@ from mattermost_acp.acp.broker import (
     NativeDispatchChanged,
     native_command_admission,
 )
-from mattermost_acp.collaboration.client import HubClient, HubError, Settings
+from mattermost_acp.collaboration.client import HubClient, HubError, Settings, elapsed_clock
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
@@ -127,9 +127,7 @@ async def test_project_deadline_cancels_only_owned_native_work_during_hub_outage
         elif changed == "report":
             gateway._reports["existing-native"] = idle_report()
         async with asyncio.timeout(3):
-            import time
-
-            while time.monotonic() < consumer.project_deadlines[p["id"]] + 0.15:
+            while elapsed_clock() < consumer.project_deadlines[p["id"]] + 0.15:
                 await asyncio.sleep(0.01)
         controls = [
             message for message in writer.messages if message["method"] != "_session/steering"

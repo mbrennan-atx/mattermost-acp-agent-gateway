@@ -747,7 +747,13 @@ async def test_reconciled_retry_discards_only_its_old_native_ownership(tmp_path)
 def test_interrupted_cancel_is_requeued_and_old_claim_is_fenced(tmp_path, recovery):
     now = [1000.0]
     path = tmp_path / "hub.db"
-    store = CollaborationStore(path, {"alpha", "beta", "gamma"}, clock=lambda: now[0])
+    store = CollaborationStore(
+        path,
+        {"alpha", "beta", "gamma"},
+        clock=lambda: now[0],
+        elapsed=lambda: now[0],
+        epoch="test-clock",
+    )
     try:
         p = project(store)
         request = ask(store, p["id"])
@@ -757,7 +763,13 @@ def test_interrupted_cancel_is_requeued_and_old_claim_is_fenced(tmp_path, recove
         assert old["kind"] == "cancel"
         if recovery == "hub_restart":
             store.close()
-            store = CollaborationStore(path, {"alpha", "beta", "gamma"}, clock=lambda: now[0])
+            store = CollaborationStore(
+                path,
+                {"alpha", "beta", "gamma"},
+                clock=lambda: now[0],
+                elapsed=lambda: now[0],
+                epoch="test-clock",
+            )
         else:
             store.update(
                 old["id"], "beta", "worker", "interrupted", "Gateway exited", claim=old["claim"]
@@ -1381,6 +1393,7 @@ async def test_compaction_busy_refusal_requeues_collaboration_without_native_deb
         finish_compaction.set()
         assert (await asyncio.wait_for(compaction, 3)).compaction == "compacted"
         store.clock = lambda: receipt["not_before"] + 1
+        store.elapsed = lambda: receipt["retry_delay"]["deadline"] + 1
         assert store.claim_next("beta", consumer.instance)["id"] == request["id"]
     finally:
         if lock.locked():
