@@ -81,6 +81,7 @@ include = [
     "/tests/test_collaboration_deadline_enforcement_overlap.py",
     "/tests/test_collaboration_gateway_delivery_regressions.py",
     "/tests/test_workspace_guard.py",
+    "/tests/test_workspace_guard_pinned_source.py",
     "/tests/test_collaboration_retirement_review.py",
     "/tests/test_collaboration_result_review.py",
     "/tests/test_collaboration_admission_review.py",

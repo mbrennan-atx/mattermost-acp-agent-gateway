@@ -1,5 +1,11 @@
 # Acceptance evidence
 
+## Current completion candidate
+
+The complete Python 3.12 suite passes 1,321 tests with one optional adapter skip in 260.43 seconds. Ruff and diff checks pass. The latest changes preserve retryable pre-dispatch cancellation, reject queued effort after session replacement, separate retained delivery history from routine status traffic, reject expired open-task claims, refresh list expiry and align harness-switch documentation. Workspace guards retain launch/process-group ownership and can pin Python source in captured configuration before checking and compiling the same bounded buffer on every invocation.
+
+Meaningful baseline regressions cover actual forked child cleanup, stale process-group ownership, warmed guard replacement, cancellation write-lock refusal, stale queued effort, elapsed task admission and history migration/recovery. Generic project behavior remains disabled without explicit configuration. Immutable package/profile validation, renewed full-branch review, final-source hosted CI and live acceptance remain required at this source checkpoint.
+
 ## Final review followup checks
 
 The integrated parent suite passes 1,218 tests with one optional adapter fixture skipped in 198.35 seconds on CPython 3.12. Ruff and diff checks pass. All six supported findings from the preceding full-branch review have fixes: detached child execution retains debt, closed roots retain terminal routing, local budgets include suspension, admission expires idle bindings transactionally, settled budget caches retire with authoritative debt evidence, and creation/binding lookups avoid decoding unrelated history.

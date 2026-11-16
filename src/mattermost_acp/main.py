@@ -64,6 +64,25 @@ finally:
 """
 
 
+_WORKSPACE_GUARD_PINNED_SOURCE = """
+import hashlib, os, stat, sys
+path, expected, *arguments = sys.argv[1:]
+limit = 8 * 1024 * 1024
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, "rb") as stream:
+    info = os.fstat(stream.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        raise SystemExit(125)
+    source = stream.read(limit + 1)
+if len(source) > limit or hashlib.sha256(source).hexdigest() != expected:
+    raise SystemExit(125)
+sys.argv = [path, *arguments]
+exec(compile(source, path, "exec", dont_inherit=True), {
+    "__name__": "__main__", "__file__": path, "__package__": None,
+})
+"""
+
+
 async def _finish_guard_task(task):
     """Retain launch/wait ownership through repeated caller cancellation."""
     while not task.done():
@@ -74,7 +93,7 @@ async def _finish_guard_task(task):
     return task.result()
 
 
-def build_workspace_guard(command, *, timeout_s=15):
+def build_workspace_guard(command, *, timeout_s=15, source_sha256=None):
     """Run an optional trusted executable before native session admission."""
     if not command:
         return None
@@ -85,6 +104,17 @@ def build_workspace_guard(command, *, timeout_s=15):
         try:
             async with asyncio.timeout(timeout_s):
                 arguments = [command, thread_id, str(cwd), prior_session or ""]
+                if source_sha256 is not None:
+                    arguments = [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-c",
+                        _WORKSPACE_GUARD_PINNED_SOURCE,
+                        command,
+                        source_sha256,
+                        *arguments[1:],
+                    ]
                 options = {}
                 if os.name == "posix":
                     control_read, control_write = os.pipe()
@@ -180,7 +210,9 @@ async def _amain() -> None:
         busy_marker=busy_path(config.db_path),
         router=load_router_from_env(),
         workspace_guard=build_workspace_guard(
-            config.workspace_guard_command, timeout_s=config.workspace_guard_timeout_s
+            config.workspace_guard_command,
+            timeout_s=config.workspace_guard_timeout_s,
+            source_sha256=config.workspace_guard_source_sha256,
         ),
     )
 

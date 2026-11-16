@@ -127,6 +127,7 @@ class Config:
     collab_cli_command: str | None = None
     workspace_guard_command: str | None = None
     workspace_guard_timeout_s: float = 15
+    workspace_guard_source_sha256: str | None = None
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -212,6 +213,14 @@ class Config:
         guard_timeout = float(os.environ.get("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "15"))
         if not math.isfinite(guard_timeout) or not 0 < guard_timeout <= 300:
             raise ValueError("AGENT_WORKSPACE_GUARD_TIMEOUT_S must be positive and at most 300")
+        guard_command = os.environ.get("AGENT_WORKSPACE_GUARD_COMMAND", "").strip() or None
+        guard_source = os.environ.get("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", "").strip() or None
+        if guard_source is not None and (
+            guard_command is None
+            or len(guard_source) != 64
+            or any(char not in "0123456789abcdef" for char in guard_source)
+        ):
+            raise ValueError("Workspace guard source pin requires a command and lowercase SHA256")
 
         return cls(
             mattermost_url=url,
@@ -227,9 +236,9 @@ class Config:
             role_file=_optional_path(os.environ.get("MATTERMOST_ROLE_FILE")),
             harness=harness,
             grok_command=command,
-            workspace_guard_command=os.environ.get("AGENT_WORKSPACE_GUARD_COMMAND", "").strip()
-            or None,
+            workspace_guard_command=guard_command,
             workspace_guard_timeout_s=guard_timeout,
+            workspace_guard_source_sha256=guard_source,
             grok_model=model,
             grok_cwd=cwd,
             always_approve=_truthy(_env("AGENT_ALWAYS_APPROVE"), default=True),

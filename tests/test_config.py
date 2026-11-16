@@ -179,3 +179,27 @@ def test_workspace_guard_timeout_loads_bounded_override(monkeypatch):
     assert Config.load("/dev/null").workspace_guard_timeout_s == 15
     monkeypatch.setenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "60")
     assert Config.load("/dev/null").workspace_guard_timeout_s == 60
+
+
+@pytest.mark.parametrize("pin", ["x" * 64, "A" * 64, "a" * 63, "a" * 65])
+def test_workspace_guard_rejects_invalid_source_pin(monkeypatch, pin):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_COMMAND", "/private/guard")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", pin)
+    with pytest.raises(ValueError, match="source pin"):
+        Config.load("/dev/null")
+
+
+def test_workspace_guard_source_pin_requires_a_selected_command(monkeypatch):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", "a" * 64)
+    monkeypatch.delenv("AGENT_WORKSPACE_GUARD_COMMAND", raising=False)
+    with pytest.raises(ValueError, match="source pin"):
+        Config.load("/dev/null")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_COMMAND", "/private/guard")
+    config = Config.load("/dev/null")
+    assert config.workspace_guard_source_sha256 == "a" * 64
