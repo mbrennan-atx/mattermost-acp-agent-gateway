@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -55,6 +57,7 @@ class Settings:
 class HubClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.deadlines = {}
         self.session = aiohttp.ClientSession(
             json_serialize=lambda value: json.dumps(value, ensure_ascii=False),
             headers={"Authorization": "Bearer " + settings.token},
@@ -62,6 +65,7 @@ class HubClient:
         )
 
     async def request(self, method, path, body=None):
+        started = time.monotonic()
         async with self.session.request(method, self.settings.url + path, json=body) as response:
             if response.status >= 400:
                 detail = "request failed"
@@ -80,7 +84,22 @@ class HubClient:
                     f"Collaboration HTTP {response.status}: {detail[:1000]}",
                     status=response.status,
                 )
-            return await response.json()
+            result = await response.json()
+            for item in result if isinstance(result, list) else [result]:
+                if not isinstance(item, dict):
+                    continue
+                remaining = item.get("project_remaining_seconds")
+                pid = item.get("project")
+                if (
+                    isinstance(pid, str)
+                    and type(remaining) in {int, float}
+                    and math.isfinite(remaining)
+                    and remaining >= 0
+                ):
+                    deadline = min(self.deadlines.get(pid, float("inf")), started + remaining)
+                    self.deadlines[pid] = deadline
+                    item["local_project_deadline"] = deadline
+            return result
 
     async def close(self):
         await self.session.close()

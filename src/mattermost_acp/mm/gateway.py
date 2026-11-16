@@ -865,7 +865,7 @@ class MattermostGateway:
             "foreground": len(getattr(self.sessions, "busy_threads", ())),
             "responses": sum(lock.locked() for lock in self._prompt_locks.values()),
             "inbound": len(self._inbound_tasks),
-            "commands": self._active_controls + len(self._slash_tasks),
+            "commands": self._active_controls + sum(not task.done() for task in self._slash_tasks),
             "native_rpc": len(getattr(self.sessions.broker, "_pending", {})),
             "background": pending + int(native_unknown),
             "native_boundary_unknown": native_unknown,

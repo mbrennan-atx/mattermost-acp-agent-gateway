@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -635,7 +636,12 @@ async def test_task_claim_retry_returns_current_task_for_same_actor(tmp_path, st
             if state == "done":
                 store.reply(task["id"], "beta", "Verified result", claim=claimed["claim"])
         current = store.get_message(task["id"], "beta")
-        assert await execute(args, clients["beta"]) == current
+        receipt = await execute(args, clients["beta"])
+        assert receipt.pop("project_deadline") == p["deadline"]
+        remaining = receipt.pop("project_remaining_seconds")
+        assert 0 < remaining <= p["deadline"] - p["created"]
+        assert receipt.pop("local_project_deadline") <= time.monotonic() + remaining
+        assert receipt == current
         assert current["state"] == state
         with pytest.raises(HubError):
             await execute(args, clients["gamma"])

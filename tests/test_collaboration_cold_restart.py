@@ -187,7 +187,20 @@ async def test_refused_cold_restart_restores_normal_admission_and_retains_work(
         assert gateway.client.posts
         if debt:
             assert store.get_message(debt["id"], "beta") == debt
-            assert consumer.inherited_claims == [debt]
+            assert len(consumer.inherited_claims) == 1
+            receipt = consumer.inherited_claims[0]
+            assert (
+                receipt["project_deadline"]
+                == store.get_project(debt["project"], "beta")["deadline"]
+            )
+            assert receipt["project_remaining_seconds"] > 0
+            assert receipt["local_project_deadline"] > 0
+            assert {
+                key: value
+                for key, value in receipt.items()
+                if key
+                not in {"project_deadline", "project_remaining_seconds", "local_project_deadline"}
+            } == debt
         if boundary == "inbound-timeout":
             assert gateway._inbound_tasks == {"pending-inbound"}
         assert_no_native(gateway, consumer)

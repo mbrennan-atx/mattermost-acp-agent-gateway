@@ -18,6 +18,58 @@ from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import PostedEvent
 
 
+def create_args(*, origin_thread="origin", origin_channel="home"):
+    return [
+        "create",
+        "--title",
+        "Shared investigation",
+        "--objective",
+        "Verify the dependency",
+        "--members",
+        "alpha,beta",
+        "--origin-thread",
+        origin_thread,
+        "--origin-channel",
+        origin_channel,
+        "--key",
+        "origin-validation",
+    ]
+
+
+@pytest.mark.parametrize("field", ["origin_thread", "origin_channel"])
+@pytest.mark.parametrize("value", ["", " \t\n "])
+def test_cli_rejects_empty_required_origins_before_execution(field, value):
+    with pytest.raises(SystemExit) as error:
+        parser().parse_args(create_args(**{field: value}))
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("field", ["origin_thread", "origin_channel"])
+@pytest.mark.parametrize("value", ["", " \t\n "])
+async def test_direct_cli_execution_refuses_empty_origins_without_creating_state(
+    correlation_api, field, value
+):
+    runtime = correlation_api
+    args = parser().parse_args(create_args())
+    setattr(args, field, value)
+    with pytest.raises(ValueError, match="origin identifier"):
+        await execute(args, runtime.clients["alpha"])
+    assert runtime.state.posts == []
+    assert await runtime.clients["alpha"].request("GET", "/projects") == []
+
+
+async def test_normalized_cli_origins_preserve_idempotent_result_destination(
+    correlation_api, monkeypatch
+):
+    monkeypatch.setenv("MATTERMOST_PEER_CHANNEL_ID", "floor")
+    args = parser().parse_args(create_args(origin_thread=" origin ", origin_channel=" home "))
+    first = await execute(args, correlation_api.clients["alpha"])
+    repeated = await execute(parser().parse_args(create_args()), correlation_api.clients["alpha"])
+    assert repeated["id"] == first["id"]
+    assert first["origin_thread_id"] == "origin" and first["origin_channel_id"] == "home"
+    assert len(correlation_api.state.posts) == 1
+
+
 @pytest.fixture
 async def correlation_api(tmp_path):
     state = SimpleNamespace(

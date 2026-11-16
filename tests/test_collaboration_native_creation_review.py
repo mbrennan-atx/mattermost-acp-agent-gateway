@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,13 +10,15 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from fake_agent import spawn_fake_agent_process
-from test_collaboration import FakeMattermost, ask, gateway_config, project
-from test_collaboration_dispatch_review import close_reports
+from test_collaboration import FakeMattermost, api_fixture, ask, close_api, gateway_config, project
+from test_collaboration_continuation_review import child_result, report, retained_parent
+from test_collaboration_dispatch_review import close_reports, idle_report, native_gateway
 from test_collaboration_regressions import (
     close_creation,
     creation_api,
     creation_body,
     maintenance_gateway,
+    memory_broker,
 )
 from test_gateway_turn import _Client
 
@@ -26,6 +29,7 @@ from mattermost_acp.acp.broker import (
     native_command_admission,
 )
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
+from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.commands.pending_restart import now_pending, pending_path, write_pending
@@ -33,6 +37,218 @@ from mattermost_acp.mm.gateway import MattermostGateway
 from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService, ThreadBusy
 from mattermost_acp.store import ThreadStore
+
+
+async def test_project_deadline_cannot_cross_awaited_native_write_lock(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    handling = None
+    p = project(store, max_seconds=1)
+    request = ask(store, p["id"])
+    claimed = store.claim_next("beta", consumer.instance)
+    report = idle_report()
+    report.update(active=True, foreground_complete=False, collaboration_project=p["id"])
+    gateway._reports["existing-native"] = report
+    await broker._write_lock.acquire()
+    try:
+        handling = asyncio.create_task(consumer.handle(claimed))
+        async with asyncio.timeout(2):
+            while not broker._pending:
+                await asyncio.sleep(0)
+        reserved = store.get_message(request["id"], "beta")
+        assert reserved["execution_pending"] is True
+        assert reserved["evidence"]["dispatch_started"] < p["deadline"]
+        await asyncio.sleep(max(0, p["deadline"] - store.clock()) + 0.05)
+        broker._write_lock.release()
+        await asyncio.sleep(0.05)
+        assert all(message["method"] == "session/cancel" for message in writer.messages), {
+            "native_writes": [message["method"] for message in writer.messages],
+            "elapsed_past_deadline": store.clock() - p["deadline"],
+            "claim_contains_deadline": "project_deadline" in claimed,
+        }
+        assert all(
+            message["params"]["sessionId"] == "existing-native" for message in writer.messages
+        )
+    finally:
+        if broker._write_lock.locked():
+            broker._write_lock.release()
+        if handling is not None and not handling.done():
+            handling.cancel()
+        if handling is not None:
+            await asyncio.gather(handling, return_exceptions=True)
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("changed", ["unchanged", "epoch", "session", "report", "shared"])
+async def test_project_deadline_cancels_only_owned_native_work_during_hub_outage(tmp_path, changed):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    p = project(store, max_seconds=1)
+    requested = ask(store, p["id"])
+    claimed = store.claim_next("beta", consumer.instance)
+    report = idle_report()
+    report.update(
+        active=True,
+        foreground_complete=False,
+        collaboration_project=None if changed == "shared" else p["id"],
+    )
+    gateway._reports["existing-native"] = report
+    actual = consumer.hub.request
+    outage = False
+
+    async def request(method, path, body=None):
+        if outage:
+            raise HubError("Synthetic hub unavailable", status=503)
+        return await actual(method, path, body)
+
+    consumer.hub.request = request
+    handling = asyncio.create_task(consumer.handle(claimed))
+    try:
+        async with asyncio.timeout(2):
+            while (
+                store.get_message(requested["id"], "beta")["evidence"].get("delivery") != "injected"
+            ):
+                await asyncio.sleep(0)
+        outage = True
+        if changed == "epoch":
+            gateway.sessions._advance_native("discussion")
+        elif changed == "session":
+            gateway.sessions.store.get = AsyncMock(
+                return_value=SimpleNamespace(session_id="replacement-native")
+            )
+        elif changed == "report":
+            gateway._reports["existing-native"] = idle_report()
+        async with asyncio.timeout(3):
+            import time
+
+            while time.monotonic() < consumer.project_deadlines[p["id"]] + 0.15:
+                await asyncio.sleep(0.01)
+        controls = [
+            message for message in writer.messages if message["method"] != "_session/steering"
+        ]
+        assert len(controls) == (1 if changed == "unchanged" else 0)
+        if controls:
+            assert controls[0]["method"] == "session/cancel"
+            assert controls[0]["params"] == {"sessionId": "existing-native"}
+        assert store.get_message(requested["id"], "beta")["execution_pending"] is True
+        assert consumer.ownership[(requested["id"], claimed["claim"])] is report
+        assert gateway.maintenance_state()["native_boundary_unknown"] is True
+    finally:
+        if not handling.done():
+            handling.cancel()
+        await asyncio.gather(handling, return_exceptions=True)
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("remaining", [2.0, 10.0])
+async def test_remaining_budget_uses_request_start_and_retries_cannot_extend_it(
+    monkeypatch, remaining
+):
+    import mattermost_acp.collaboration.client as client_module
+
+    now = [100.0]
+    monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    async def response(request):
+        now[0] += 5
+        return web.json_response(
+            {
+                "project": "synthetic",
+                "project_deadline": 1000 + remaining,
+                "project_remaining_seconds": remaining,
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/receipt", response)
+    server = TestServer(app)
+    await server.start_server()
+    client = HubClient(Settings(str(server.make_url("")).rstrip("/"), "synthetic-token" * 3))
+    try:
+        first = await client.request("GET", "/receipt")
+        assert first["local_project_deadline"] == 100 + remaining
+        second = await client.request("GET", "/receipt")
+        assert second["local_project_deadline"] == first["local_project_deadline"]
+        assert second["local_project_deadline"] <= now[0]
+    finally:
+        await client.close()
+        await server.close()
+
+
+@pytest.mark.parametrize(
+    "phase", ["transfer", "stale_parent", "reserving_parent", "stale_epoch", "rollback"]
+)
+async def test_deadline_cancellation_tracks_continuation_execution_and_rollback(tmp_path, phase):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, old):
+        broker, writer = memory_broker()
+        sessions = SessionService(broker, gateway.sessions.store, default_cwd=tmp_path)
+        sessions._native_epochs["discussion"] = 7
+        gateway.sessions = sessions
+        old["native_dispatched"] = True
+        delivery = child_result(store, p, parent, consumer)
+        info = await consumer.continuation(delivery)
+        moved = report(p["id"], "continuation-execution")
+        moved["native_dispatched"] = True
+        gateway._reports["existing-native"] = moved
+        assert await consumer.reserve_continuation(delivery, "existing-native", info)
+        parent_key = (parent["id"], parent["claim"])
+        child_key = (delivery["id"], delivery["claim"])
+        if phase == "rollback":
+            gateway._reports["existing-native"] = old
+            old["reporter"].has_pending_work = lambda: True
+            await consumer.rollback_continuation(info)
+            consumer.release_ownership(child_key)
+        elif phase == "stale_parent":
+            consumer.ownership_items[parent_key]["reservation_evidence"] = parent["evidence"]
+        elif phase == "stale_epoch":
+            consumer.ownership_items[parent_key]["reservation_evidence"]["native_epoch"] = 6
+        if phase != "reserving_parent":
+            consumer.reserving.discard(parent_key)
+        consumer.project_deadlines[p["id"]] = time.monotonic() - 1
+        await consumer.enforce_deadline(p["id"])
+        assert writer.messages == [
+            {
+                "jsonrpc": "2.0",
+                "method": "session/cancel",
+                "params": {"sessionId": "existing-native"},
+            }
+        ]
+        expected = old if phase == "rollback" else moved
+        assert consumer.ownership[parent_key] is expected
+        assert expected["cancel_requested"] is True
+        assert store.get_message(parent["id"], "beta")["execution_pending"] is True
+
+
+@pytest.mark.parametrize("prior_owner", [False, True])
+async def test_rejected_reservation_restores_deadline_ownership_registry(tmp_path, prior_owner):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, old):
+        key = (parent["id"], parent["claim"])
+        original = consumer.ownership_items[key]
+        store.reply(parent["id"], "beta", "Explicit early result", claim=parent["claim"])
+        if not prior_owner:
+            consumer.release_ownership(key)
+        provisional = report(p["id"], "rejected-reservation")
+        provisional["previous"] = old
+        gateway._reports["existing-native"] = provisional
+        retry = dict(parent)
+        with pytest.raises(HubError, match="409"):
+            await consumer.reserve(retry, "existing-native")
+        if prior_owner:
+            assert consumer.ownership[key] is old
+            assert consumer.ownership_items[key] is original
+            assert original["reservation_evidence"]["execution_id"] == old["execution_id"]
+        else:
+            assert key not in consumer.ownership and key not in consumer.ownership_items
 
 
 @pytest.mark.parametrize("backend", ["claude", "codex", "grok"])

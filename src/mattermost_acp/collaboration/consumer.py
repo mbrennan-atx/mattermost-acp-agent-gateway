@@ -16,7 +16,7 @@ from pathlib import Path
 
 import aiohttp
 
-from mattermost_acp.acp.broker import NativeDispatchChanged
+from mattermost_acp.acp.broker import NativeDispatchChanged, native_command_admission
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
 from mattermost_acp.mm.chunk import DEFAULT_LIMIT
 from mattermost_acp.mm.client import MattermostError
@@ -33,6 +33,9 @@ class CollaborationConsumer:
         self.closing = False
         self.ownership = {}
         self.ownership_threads = {}
+        self.ownership_items = {}
+        self.project_deadlines = {}
+        self.deadline_tasks = {}
         self.rejected_reservations = {}
         self.pending_execution_restores = {}
         self.reserving = set()
@@ -80,7 +83,11 @@ class CollaborationConsumer:
         if self.closing:
             return
         self.closing = True
-        tasks = [task for task in [self.task, *self.workers.values()] if task is not None]
+        tasks = [
+            task
+            for task in [self.task, *self.workers.values(), *self.deadline_tasks.values()]
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -254,11 +261,133 @@ class CollaborationConsumer:
         }
         if expected_execution_id is not None:
             body["expected_execution_id"] = expected_execution_id
-        return await self.hub.request(
+        receipt = await self.hub.request(
             "POST",
             f"/messages/{item['id']}/update",
             body,
         )
+        self.observe_deadline(receipt)
+        return receipt
+
+    def observe_deadline(self, item):
+        pid = item.get("project")
+        deadline = item.get("local_project_deadline")
+        remaining = item.get("project_remaining_seconds")
+        if deadline is None and type(remaining) in {int, float} and math.isfinite(remaining):
+            deadline = time.monotonic() + max(0, remaining)
+        if (
+            not isinstance(pid, str)
+            or type(deadline) not in {int, float}
+            or not math.isfinite(deadline)
+        ):
+            return
+        prior = self.project_deadlines.get(pid, float("inf"))
+        self.project_deadlines[pid] = min(prior, deadline)
+        task = self.deadline_tasks.get(pid)
+        if deadline < prior and task is not None and task is not asyncio.current_task():
+            task.cancel()
+        if task is None or task.done() or task.cancelling():
+            # Cancellation after the deadline must not inherit a work admission guard.
+            with native_command_admission(None):
+                self.deadline_tasks[pid] = asyncio.create_task(
+                    self.enforce_deadline(pid), name="project-deadline-" + pid
+                )
+
+    def before_deadline(self, item):
+        self.observe_deadline(item)
+        return time.monotonic() < self.project_deadlines.get(item.get("project"), float("inf"))
+
+    async def deadline_work(self, item, operation):
+        try:
+            with native_command_admission(lambda: self.before_deadline(item)):
+                return await operation
+        finally:
+            if not self.before_deadline(item) and hasattr(operation, "close"):
+                operation.close()
+
+    async def enforce_deadline(self, pid):
+        await asyncio.sleep(max(0, self.project_deadlines[pid] - time.monotonic()))
+        handled = set()
+        for key, owned in list(self.ownership.items()):
+            item = self.ownership_items.get(key, {})
+            if item.get("project") != pid:
+                continue
+            self.cancelled_claims.add(key)
+            if owned.get("collaboration_project") != pid:
+                continue
+            owned["cancel_requested"] = True
+            if id(owned) in handled or not owned.get("native_dispatched"):
+                continue
+            binding = item.get("binding", {})
+            if (
+                item.get("recipient") == item.get("project_owner")
+                and not item.get("project_owner_in_discussion")
+                and binding.get("thread_id") == item.get("origin_thread_id")
+                and binding.get("channel_id") == item.get("origin_channel_id")
+            ):
+                continue
+            proof = item.get("reservation_evidence", item.get("evidence", {}))
+            session, execution, epoch = (
+                proof.get(name) for name in ("session_id", "execution_id", "native_epoch")
+            )
+            if (
+                not session
+                or not execution
+                or epoch is None
+                or owned.get("execution_id") != execution
+            ):
+                continue
+
+            def still_owned(
+                key=key,
+                owned=owned,
+                session=session,
+                execution=execution,
+                epoch=epoch,
+                thread=binding["thread_id"],
+            ):
+                return (
+                    self.ownership.get(key) is owned
+                    and self.gateway._reports.get(session) is owned
+                    and owned.get("execution_id") == execution
+                    and owned.get("collaboration_project") == pid
+                    and key not in self.reserving
+                    and getattr(self.gateway.sessions, "native_epoch", lambda _thread: 0)(thread)
+                    == epoch
+                )
+
+            if not still_owned():
+                continue
+            handled.add(id(owned))
+            try:
+                async with asyncio.timeout(3):
+                    reporter = owned["reporter"]
+                    if hasattr(reporter, "stoppable_async_tasks"):
+                        for task_id in reporter.stoppable_async_tasks():
+
+                            def task_owned(
+                                task_id=task_id, reporter=reporter, still_owned=still_owned
+                            ):
+                                return still_owned() and reporter.owns_async_task(task_id)
+
+                            await self.gateway.sessions.stop_async_task(
+                                binding["thread_id"],
+                                task_id,
+                                expected_session=session,
+                                expected_epoch=epoch,
+                                guard=task_owned,
+                            )
+                    await self.gateway.sessions.cancel(
+                        binding["thread_id"],
+                        expected_session=session,
+                        expected_epoch=epoch,
+                        guard=still_owned,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A refused/ambiguous stop cannot prove that native work ended.
+                logger.warning("Project deadline reached; native cancellation remains unresolved")
 
     def active(self, thread):
         if self.gateway.sessions.is_busy(thread):
@@ -290,6 +419,12 @@ class CollaborationConsumer:
         self.rejected_reservations.pop(key, None)
         self.pending_execution_restores.pop(key, None)
         report = self.ownership.pop(key, None)
+        item = self.ownership_items.pop(key, {})
+        pid = item.get("project")
+        if pid and not any(owned.get("project") == pid for owned in self.ownership_items.values()):
+            task = self.deadline_tasks.get(pid)
+            if task is not None and task is not asyncio.current_task():
+                task.cancel()
         thread = self.ownership_threads.pop(key, None) or (report or {}).get("thread_id")
         self.gateway.prune_reports()
         if thread and not self.owns_thread(thread) and not self.gateway.background_pending(thread):
@@ -428,8 +563,13 @@ class CollaborationConsumer:
             # execution owner or its terminal receipts.
             if prior is None:
                 self.ownership.pop(key, None)
+                self.ownership_items.pop(key, None)
             else:
                 self.ownership[key] = prior
+                if attempt["prior_item"] is None:
+                    self.ownership_items.pop(key, None)
+                else:
+                    self.ownership_items[key] = attempt["prior_item"]
             if attempt["prior_thread"] is None:
                 self.ownership_threads.pop(key, None)
             else:
@@ -534,6 +674,14 @@ class CollaborationConsumer:
             if self.ownership.get(key) is not info["report"]:
                 raise NativeDispatchChanged("Continuation ownership changed")
             self.ownership[key] = report
+            self.ownership_items[key] = {
+                **self.ownership_items.get(key, parent),
+                "reservation_evidence": {
+                    "session_id": session,
+                    "execution_id": report["execution_id"],
+                    "native_epoch": epoch,
+                },
+            }
             evidence = {
                 "session_id": session,
                 "execution_id": report["execution_id"],
@@ -598,6 +746,10 @@ class CollaborationConsumer:
             )
             if self.ownership.get(key) is owned:
                 self.ownership[key] = old
+                self.ownership_items[key] = {
+                    **self.ownership_items.get(key, parent),
+                    "reservation_evidence": evidence,
+                }
         self.gateway.prune_reports()
 
     async def heartbeat(self, item):
@@ -717,6 +869,7 @@ class CollaborationConsumer:
         )
 
     async def handle(self, item):
+        self.observe_deadline(item)
         renewal = asyncio.create_task(self.heartbeat(item))
         try:
             if self.gateway.sealed or (self.gateway.draining and item["kind"] != "cancel"):
@@ -726,6 +879,7 @@ class CollaborationConsumer:
                 await self.handle_cancel(item)
                 return
             current = await self.hub.request("GET", f"/messages/{item['id']}")
+            self.observe_deadline(current)
             if current["state"] == "cancelling":
                 await self.update(item, "queued")
                 return
@@ -803,20 +957,23 @@ class CollaborationConsumer:
                 if not await self.reserve(item, record.session_id, steering=True):
                     return
                 try:
-                    outcome = await self.gateway.sessions.hint(
-                        thread,
-                        prompt,
-                        expected_session=record.session_id,
-                        expected_epoch=item["native_epoch"],
-                        guard=lambda: (
-                            not self.inherited_thread_pending(thread)
-                            and is_loaded(record.session_id)
-                            and self.steerable_report(report)
-                            and self.gateway._reports.get(record.session_id) is report
-                            and self.ownership.get((item["id"], item.get("claim"))) is report
-                            and report.get("execution_id")
-                            == item["reservation_evidence"]["execution_id"]
-                            and (item["id"], item.get("claim")) not in self.cancelled_claims
+                    outcome = await self.deadline_work(
+                        item,
+                        self.gateway.sessions.hint(
+                            thread,
+                            prompt,
+                            expected_session=record.session_id,
+                            expected_epoch=item["native_epoch"],
+                            guard=lambda: (
+                                not self.inherited_thread_pending(thread)
+                                and is_loaded(record.session_id)
+                                and self.steerable_report(report)
+                                and self.gateway._reports.get(record.session_id) is report
+                                and self.ownership.get((item["id"], item.get("claim"))) is report
+                                and report.get("execution_id")
+                                == item["reservation_evidence"]["execution_id"]
+                                and (item["id"], item.get("claim")) not in self.cancelled_claims
+                            ),
                         ),
                     )
                 except NativeDispatchChanged:
@@ -862,22 +1019,27 @@ class CollaborationConsumer:
             }
             self.reserving.update(transfer_keys)
             try:
-                result = await self.gateway.run_prompt(
-                    thread_id=thread,
-                    channel_id=binding["channel_id"],
-                    prompt=prompt,
-                    author_id="project:" + item["project"],
-                    author_name=item["sender"],
-                    workspace=binding.get("workspace"),
-                    collaboration_project=item["project"],
-                    before_native=(
-                        (lambda session: self.reserve_continuation(item, session, continuation))
+                result = await self.deadline_work(
+                    item,
+                    self.gateway.run_prompt(
+                        thread_id=thread,
+                        channel_id=binding["channel_id"],
+                        prompt=prompt,
+                        author_id="project:" + item["project"],
+                        author_name=item["sender"],
+                        workspace=binding.get("workspace"),
+                        collaboration_project=item["project"],
+                        before_native=(
+                            (lambda session: self.reserve_continuation(item, session, continuation))
+                            if continuation is not None
+                            else (lambda session: self.reserve_independent(item, session))
+                        ),
+                        ownership_guard=(
+                            lambda: self.continuation_idle(continuation, reserved=True)
+                        )
                         if continuation is not None
-                        else (lambda session: self.reserve_independent(item, session))
+                        else None,
                     ),
-                    ownership_guard=(lambda: self.continuation_idle(continuation, reserved=True))
-                    if continuation is not None
-                    else None,
                 )
                 if (
                     continuation is not None
@@ -1037,6 +1199,7 @@ class CollaborationConsumer:
         )
 
     async def reserve(self, item, session, *, steering=False):
+        self.observe_deadline(item)
         if self.inherited_thread_pending(item["binding"]["thread_id"]):
             await self.update(item, "queued")
             return False
@@ -1066,10 +1229,12 @@ class CollaborationConsumer:
         )
         key = (item["id"], item.get("claim"))
         prior_owned = self.ownership.get(key)
+        prior_item = self.ownership_items.get(key)
         prior_thread = self.ownership_threads.get(key)
         prior_reservation = item.get("reservation_evidence")
         self.reserving.add(key)
         self.ownership[key] = report
+        self.ownership_items[key] = item
         self.ownership_threads[key] = item["binding"]["thread_id"]
         evidence = {
             "session_id": session,
@@ -1092,6 +1257,7 @@ class CollaborationConsumer:
                     "session": session,
                     "item": item,
                     "prior_owned": prior_owned,
+                    "prior_item": prior_item,
                     "prior_thread": prior_thread,
                     "prior_reservation": prior_reservation,
                 }
@@ -1104,6 +1270,7 @@ class CollaborationConsumer:
                 and receipt.get("claim") == item.get("claim")
                 and key not in self.cancelled_claims
                 and not self.inherited_thread_pending(item["binding"]["thread_id"])
+                and self.before_deadline(item)
             )
             if accepted:
                 item["native_epoch"] = epoch

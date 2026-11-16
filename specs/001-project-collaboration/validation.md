@@ -107,3 +107,11 @@ The focused batch passes 134 checks; related recovery, continuation and dispatch
 The complete parent suite at 37256e9 passes 1,015 tests with one optional adapter skipped. Review found that drain could requeue an externally posted result without a native session, and plain-text authentication failures lost their HTTP status. Orphaned claims with post-start or result-post evidence now require external reconciliation, preserving receipts without another notification. The client retains error status before requiring a JSON response; definite authentication failure is rejected, while server failures retain ambiguous admission handling.
 
 Sixty-four result cases and 163 related recovery/admission regressions pass. Four new integration cases cover lost completion/interruption receipts, retained legacy post evidence, no duplicate across lease expiry and a real plain-text 401 without native fallback. Source is frozen for the next complete parent run, immutable build and full-branch review. Live acceptance remains pending.
+
+## Local deadline enforcement and history indexes
+
+The combined parent suite passes 1,094 tests with one optional adapter skip in 188.32 seconds. Ruff and diff checks pass. Native writes enforce a local monotonic project deadline, including broker lock waits and hub outage; later receipts cannot extend that deadline. Expired project work retains matching native cancellation ownership until terminal evidence settles it. Required CLI origin identifiers reject empty values before hub access.
+
+Queryable execution-debt and discussion metadata preserve legacy receipts while indexed actor recovery and floor admission avoid decoding unrelated retained history. Migration/reopen, query-plan and decode guards pass. An actual cold standalone slash launcher now schedules restart after completion; unfinished commands still block it. The 21-case index/restart batch passes.
+
+The finalized late ordinary-Claude injection finding did not reproduce with the installed adapter: steer returned promptRequired/noRunningTurn, and the local broker/hub path queued then completed in a fresh turn. This does not establish complete native goal or queue idleness. Durable stop ordering, final integrated review, hosted CI and live acceptance remain pending.

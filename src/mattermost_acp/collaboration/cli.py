@@ -18,6 +18,10 @@ def content(args):
     return Path(args.text_file).read_text() if args.text_file else args.text
 
 
+def origin_identifier(value):
+    return text(value, "origin identifier", 200)
+
+
 async def execute(args, hub):
     command = args.command
     if command == "list":
@@ -25,6 +29,8 @@ async def execute(args, hub):
     if command == "show":
         return await hub.request("GET", f"/projects/{args.project}")
     if command == "create":
+        origin_thread = origin_identifier(args.origin_thread)
+        origin_channel = origin_identifier(args.origin_channel)
         actor = (await hub.request("GET", "/identity"))["actor"]
         members = sorted(
             set(args.members.split(",") if args.members else await hub.request("GET", "/actors"))
@@ -33,8 +39,8 @@ async def execute(args, hub):
             "title": text(args.title, "title", 200),
             "objective": text(args.objective, "objective"),
             "members": members,
-            "origin_thread_id": args.origin_thread,
-            "origin_channel_id": args.origin_channel,
+            "origin_thread_id": origin_thread,
+            "origin_channel_id": origin_channel,
             "limits": {
                 name: getattr(args, name)
                 for name in ("max_workers", "max_turns", "max_depth", "max_seconds")
@@ -151,8 +157,8 @@ def parser():
     create.add_argument(
         "--members", help="Comma-separated participants; default: configured actors"
     )
-    create.add_argument("--origin-thread", required=True)
-    create.add_argument("--origin-channel", required=True)
+    create.add_argument("--origin-thread", required=True, type=origin_identifier)
+    create.add_argument("--origin-channel", required=True, type=origin_identifier)
     create.add_argument("--discussion-thread", help="Reuse an existing floor root")
     create.add_argument("--key", default=uuid.uuid4().hex)
     for name, value in (("workers", 3), ("turns", 24), ("depth", 2), ("seconds", 3600)):

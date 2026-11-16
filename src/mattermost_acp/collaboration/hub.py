@@ -314,7 +314,7 @@ def build_app(
             result = store.retry(mid, actor, body["reconciliation"])
         else:
             raise KeyError("Unknown action")
-        return web.json_response(result)
+        return web.json_response(store.deadline_receipt(result, actor))
 
     async def mailbox_admission(request):
         body = await request.json()
@@ -332,12 +332,19 @@ def build_app(
             admission_fences[key] = mode
         claims = store.active_claims(*key)
         changed.set()
-        return web.json_response(claims)
+        return web.json_response(
+            [store.deadline_receipt(item, request["actor"]) for item in claims]
+        )
 
     async def claims(request):
         # Recovery inspection spans this actor's instances without changing
         # leases, admission fences or the ownership of another instance.
-        return web.json_response(store.active_claims(request["actor"]))
+        return web.json_response(
+            [
+                store.deadline_receipt(item, request["actor"])
+                for item in store.active_claims(request["actor"])
+            ]
+        )
 
     async def mailbox(request):
         instance = request.query.get("instance", "")
@@ -368,7 +375,11 @@ def build_app(
 
     async def message(request):
         store.expire()
-        return web.json_response(store.get_message(request.match_info["mid"], request["actor"]))
+        return web.json_response(
+            store.deadline_receipt(
+                store.get_message(request.match_info["mid"], request["actor"]), request["actor"]
+            )
+        )
 
     async def cancel_thread(request):
         body = await request.json()

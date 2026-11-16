@@ -14,11 +14,13 @@ from pathlib import Path
 ACTIVE = {"running", "unconfirmed", "cancelling"}
 TERMINAL = {"done", "failed", "blocked", "cancelled"}
 WORK = {"ask", "work"}
-PENDING_EXECUTION = (
+LEGACY_PENDING_EXECUTION = (
     "COALESCE(json_extract(data,'$.execution_pending'),"
     "(json_extract(data,'$.evidence.session_id') IS NOT NULL "
     "AND json_extract(data,'$.evidence.dispatch_started') IS NOT NULL))=1"
 )
+
+PENDING_EXECUTION = "execution_pending=1"
 
 
 def identifier() -> str:
@@ -71,12 +73,15 @@ class CollaborationStore:
                 ("created", "REAL"),
                 ("owner", "TEXT"),
                 ("origin_thread", "TEXT"),
+                ("channel", "TEXT"),
+                ("thread", "TEXT"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE projects ADD COLUMN {name} {kind}")
             missing = self.db.execute(
                 "SELECT data FROM projects WHERE status IS NULL OR deadline IS NULL "
-                "OR created IS NULL OR owner IS NULL OR origin_thread IS NULL"
+                "OR created IS NULL OR owner IS NULL OR origin_thread IS NULL "
+                "OR channel IS NULL OR thread IS NULL"
             ).fetchall()
             for row in missing:
                 self.save_project(json.loads(row[0]))
@@ -86,6 +91,36 @@ class CollaborationStore:
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS origin_projects "
                 "ON projects(owner,origin_thread,status,created)"
+            )
+        # Persist routing and execution metadata once. Runtime admission and
+        # recovery read only matching rows, regardless of retained JSON history.
+        with self.transaction():
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS project_discussion ON projects(channel,thread)"
+            )
+            message_columns = {row[1] for row in self.db.execute("PRAGMA table_info(messages)")}
+            if "execution_pending" not in message_columns:
+                self.db.execute("ALTER TABLE messages ADD COLUMN execution_pending INTEGER")
+            self.db.execute(
+                "UPDATE messages SET execution_pending=(" + LEGACY_PENDING_EXECUTION + ") "
+                "WHERE execution_pending IS NULL"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS execution_debt ON messages(recipient,execution_pending)"
+            )
+            creation_columns = {row[1] for row in self.db.execute("PRAGMA table_info(creations)")}
+            for name, kind in (("channel", "TEXT"), ("thread", "TEXT"), ("unresolved", "INTEGER")):
+                if name not in creation_columns:
+                    self.db.execute(f"ALTER TABLE creations ADD COLUMN {name} {kind}")
+            for row in self.db.execute(
+                "SELECT actor,key,data FROM creations WHERE channel IS NULL OR unresolved IS NULL"
+            ).fetchall():
+                self.save_creation(row[0], row[1], json.loads(row[2]))
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS creation_discussion ON creations(channel,thread)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS unresolved_creation ON creations(channel,unresolved)"
             )
         # A new hub process cannot establish what a crashed native turn did.
         with self.transaction():
@@ -113,8 +148,9 @@ class CollaborationStore:
 
     def save_project(self, item):
         self.db.execute(
-            "INSERT OR REPLACE INTO projects(id,data,status,deadline,created,owner,origin_thread) "
-            "VALUES(?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO projects"
+            "(id,data,status,deadline,created,owner,origin_thread,channel,thread) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 item["id"],
                 json.dumps(item),
@@ -123,16 +159,27 @@ class CollaborationStore:
                 item["created"],
                 item["owner"],
                 item["origin_thread_id"],
+                item["channel_id"],
+                item["thread_id"],
             ),
         )
 
     def save_message(self, item):
+        debt = item.get("execution_pending")
+        if debt is None:
+            evidence = item.get("evidence") or {}
+            debt = (
+                evidence.get("session_id") is not None
+                and evidence.get("dispatch_started") is not None
+            )
         self.db.execute(
-            """INSERT INTO messages VALUES(?,?,?,?,?,?,?,?,?)
+            """INSERT INTO messages
+            (id,project,sender,recipient,kind,state,created,key,data,execution_pending)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
             project=excluded.project,sender=excluded.sender,recipient=excluded.recipient,
             kind=excluded.kind,state=excluded.state,created=excluded.created,
-            key=excluded.key,data=excluded.data""",
+            key=excluded.key,data=excluded.data,execution_pending=excluded.execution_pending""",
             (
                 item["id"],
                 item["project"],
@@ -143,6 +190,7 @@ class CollaborationStore:
                 item["created"],
                 item["key"],
                 json.dumps(item),
+                int(debt == 1),
             ),
         )
 
@@ -162,6 +210,14 @@ class CollaborationStore:
         item = json.loads(row[0])
         self.get_project(item["project"], actor)
         return item
+
+    def deadline_receipt(self, item, actor):
+        project = self.get_project(item["project"], actor)
+        return {
+            **item,
+            "project_deadline": project["deadline"],
+            "project_remaining_seconds": max(0.0, project["deadline"] - self.clock()),
+        }
 
     def prepare_creation(self, actor, body):
         """Persist intent before external posting; uncertain posts need reconciliation."""
@@ -218,24 +274,22 @@ class CollaborationStore:
 
     def unresolved_creations(self, channel):
         return [
-            (actor, key, intent)
-            for actor, key, raw in self.db.execute("SELECT actor,key,data FROM creations")
-            if (intent := json.loads(raw)).get("creation_id")
-            and intent["status"] != "rejected"
-            and not intent.get("thread_id")
-            and intent["body"]["channel_id"] == channel
+            (actor, key, json.loads(raw))
+            for actor, key, raw in self.db.execute(
+                "SELECT actor,key,data FROM creations WHERE channel=? AND unresolved=1",
+                (channel,),
+            )
         ]
 
     def known_discussion(self, channel, thread):
-        for (raw,) in self.db.execute("SELECT data FROM projects"):
-            project = json.loads(raw)
-            if project["channel_id"] == channel and project["thread_id"] == thread:
-                return True
-        for (raw,) in self.db.execute("SELECT data FROM creations"):
-            intent = json.loads(raw)
-            if intent["body"]["channel_id"] == channel and intent.get("thread_id") == thread:
-                return True
-        return False
+        return bool(
+            self.db.execute(
+                "SELECT 1 FROM projects WHERE channel=? AND thread=? LIMIT 1", (channel, thread)
+            ).fetchone()
+            or self.db.execute(
+                "SELECT 1 FROM creations WHERE channel=? AND thread=? LIMIT 1", (channel, thread)
+            ).fetchone()
+        )
 
     def record_creation_root(self, actor, key, thread, *, creation_id=None):
         """Keep one root binding even when posting and verification finish out of order."""
@@ -266,7 +320,20 @@ class CollaborationStore:
         key = text(key, "project idempotency key", 200)
         with self.transaction():
             self.db.execute(
-                "INSERT OR REPLACE INTO creations VALUES(?,?,?)", (actor, key, json.dumps(intent))
+                "INSERT OR REPLACE INTO creations(actor,key,data,channel,thread,unresolved) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    actor,
+                    key,
+                    json.dumps(intent),
+                    intent["body"]["channel_id"],
+                    intent.get("thread_id"),
+                    int(
+                        bool(intent.get("creation_id"))
+                        and intent["status"] != "rejected"
+                        and not intent.get("thread_id")
+                    ),
+                ),
             )
 
     def finish_creation(self, actor, intent):
@@ -573,10 +640,11 @@ class CollaborationStore:
 
     def active_claims(self, actor, instance=None):
         rows = self.db.execute(
-            "SELECT data FROM messages WHERE recipient=? AND (state IN "
-            "('running','cancelling','unconfirmed','interrupted') "
-            "OR " + PENDING_EXECUTION + ")",
-            (actor,),
+            "SELECT data FROM messages WHERE recipient=? AND "
+            "state IN ('running','cancelling','unconfirmed','interrupted') "
+            "UNION ALL SELECT data FROM messages WHERE recipient=? AND execution_pending=1 "
+            "AND state NOT IN ('running','cancelling','unconfirmed','interrupted')",
+            (actor, actor),
         ).fetchall()
         return [
             item
@@ -706,6 +774,9 @@ class CollaborationStore:
                     "project_channel_id": project["channel_id"],
                     "origin_thread_id": project["origin_thread_id"],
                     "origin_channel_id": project["origin_channel_id"],
+                    "project_owner_in_discussion": project.get("owner_in_discussion", False),
+                    "project_deadline": project["deadline"],
+                    "project_remaining_seconds": max(0.0, project["deadline"] - self.clock()),
                 }
             return None
 
@@ -1146,22 +1217,19 @@ class CollaborationStore:
     def mention(self, actor, channel, thread, recipient, body, key, *, post_created_at=None):
         with self.transaction():
             projects = [
-                project
-                for (raw,) in self.db.execute("SELECT data FROM projects")
-                if (project := json.loads(raw))
-                if project["channel_id"] == channel and project["thread_id"] == thread
+                json.loads(raw)
+                for (raw,) in self.db.execute(
+                    "SELECT data FROM projects WHERE channel=? AND thread=?", (channel, thread)
+                )
             ]
             if not projects:
-                # Posting and read-back are separate external operations. Once
-                # a root receipt exists, it remains project-owned even when
-                # finalization fails or an origin stop awaits reconciliation.
-                for (raw,) in self.db.execute("SELECT data FROM creations"):
-                    intent = json.loads(raw)
-                    if (
-                        intent.get("thread_id") == thread
-                        and intent["body"]["channel_id"] == channel
-                    ):
-                        raise PermissionError("Project discussion creation requires reconciliation")
+                # A recorded creation remains project-owned after cancellation
+                # or failed finalization. Match the root without decoding history.
+                if self.db.execute(
+                    "SELECT 1 FROM creations WHERE channel=? AND thread=? LIMIT 1",
+                    (channel, thread),
+                ).fetchone():
+                    raise PermissionError("Project discussion creation requires reconciliation")
                 return None
             projects = [
                 project

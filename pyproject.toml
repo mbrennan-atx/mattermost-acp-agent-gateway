@@ -68,6 +68,7 @@ include = [
     "/tests/test_collaboration_provisional_steering.py",
     "/tests/test_collaboration_reply_artifacts.py",
     "/tests/test_collaboration_cold_restart.py",
+    "/tests/test_collaboration_history_indexes.py",
     "/tests/test_collaboration_gateway_delivery_regressions.py",
     "/tests/test_workspace_guard.py",
     "/tests/test_collaboration_retirement_review.py",
