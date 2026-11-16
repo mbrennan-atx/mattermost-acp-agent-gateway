@@ -61,6 +61,21 @@ def _optional_path(value: str | None) -> Path | None:
     return selected
 
 
+def _collaboration_cli_command(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    selected = Path(raw)
+    if (
+        any(character in raw for character in "\x00\r\n`")
+        or not selected.is_absolute()
+        or not selected.is_file()
+        or not os.access(selected, os.X_OK)
+    ):
+        raise ValueError("MATTERMOST_COLLAB_CLI_COMMAND must select one absolute executable file")
+    return str(selected)
+
+
 def _read_token(path: Path) -> str:
     try:
         return path.expanduser().read_text(encoding="utf-8").strip()
@@ -109,6 +124,7 @@ class Config:
     attachments_max_bytes: int
     collab_sidecar: bool = False
     collab_origin_actor: str = ""
+    collab_cli_command: str | None = None
     workspace_guard_command: str | None = None
     workspace_guard_timeout_s: float = 15
 
@@ -238,4 +254,7 @@ class Config:
             attachments_max_bytes=int(attachments_max_mb * 1024 * 1024),
             collab_sidecar=_truthy(os.environ.get("MATTERMOST_COLLAB_SIDECAR")),
             collab_origin_actor=os.environ.get("MATTERMOST_COLLAB_ORIGIN_ACTOR", "").strip(),
+            collab_cli_command=_collaboration_cli_command(
+                os.environ.get("MATTERMOST_COLLAB_CLI_COMMAND")
+            ),
         )

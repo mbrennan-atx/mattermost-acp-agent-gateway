@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
@@ -165,6 +166,35 @@ def build_app(
         body = await request.json()
         body["owner_in_discussion"] = bool(actors[actor].get("sidecar"))
         async with creation_lock:
+            posting = None
+            if not body.get("thread_id") and create_post is None:
+                try:
+                    retained = store.get_creation(actor, body.get("key"))
+                except KeyError:
+                    retained = None
+                if retained is None or not retained.get("thread_id"):
+                    # A configuration failure proves no POST occurred. It must
+                    # not reserve an uncertain root or fence unrelated replies.
+                    settings = actors[actor]
+                    base = settings.get("mattermost_url")
+                    path = settings.get("mattermost_token_file")
+                    try:
+                        parsed = urlsplit(base or "")
+                        valid_port = parsed.port is None or 0 < parsed.port <= 65535
+                        if (
+                            parsed.scheme not in {"http", "https"}
+                            or not parsed.hostname
+                            or not valid_port
+                            or not path
+                            or not settings.get("user_id")
+                        ):
+                            raise ValueError("Mattermost posting configuration required")
+                        token = Path(path).expanduser().read_text().strip()
+                        if not token:
+                            raise ValueError("Mattermost posting credential required")
+                    except OSError as exc:
+                        raise ValueError("Mattermost posting credential unavailable") from exc
+                    posting = base, token
             intent, fresh = store.prepare_creation(actor, body)
             explicit = body.get("thread_id")
             if explicit:
@@ -179,7 +209,6 @@ def build_app(
                     raise ValueError(
                         "Discussion posting is unconfirmed; reconcile with --discussion-thread"
                     )
-                settings = actors[actor]
                 props = {
                     "mattermost_acp_creation_id": intent["creation_id"],
                     "mattermost_acp_creation_actor": actor,
@@ -187,11 +216,7 @@ def build_app(
                 if create_post is not None:
                     post = await create_post(actor, {**body, "props": props})
                 else:
-                    base = settings.get("mattermost_url")
-                    path = settings.get("mattermost_token_file")
-                    if not base or not path:
-                        raise ValueError("Mattermost posting configuration required")
-                    token = Path(path).expanduser().read_text().strip()
+                    base, token = posting
                     async with aiohttp.ClientSession(
                         headers={"Authorization": "Bearer " + token},
                         timeout=aiohttp.ClientTimeout(total=20),

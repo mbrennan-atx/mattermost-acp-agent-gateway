@@ -1079,9 +1079,13 @@ class CollaborationStore:
                     ):
                         raise PermissionError("Project discussion creation requires reconciliation")
                 return None
-            projects = [project for project in projects if actor in project["members"]]
+            projects = [
+                project
+                for project in projects
+                if actor in project["members"] and recipient in project["members"]
+            ]
             if not projects:
-                raise PermissionError("Actor is not a project participant")
+                raise PermissionError("Both actors must participate in the project discussion")
             request = {"recipient": recipient, "kind": "ask", "text": body, "key": key}
             for project in projects:
                 if self.db.execute(

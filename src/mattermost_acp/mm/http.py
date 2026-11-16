@@ -79,7 +79,8 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
 
     app.router.add_post("/slash", slash)
     app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
-    maintenance_lock = asyncio.Lock()
+    maintenance_gateway = getattr(handler, "__self__", None)
+    maintenance_lock = getattr(maintenance_gateway, "_maintenance_lock", None) or asyncio.Lock()
 
     async def maintenance(request):
         gateway = getattr(handler, "__self__", None)
@@ -105,9 +106,12 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
         # Local flags and the hub fence are one transition, including overlapping
         # operator requests. The consumer's lock covers only its hub operation.
         async with maintenance_lock:
+            if action == "resume" and gateway.maintenance_state().get("restart_pending", False):
+                raise web.HTTPConflict(text="Gateway restart is already pending")
             if action == "seal":
                 if not gateway.draining or not gateway.maintenance_state()["idle"]:
                     raise web.HTTPConflict(text="Gateway must be drained and idle")
+                gateway._maintenance_generation = getattr(gateway, "_maintenance_generation", 0) + 1
                 try:
                     await consumer.set_admission("sealed")
                 except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
@@ -118,6 +122,7 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
                 gateway.sealed = True
             elif action != "state":
                 # Keep local admission closed throughout a hub fence transition.
+                gateway._maintenance_generation = getattr(gateway, "_maintenance_generation", 0) + 1
                 gateway.draining = True
                 try:
                     await consumer.set_admission("controls" if action == "drain" else "normal")

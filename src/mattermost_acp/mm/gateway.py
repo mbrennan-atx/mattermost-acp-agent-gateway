@@ -109,6 +109,9 @@ class MattermostGateway:
         )
         self.draining = False
         self.sealed = False
+        self._maintenance_lock = asyncio.Lock()
+        self._maintenance_generation = 0
+        self._restart_pending = False
         self._inbound_tasks = set()
         self._slash_tasks = set()
         self._active_controls = 0
@@ -815,6 +818,10 @@ class MattermostGateway:
         state = {
             "draining": self.draining,
             "sealed": self.sealed,
+            "restart_pending": self._restart_pending or any(
+                task.get_name() == "mattermost-acp-restart" and not task.done()
+                for task in self._slash_tasks
+            ),
             "foreground": len(getattr(self.sessions, "busy_threads", ())),
             "responses": sum(lock.locked() for lock in self._prompt_locks.values()),
             "inbound": len(self._inbound_tasks),
@@ -1527,62 +1534,70 @@ class MattermostGateway:
         self, thread_id: str, channel_id: str, user_id: str, *, timeout_s: float = 900
     ) -> None:
         deadline = time.monotonic() + timeout_s
-        previous_flags = self.draining, self.sealed
         admission = getattr(self.collaboration, "set_admission", None)
         restart_scheduled = False
         hub_sealed = admission is None
-        self.draining = True
+        previous_flags = None
+        generation = None
         try:
-            if admission is not None:
-                await admission("controls")
+            async with self._maintenance_lock:
+                previous_flags = self.draining, self.sealed
+                self._maintenance_generation += 1
+                generation = self._maintenance_generation
+                self.draining = True
+                if admission is not None:
+                    await admission("controls")
             while True:
-                state = self.maintenance_state()
-                # This helper is the control deciding whether it may restart.
-                state["commands"] -= int(asyncio.current_task() in self._slash_tasks)
-                if state["native_boundary_unknown"]:
-                    await self._post(
-                        channel_id,
-                        "The new harness is saved. Native goal/queue idle status is unknown; "
-                        "automatic restart is deferred.",
-                        root_id=thread_id,
-                    )
-                    return
-                if not any(
-                    state[key]
-                    for key in (
-                        "foreground",
-                        "responses",
-                        "inbound",
-                        "commands",
-                        "native_rpc",
-                        "background",
-                        "collaboration",
-                    )
-                ):
-                    if not hub_sealed:
-                        self.sealed = True
-                        await admission("sealed")
-                        hub_sealed = True
-                        continue
-                    break
-                if time.monotonic() >= deadline:
-                    await self._post(
-                        channel_id,
-                        "The new harness is saved. Pending work prevents automatic restart.",
-                        root_id=thread_id,
-                    )
+                notice = None
+                async with self._maintenance_lock:
+                    if generation != self._maintenance_generation:
+                        return  # A newer operator transition owns admission.
+                    state = self.maintenance_state()
+                    # This helper is the control deciding whether it may restart.
+                    state["commands"] -= int(asyncio.current_task() in self._slash_tasks)
+                    if state["native_boundary_unknown"]:
+                        notice = (
+                            "The new harness is saved. Native goal/queue idle status is unknown; "
+                            "automatic restart is deferred."
+                        )
+                    elif not any(
+                        state[key]
+                        for key in (
+                            "foreground",
+                            "responses",
+                            "inbound",
+                            "commands",
+                            "native_rpc",
+                            "background",
+                            "collaboration",
+                        )
+                    ):
+                        if not hub_sealed:
+                            self.sealed = True
+                            await admission("sealed")
+                            hub_sealed = True
+                            continue
+                        # Keep the last idle check, local fence and restart
+                        # scheduling in the same operator transition.
+                        self.draining = self.sealed = True
+                        self._restart_pending = True
+                        msg = await self._request_restart(
+                            thread_id=thread_id,
+                            channel_id=channel_id,
+                            user_id=user_id,
+                            reason="harness_switch",
+                        )
+                        restart_scheduled = True
+                        logger.info("harness switch restart: %s", msg)
+                        break
+                    elif time.monotonic() >= deadline:
+                        notice = (
+                            "The new harness is saved. Pending work prevents automatic restart."
+                        )
+                if notice is not None:
+                    await self._post(channel_id, notice, root_id=thread_id)
                     return
                 await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
-            # No await separates the final idle check from native admission.
-            self.draining = self.sealed = True
-            msg = await self._request_restart(
-                thread_id=thread_id,
-                channel_id=channel_id,
-                user_id=user_id,
-                reason="harness_switch",
-            )
-            restart_scheduled = True
-            logger.info("harness switch restart: %s", msg)
         except Exception:
             logger.exception("Automatic harness restart could not settle admission")
             await self._post(
@@ -1591,26 +1606,28 @@ class MattermostGateway:
                 root_id=thread_id,
             )
         finally:
-            if not restart_scheduled:
-                self.draining = self.sealed = True
-                try:
-                    if admission is not None:
-                        if not any(previous_flags):
-                            # Reconcile a lost acknowledgement before normal
-                            # polling can reopen; its response alone cannot
-                            # resolve an outstanding mailbox claim.
-                            await admission("controls")
-                        await admission(
-                            "sealed"
-                            if previous_flags[1]
-                            else "controls"
-                            if previous_flags[0]
-                            else "normal"
-                        )
-                except Exception:
-                    logger.exception("Restart admission recovery remains unresolved")
-                else:
-                    self.draining, self.sealed = previous_flags
+            if not restart_scheduled and generation is not None:
+                async with self._maintenance_lock:
+                    if generation == self._maintenance_generation:
+                        self._restart_pending = False
+                        self.draining = self.sealed = True
+                        try:
+                            if admission is not None:
+                                if not any(previous_flags):
+                                    # Reconcile a lost acknowledgement before
+                                    # polling reopens. Unresolved claims remain.
+                                    await admission("controls")
+                                await admission(
+                                    "sealed"
+                                    if previous_flags[1]
+                                    else "controls"
+                                    if previous_flags[0]
+                                    else "normal"
+                                )
+                        except Exception:
+                            logger.exception("Restart admission recovery remains unresolved")
+                        else:
+                            self.draining, self.sealed = previous_flags
 
     def _format_status(self, st: dict[str, object]) -> str:
         reporter = TurnReporter()
@@ -1646,31 +1663,41 @@ class MattermostGateway:
         user_id: str,
         reason: str,
     ) -> str:
-        rec = await self.sessions.store.get(thread_id)
-        pending = now_pending(
-            thread_id=thread_id,
-            session_id=rec.session_id if rec else None,
-            user_id=user_id,
-            reason=reason,
-            team_id=self.config.team_id,
-            parent_channel_id=channel_id,
-        )
+        self._restart_pending = True
+        try:
+            rec = await self.sessions.store.get(thread_id)
+            pending = now_pending(
+                thread_id=thread_id,
+                session_id=rec.session_id if rec else None,
+                user_id=user_id,
+                reason=reason,
+                team_id=self.config.team_id,
+                parent_channel_id=channel_id,
+            )
 
-        async def _cancel() -> None:
-            if self.sessions.is_busy(thread_id):
-                try:
-                    await self.sessions.cancel(thread_id)
-                except Exception:
-                    logger.exception("cancel before restart failed")
+            async def _cancel() -> None:
+                if self.sessions.is_busy(thread_id):
+                    try:
+                        await self.sessions.cancel(thread_id)
+                    except Exception:
+                        logger.exception("cancel before restart failed")
 
-        return await restart_gateway(
-            pending=pending,
-            db_path=self.config.db_path,
-            stop_coro=self.sessions.broker.stop,
-            cancel_coro=_cancel,
-            unit="mattermost-acp-gateway.service",
-            track=self._track_control,
-        )
+            def track_restart(operation, name):
+                task = self._track_control(operation, name)
+                task.add_done_callback(lambda _task: setattr(self, "_restart_pending", False))
+                return task
+
+            return await restart_gateway(
+                pending=pending,
+                db_path=self.config.db_path,
+                stop_coro=self.sessions.broker.stop,
+                cancel_coro=_cancel,
+                unit="mattermost-acp-gateway.service",
+                track=track_restart,
+            )
+        except BaseException:
+            self._restart_pending = False
+            raise
 
     async def _handle_pending_restart_bump(self) -> None:
         pending = consume_pending(pending_path(self.config.db_path))

@@ -655,7 +655,12 @@ class CollaborationConsumer:
                 "then continue authorized work or report the verified outcome. This delivery "
                 "requires no acknowledgement or reply to the sender. "
             )
-        command = shlex.quote(sys.executable) + " -m mattermost_acp.collaboration.cli"
+        selected = getattr(self.gateway.config, "collab_cli_command", None)
+        command = (
+            shlex.quote(selected)
+            if selected
+            else shlex.quote(sys.executable) + " -m mattermost_acp.collaboration.cli"
+        )
         instructions = instructions.replace("mm-work ", command + " ")
         return (
             f"Project collaboration: {item['project_title']}\n"
