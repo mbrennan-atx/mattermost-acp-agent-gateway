@@ -9,6 +9,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
+from urllib.parse import quote
 
 from mattermost_acp.collaboration.client import HubClient, Settings
 from mattermost_acp.collaboration.store import text
@@ -31,7 +32,6 @@ async def execute(args, hub):
     if command == "create":
         origin_thread = origin_identifier(args.origin_thread)
         origin_channel = origin_identifier(args.origin_channel)
-        actor = (await hub.request("GET", "/identity"))["actor"]
         members = sorted(
             set(args.members.split(",") if args.members else await hub.request("GET", "/actors"))
         )
@@ -49,25 +49,26 @@ async def execute(args, hub):
             "channel_id": os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "").strip() or None,
         }
         # A retry with the same key reuses the first discussion and project.
-        for existing in await hub.request("GET", "/projects"):
-            if existing.get("key") == body["key"] and existing["owner"] == actor:
-                if any(
-                    existing[name] != body[name]
-                    for name in (
-                        "title",
-                        "objective",
-                        "origin_thread_id",
-                        "origin_channel_id",
-                        "limits",
-                        "channel_id",
-                    )
-                ):
-                    raise ValueError("Conflicting project creation key")
-                if set(existing["members"]) != set(members):
-                    raise ValueError("Conflicting project membership for creation key")
-                if args.discussion_thread and existing["thread_id"] != args.discussion_thread:
-                    raise ValueError("Conflicting project discussion for creation key")
-                return existing
+        evidence = await hub.request("GET", "/creations/" + quote(body["key"], safe=""))
+        existing = evidence.get("project")
+        if existing is not None:
+            if any(
+                existing[name] != body[name]
+                for name in (
+                    "title",
+                    "objective",
+                    "origin_thread_id",
+                    "origin_channel_id",
+                    "limits",
+                    "channel_id",
+                )
+            ):
+                raise ValueError("Conflicting project creation key")
+            if set(existing["members"]) != set(members):
+                raise ValueError("Conflicting project membership for creation key")
+            if args.discussion_thread and existing["thread_id"] != args.discussion_thread:
+                raise ValueError("Conflicting project discussion for creation key")
+            return existing
         body["thread_id"] = args.discussion_thread
         return await hub.request("POST", "/creations", body)
     if command in {"ask", "task"}:

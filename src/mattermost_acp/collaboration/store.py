@@ -94,6 +94,10 @@ class CollaborationStore:
                 PRIMARY KEY(actor,key));
             CREATE TABLE IF NOT EXISTS origin_stops(actor TEXT, thread TEXT, cutoff REAL NOT NULL,
                 PRIMARY KEY(actor,thread));
+            CREATE TABLE IF NOT EXISTS project_bindings(
+                project TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL,
+                channel TEXT NOT NULL, PRIMARY KEY(project,actor));
+            CREATE INDEX IF NOT EXISTS native_binding ON project_bindings(actor,thread,project);
         """)
         self.migrate_admission_order()
         # Backfill queryable metadata once for hubs created with the JSON-only
@@ -110,6 +114,8 @@ class CollaborationStore:
                 ("thread", "TEXT"),
                 ("elapsed_epoch", "TEXT"),
                 ("elapsed_deadline", "REAL"),
+                ("creation_key", "TEXT"),
+                ("bindings_indexed", "INTEGER"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE projects ADD COLUMN {name} {kind}")
@@ -140,6 +146,20 @@ class CollaborationStore:
                 "CREATE INDEX IF NOT EXISTS origin_project_admission "
                 "ON projects(owner,origin_thread,status,admission_order)"
             )
+            self.db.execute(
+                "UPDATE projects SET creation_key=json_extract(data,'$.key') "
+                "WHERE creation_key IS NULL AND json_extract(data,'$.key') IS NOT NULL"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS project_creation_key ON projects(owner,creation_key)"
+            )
+            self.db.execute(
+                "INSERT OR REPLACE INTO project_bindings(project,actor,thread,channel) "
+                "SELECT p.id,b.key,json_extract(b.value,'$.thread_id'),"
+                "json_extract(b.value,'$.channel_id') FROM projects p,"
+                "json_each(p.data,'$.bindings') b WHERE p.bindings_indexed IS NULL"
+            )
+            self.db.execute("UPDATE projects SET bindings_indexed=1 WHERE bindings_indexed IS NULL")
         # Persist routing and execution metadata once. Runtime admission and
         # recovery read only matching rows, regardless of retained JSON history.
         with self.transaction():
@@ -155,6 +175,10 @@ class CollaborationStore:
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS execution_debt ON messages(recipient,execution_pending)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS project_execution_debt "
+                "ON messages(project,execution_pending,state,recipient)"
             )
             creation_columns = {row[1] for row in self.db.execute("PRAGMA table_info(creations)")}
             for name, kind in (("channel", "TEXT"), ("thread", "TEXT"), ("unresolved", "INTEGER")):
@@ -304,8 +328,8 @@ class CollaborationStore:
             self.db.execute(
                 "INSERT OR REPLACE INTO projects"
                 "(id,data,status,deadline,created,owner,origin_thread,channel,thread,"
-                "admission_order,elapsed_epoch,elapsed_deadline) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "admission_order,elapsed_epoch,elapsed_deadline,creation_key,bindings_indexed) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
                 (
                     item["id"],
                     json.dumps(item),
@@ -319,6 +343,15 @@ class CollaborationStore:
                     order,
                     item.get("elapsed_epoch"),
                     item.get("elapsed_deadline"),
+                    item.get("key"),
+                ),
+            )
+            self.db.execute("DELETE FROM project_bindings WHERE project=?", (item["id"],))
+            self.db.executemany(
+                "INSERT INTO project_bindings(project,actor,thread,channel) VALUES(?,?,?,?)",
+                (
+                    (item["id"], actor, binding["thread_id"], binding["channel_id"])
+                    for actor, binding in item.get("bindings", {}).items()
                 ),
             )
 
@@ -381,10 +414,30 @@ class CollaborationStore:
 
     def deadline_receipt(self, item, actor):
         project = self.get_project(item["project"], actor)
-        return {
+        receipt = {
             **item,
             "project_deadline": project["deadline"],
             "project_remaining_seconds": self.remaining_seconds(project),
+        }
+        if project["status"] != "active":
+            receipt.update(self.project_budget(project, actor))
+        return receipt
+
+    def project_budget(self, project, actor):
+        if isinstance(project, str):
+            project = self.get_project(project, actor)
+        return {
+            "project": project["id"],
+            "project_deadline": project["deadline"],
+            "project_remaining_seconds": self.remaining_seconds(project),
+            "project_admission_closed": project["status"] != "active",
+            "project_execution_pending": bool(
+                self.db.execute(
+                    "SELECT 1 FROM messages WHERE project=? AND (execution_pending=1 "
+                    "OR state IN ('running','unconfirmed','interrupted','cancelling')) LIMIT 1",
+                    (project["id"],),
+                ).fetchone()
+            ),
         }
 
     def prepare_creation(self, actor, body):
@@ -394,6 +447,7 @@ class CollaborationStore:
         canonical["key"] = key
         canonical.setdefault("owner_in_discussion", False)
         with self.transaction():
+            self.expire()
             row = self.db.execute(
                 "SELECT data FROM creations WHERE actor=? AND key=?", (actor, key)
             ).fetchone()
@@ -544,6 +598,37 @@ class CollaborationStore:
     def create_project(
         self, actor, body, *, created=None, admission_order=None, elapsed_admission=None
     ):
+        with self.transaction():
+            self.expire()
+            return self._create_project(
+                actor,
+                body,
+                created=created,
+                admission_order=admission_order,
+                elapsed_admission=elapsed_admission,
+            )
+
+    def project_by_creation_key(self, actor, key):
+        key = text(key, "project idempotency key", 200)
+        row = self.db.execute(
+            "SELECT data FROM projects WHERE owner=? AND creation_key=? ORDER BY rowid LIMIT 1",
+            (actor, key),
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def creation_evidence(self, actor, key):
+        with self.transaction():
+            self.expire()
+            project = self.project_by_creation_key(actor, key)
+            try:
+                intent = self.get_creation(actor, key)
+            except KeyError:
+                intent = None
+            return {"project": project, "creation": intent}
+
+    def _create_project(
+        self, actor, body, *, created=None, admission_order=None, elapsed_admission=None
+    ):
         body = {"owner_in_discussion": False, **body}
         key = body.get("key")
         fingerprint = hashlib.sha256(
@@ -551,11 +636,11 @@ class CollaborationStore:
         ).hexdigest()
         if key:
             key = text(key, "project idempotency key", 200)
-            for existing in self.list_projects(actor):
-                if existing["owner"] == actor and existing.get("key") == key:
-                    if existing.get("fingerprint") != fingerprint:
-                        raise ValueError("Conflicting project idempotency key")
-                    return existing
+            existing = self.project_by_creation_key(actor, key)
+            if existing is not None:
+                if existing.get("fingerprint") != fingerprint:
+                    raise ValueError("Conflicting project idempotency key")
+                return existing
         members = body.get("members", [])
         if (
             not isinstance(members, list)
@@ -632,9 +717,15 @@ class CollaborationStore:
             or binding["channel_id"] != project["channel_id"]
         ):
             raise ValueError("Sidecar bindings must stay in the project discussion")
-        for other in self.list_projects(actor):
-            if other["id"] == project["id"] or other["status"] == "cancelled":
-                continue
+        for (raw,) in self.db.execute(
+            "SELECT p.data FROM project_bindings b JOIN projects p ON p.id=b.project "
+            "WHERE b.actor=? AND b.thread=? AND p.id<>? AND (p.status<>'cancelled' "
+            "OR EXISTS(SELECT 1 FROM messages m WHERE m.project=p.id AND m.recipient=? "
+            "AND (m.execution_pending=1 OR m.state IN "
+            "('running','unconfirmed','interrupted','cancelling'))))",
+            (actor, binding["thread_id"], project["id"], actor),
+        ):
+            other = json.loads(raw)
             existing = other["bindings"][actor]
             if existing["thread_id"] != binding["thread_id"]:
                 continue
@@ -676,6 +767,7 @@ class CollaborationStore:
 
     def bind(self, pid, actor, body):
         with self.transaction():
+            self.expire()
             project = self.get_project(pid, actor)
             if self.db.execute(
                 "SELECT 1 FROM messages WHERE project=? AND recipient=? "

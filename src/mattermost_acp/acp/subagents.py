@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 
 from .types import SessionUpdate
 
+ASYNC_TERMINAL = frozenset({"completed", "failed", "stopped"})
+WORKER_TERMINAL = frozenset({"completed", "cancelled", "canceled", "failed", "idle"})
+
 
 def _short(value: object, limit: int = 240) -> str:
     return " ".join(str(value or "").split())[:limit]
@@ -24,6 +27,14 @@ class Worker:
     parts: str = ""
     async_tasks: dict[str, dict] = field(default_factory=dict)
     observed_tools: set[str] = field(default_factory=set)
+    active_tools: set[str] = field(default_factory=set)
+    background_requested: set[str] = field(default_factory=set)
+    detached_tools: set[str] = field(default_factory=set)
+
+    def pending_execution(self) -> bool:
+        return bool(self.active_tools or self.detached_tools) or any(
+            task.get("state") not in ASYNC_TERMINAL for task in self.async_tasks.values()
+        )
 
 
 class SubagentTracker:
@@ -36,6 +47,7 @@ class SubagentTracker:
 
     def __init__(self) -> None:
         self.workers: dict[str, Worker] = {}
+        self._retired_sessions: set[str] = set()
 
     def _events(self, worker: Worker) -> list[SessionUpdate]:
         events = []
@@ -57,10 +69,7 @@ class SubagentTracker:
                         "async_tasks": {
                             task_id: dict(task) for task_id, task in worker.async_tasks.items()
                         },
-                        "pending_async_work": any(
-                            task.get("state") not in {"completed", "failed", "stopped"}
-                            for task in worker.async_tasks.values()
-                        ),
+                        "pending_async_work": worker.pending_execution(),
                     },
                 )
             )
@@ -80,6 +89,30 @@ class SubagentTracker:
         descendants = {event.raw["worker_id"] for event in self.snapshots(session_id)}
         for child in descendants | {session_id}:
             self.workers.pop(child, None)
+            self._retired_sessions.discard(child)
+
+    def pending(self, session_id: str) -> bool:
+        related = {event.raw["worker_id"] for event in self.snapshots(session_id)}
+        if session_id in self.workers:
+            related.add(session_id)
+        return any(
+            self.workers[child].state not in WORKER_TERMINAL
+            or self.workers[child].pending_execution()
+            for child in related
+        )
+
+    def retire(self, session_id: str) -> None:
+        """Retain routing until known child execution supplies terminal evidence."""
+        if self.pending(session_id):
+            self._retired_sessions.add(session_id)
+        else:
+            self.forget(session_id)
+
+    def prune_retired(self) -> None:
+        # The broker calls this after delivering the final ancestor snapshots.
+        for session_id in list(self._retired_sessions):
+            if not self.pending(session_id):
+                self.forget(session_id)
 
     def observe(self, update: SessionUpdate) -> list[SessionUpdate]:
         raw = update.raw
@@ -123,10 +156,41 @@ class SubagentTracker:
             worker.parts = (worker.parts + update.text)[-2000:]
             worker.latest = _short(worker.parts)
         elif update.kind in {"tool_call", "tool_call_update"}:
-            if update.kind == "tool_call" and update.tool_call_id:
-                worker.observed_tools.add(update.tool_call_id)
-                for task in worker.async_tasks.values():
-                    task["owned"] = task.get("toolCallId") in worker.observed_tools
+            tool_id = update.tool_call_id
+            if tool_id:
+                if update.kind == "tool_call":
+                    worker.observed_tools.add(tool_id)
+                    for task in worker.async_tasks.values():
+                        task["owned"] = task.get("toolCallId") in worker.observed_tools
+                state = (update.tool_status or "").lower()
+                meta = raw.get("_meta")
+                meta = meta if isinstance(meta, dict) else {}
+                native = meta.get("claudeCode")
+                native = native if isinstance(native, dict) else {}
+                inputs = raw.get("rawInput")
+                if (
+                    native.get("toolName") == "Bash"
+                    and isinstance(inputs, dict)
+                    and inputs.get("run_in_background") is True
+                ):
+                    worker.background_requested.add(tool_id)
+                jetbrains = meta.get("jetbrains")
+                air = jetbrains.get("air", {}) if isinstance(jetbrains, dict) else {}
+                background = air.get("asyncTasks", {}) if isinstance(air, dict) else {}
+                if state in {"completed", "success"} and (
+                    tool_id in worker.background_requested
+                    or (isinstance(background, dict) and background.get("backgrounded") is True)
+                ):
+                    worker.detached_tools.add(tool_id)
+                    if any(
+                        task.get("toolCallId") == tool_id and task.get("state") in ASYNC_TERMINAL
+                        for task in worker.async_tasks.values()
+                    ):
+                        worker.detached_tools.discard(tool_id)
+                if state in {"completed", "success", "failed", "cancelled", "canceled", "error"}:
+                    worker.active_tools.discard(tool_id)
+                elif update.kind == "tool_call" or state in {"pending", "in_progress", "running"}:
+                    worker.active_tools.add(tool_id)
             worker.parts = ""
             if not worker.latest:
                 worker.latest = "Using tools"
@@ -148,13 +212,12 @@ class SubagentTracker:
             state = raw.get("state", previous)
             state = state if isinstance(state, str) else "unknown"
             task["state"] = (
-                previous
-                if previous in {"completed", "failed", "stopped"}
-                and state not in {"completed", "failed", "stopped"}
-                else state
+                previous if previous in ASYNC_TERMINAL and state not in ASYNC_TERMINAL else state
             )
             tool_id = task.get("toolCallId")
             task["owned"] = isinstance(tool_id, str) and tool_id in worker.observed_tools
+            if task.get("state") in ASYNC_TERMINAL:
+                worker.detached_tools.discard(tool_id)
         elif update.model_id:
             worker.model = _short(update.model_id, 80)
         else:

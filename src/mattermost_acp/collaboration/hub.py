@@ -96,6 +96,15 @@ def build_app(
         body["owner_in_discussion"] = bool(actors[actor].get("sidecar"))
         return web.json_response(store.create_project(actor, body))
 
+    async def creation_evidence(request):
+        return web.json_response(
+            store.creation_evidence(request["actor"], request.match_info["key"])
+        )
+
+    async def project_budget(request):
+        store.expire()
+        return web.json_response(store.project_budget(request.match_info["pid"], request["actor"]))
+
     async def read_creation_root(actor, thread, *, fallback_channel=None):
         if verify_creation is not None:
             return await verify_creation(actor, thread)
@@ -513,6 +522,8 @@ def build_app(
     app.router.add_get("/healthz", health)
     app.router.add_route("*", "/projects", projects)
     app.router.add_post("/creations", creations)
+    app.router.add_get("/creations/{key}", creation_evidence)
+    app.router.add_get("/projects/{pid}/budget", project_budget)
     app.router.add_get("/projects/{pid}", show)
     app.router.add_post("/projects/{pid}/{action}", project_action)
     app.router.add_get("/messages/{mid}", message)

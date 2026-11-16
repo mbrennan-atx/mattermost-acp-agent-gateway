@@ -19,10 +19,16 @@ import aiohttp
 
 from mattermost_acp.acp.broker import NativeDispatchChanged, native_command_admission
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
+from mattermost_acp.collaboration.client import elapsed_clock as receipt_elapsed_clock
 from mattermost_acp.mm.chunk import DEFAULT_LIMIT
 from mattermost_acp.mm.client import MattermostError
 
 logger = logging.getLogger(__name__)
+DEADLINE_RECHECK_SECONDS = 1.0
+
+
+def elapsed_clock():
+    return receipt_elapsed_clock(time)
 
 
 class CollaborationConsumer:
@@ -31,12 +37,17 @@ class CollaborationConsumer:
         self.instance = uuid.uuid4().hex
         self.task = None
         self.workers: dict[tuple[str, str | None], asyncio.Task] = {}
+        self.worker_projects = {}
+        self.handling = {}
         self.closing = False
         self.ownership = {}
         self.ownership_threads = {}
         self.ownership_items = {}
         self.project_deadlines = {}
         self.deadline_tasks = {}
+        self.deadline_stops = set()
+        self.settled_projects = set()
+        self.deadline_cleanup_cursor = 0
         self.rejected_reservations = {}
         self.pending_execution_restores = {}
         self.reserving = set()
@@ -104,6 +115,7 @@ class CollaborationConsumer:
                         # block unrelated ownership and mailbox processing.
                         logger.warning("Project stop unresolved; recorded intent retained")
                 await self.reconcile_ownership()
+                await self.reconcile_deadlines()
                 if self.gateway.sealed or self.poll_paused:
                     await asyncio.sleep(0.25)
                     continue
@@ -124,6 +136,7 @@ class CollaborationConsumer:
                     )
                     key = (item["id"], item.get("claim"))
                     self.workers[key] = task
+                    self.worker_projects[key] = item["project"]
                     task.add_done_callback(
                         lambda completed, key=key: self.finish_worker(key, completed)
                     )
@@ -186,6 +199,8 @@ class CollaborationConsumer:
                 report["cancel_requested"] = True
         self.recovery_pending = False
         self.gateway.collaboration_recovery_pending = False
+        for item in claims:
+            self.observe_deadline(item)
 
     async def set_admission(self, mode):
         """Fence hub claims before settling local mailbox uncertainty."""
@@ -247,6 +262,9 @@ class CollaborationConsumer:
     def finish_worker(self, key, completed):
         if self.workers.get(key) is completed:
             self.workers.pop(key)
+            pid = self.worker_projects.pop(key, None)
+            if pid:
+                self.evict_deadline(pid)
 
     async def update(self, item, state, result="", evidence=None, *, expected_execution_id=None):
         if expected_execution_id is None and state not in {"dispatch", "post_dispatch"}:
@@ -275,10 +293,19 @@ class CollaborationConsumer:
 
     def observe_deadline(self, item):
         pid = item.get("project")
+        if not isinstance(pid, str):
+            return
+        if (
+            item.get("project_admission_closed") is True
+            and item.get("project_execution_pending") is False
+        ):
+            self.settled_projects.add(pid)
+            if self.evict_deadline(pid):
+                return
         deadline = item.get("local_project_deadline")
         remaining = item.get("project_remaining_seconds")
         if deadline is None and type(remaining) in {int, float} and math.isfinite(remaining):
-            deadline = time.monotonic() + max(0, remaining)
+            deadline = elapsed_clock() + max(0, remaining)
         if (
             not isinstance(pid, str)
             or type(deadline) not in {int, float}
@@ -299,7 +326,52 @@ class CollaborationConsumer:
 
     def before_deadline(self, item):
         self.observe_deadline(item)
-        return time.monotonic() < self.project_deadlines.get(item.get("project"), float("inf"))
+        return item.get("project_admission_closed") is not True and elapsed_clock() < (
+            self.project_deadlines.get(item.get("project"), float("inf"))
+        )
+
+    def evict_deadline(self, pid):
+        if (
+            pid not in self.settled_projects
+            or self.recovery_pending
+            or pid in self.handling.values()
+            or pid in self.worker_projects.values()
+            or any(item.get("project") == pid for item in self.ownership_items.values())
+            or any(item.get("project") == pid for item in self.inherited_claims)
+        ):
+            return False
+        task = self.deadline_tasks.pop(pid, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self.project_deadlines.pop(pid, None)
+        self.hub.deadlines.pop(pid, None)
+        self.deadline_stops = {stop for stop in self.deadline_stops if stop[0] != pid}
+        self.settled_projects.discard(pid)
+        return True
+
+    async def refresh_budget(self, pid):
+        try:
+            async with asyncio.timeout(3):
+                receipt = await self.hub.request("GET", f"/projects/{pid}/budget")
+                self.observe_deadline(receipt)
+        except Exception:
+            logger.warning("Project deadline reconciliation unavailable; budget retained")
+
+    async def reconcile_deadlines(self):
+        for pid in list(self.settled_projects):
+            self.evict_deadline(pid)
+        pending = [
+            pid
+            for pid, deadline in self.project_deadlines.items()
+            if deadline <= elapsed_clock()
+            and (pid not in self.deadline_tasks or self.deadline_tasks[pid].done())
+        ]
+        if pending:
+            start = self.deadline_cleanup_cursor % len(pending)
+            selected = (pending[start:] + pending[:start])[:4]
+            self.deadline_cleanup_cursor = start + len(selected)
+            for pid in selected:
+                await self.refresh_budget(pid)
 
     async def deadline_work(self, item, operation):
         try:
@@ -314,7 +386,15 @@ class CollaborationConsumer:
                 operation.close()
 
     async def enforce_deadline(self, pid):
-        await asyncio.sleep(max(0, self.project_deadlines[pid] - time.monotonic()))
+        while pid in self.project_deadlines:
+            remaining = self.project_deadlines[pid] - elapsed_clock()
+            if remaining <= 0:
+                break
+            # asyncio timers exclude suspension. Recheck BOOTTIME within one
+            # second of event-loop progress after the host resumes.
+            await asyncio.sleep(min(DEADLINE_RECHECK_SECONDS, remaining))
+        if pid not in self.project_deadlines:
+            return
         handled = set()
         for key, owned in list(self.ownership.items()):
             item = self.ownership_items.get(key, {})
@@ -366,6 +446,12 @@ class CollaborationConsumer:
 
             if not still_owned():
                 continue
+            stop = (pid, session, execution, epoch)
+            if stop in self.deadline_stops:
+                continue
+            # Timer replacement and other expiry observers can overlap. Keep
+            # the original bounded stop attempt uncertain rather than repeat it.
+            self.deadline_stops.add(stop)
             handled.add(id(owned))
             try:
                 async with asyncio.timeout(3):
@@ -396,6 +482,7 @@ class CollaborationConsumer:
             except Exception:
                 # A refused/ambiguous stop cannot prove that native work ended.
                 logger.warning("Project deadline reached; native cancellation remains unresolved")
+        await self.refresh_budget(pid)
 
     def active(self, thread):
         if self.gateway.sessions.is_busy(thread):
@@ -471,10 +558,8 @@ class CollaborationConsumer:
         report = self.ownership.pop(key, None)
         item = self.ownership_items.pop(key, {})
         pid = item.get("project")
-        if pid and not any(owned.get("project") == pid for owned in self.ownership_items.values()):
-            task = self.deadline_tasks.get(pid)
-            if task is not None and task is not asyncio.current_task():
-                task.cancel()
+        if pid:
+            self.evict_deadline(pid)
         thread = self.ownership_threads.pop(key, None) or (report or {}).get("thread_id")
         self.gateway.prune_reports()
         if thread and not self.owns_thread(thread) and not self.gateway.background_pending(thread):
@@ -916,6 +1001,8 @@ class CollaborationConsumer:
         )
 
     async def handle(self, item):
+        handling_key = (item["id"], item.get("claim"))
+        self.handling[handling_key] = item["project"]
         self.observe_deadline(item)
         renewal = asyncio.create_task(self.heartbeat(item))
         try:
@@ -1165,6 +1252,7 @@ class CollaborationConsumer:
                 if mid:
                     try:
                         settled = await self.hub.request("GET", f"/messages/{mid}")
+                        self.observe_deadline(settled)
                         if settled.get("claim") != claim:
                             continue
                         key = (mid, claim)
@@ -1176,6 +1264,8 @@ class CollaborationConsumer:
                             self.cancelled_claims.discard(key)
                     except Exception:
                         pass
+            self.handling.pop(handling_key, None)
+            self.evict_deadline(item["project"])
 
     async def wait_for_continuation(self, item):
         if item["kind"] not in {"ask", "work"}:

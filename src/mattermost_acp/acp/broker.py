@@ -686,7 +686,7 @@ class AcpBroker:
         return resolved
 
     async def session_close(self, session_id: str) -> None:
-        self.subagents.forget(session_id)
+        self.subagents.retire(session_id)
         if not self._capabilities.close:
             return
         process = self._proc
@@ -1004,6 +1004,7 @@ class AcpBroker:
                         self.update_observer(event)
                     except Exception:
                         logger.exception("background update observer failed")
+            self.subagents.prune_retired()
             return
 
         if method:

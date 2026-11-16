@@ -1,8 +1,16 @@
 # Acceptance evidence
 
+## Final review followup checks
+
+The integrated parent suite passes 1,218 tests with one optional adapter fixture skipped in 198.35 seconds on CPython 3.12. Ruff and diff checks pass. All six supported findings from the preceding full-branch review have fixes: detached child execution retains debt, closed roots retain terminal routing, local budgets include suspension, admission expires idle bindings transactionally, settled budget caches retire with authoritative debt evidence, and creation/binding lookups avoid decoding unrelated history.
+
+Child lifecycle coverage includes 27 new cases with 23 failures and four controls against the exact baseline. Deadline/admission coverage includes thirty cases with 21 baseline failures and nine controls. A separate overlap case demonstrates and fixes duplicate cancellation from concurrent expiry observers; the parent rechecked 118 native-creation/cancellation cases before the complete suite. Pending or ambiguous cancellation retains execution debt. These suites enter both package and public export manifests.
+
+Immutable package/profile staging, renewed full-branch review, exact-source hosted CI and live acceptance remain required. No collaboration service is active at this checkpoint.
+
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 985 parent-verified tests pass with one optional installed Codex adapter fixture skipped in 143.38 seconds. This suite includes restart ownership, ordinary-chat recovery admission, retained creation roots, verified source-post timestamps and bounded guard-timeout coverage.
+- Python 3.12.15 with locked dependencies: 1,218 parent-verified tests pass with one optional installed Codex adapter fixture skipped in 198.35 seconds. This suite includes restart ownership, ordinary-chat recovery admission, retained creation roots, verified source-post timestamps and bounded guard-timeout coverage.
 - Ruff passes across the repository. Formatting passes for all 31 changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
 - Preceding full-branch Sol/high reports and finalized synthesis were inspected. All supported findings have fixes and meaningful regressions. Latest fixes reject unknown and unverified authors in registered discussions, retain ordinary behavior outside projects, and apply expiry inside dispatch transactions after native preparation. A fresh committed-source review precedes publication.

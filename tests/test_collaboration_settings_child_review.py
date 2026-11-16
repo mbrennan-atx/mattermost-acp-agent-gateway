@@ -152,6 +152,13 @@ async def test_project_cancellation_stops_owned_child_task_through_root_native_s
         await native("child", "tool_call", toolCallId="child-bash")
         await native(
             "child",
+            "tool_call_update",
+            toolCallId="child-bash",
+            status="completed",
+            _meta={"jetbrains": {"air": {"asyncTasks": {"backgrounded": True}}}},
+        )
+        await native(
+            "child",
             "async_task_spawned",
             asyncTaskId="child-command",
             toolCallId="child-bash",

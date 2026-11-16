@@ -19,6 +19,16 @@ class HubError(Exception):
         self.status = status
 
 
+def elapsed_clock(clock=None):
+    """Use the same suspension-inclusive clock as the local Linux hub."""
+    clock = time if clock is None else clock
+    return (
+        clock.clock_gettime(clock.CLOCK_BOOTTIME)
+        if hasattr(clock, "CLOCK_BOOTTIME")
+        else clock.monotonic()
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     url: str
@@ -65,7 +75,7 @@ class HubClient:
         )
 
     async def request(self, method, path, body=None):
-        started = time.monotonic()
+        started = elapsed_clock()
         async with self.session.request(method, self.settings.url + path, json=body) as response:
             if response.status >= 400:
                 detail = "request failed"
@@ -97,7 +107,13 @@ class HubClient:
                     and remaining >= 0
                 ):
                     deadline = min(self.deadlines.get(pid, float("inf")), started + remaining)
-                    self.deadlines[pid] = deadline
+                    if (
+                        item.get("project_admission_closed") is True
+                        and item.get("project_execution_pending") is False
+                    ):
+                        self.deadlines.pop(pid, None)
+                    else:
+                        self.deadlines[pid] = deadline
                     item["local_project_deadline"] = deadline
             return result
 
