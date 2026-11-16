@@ -343,7 +343,11 @@ async def test_interrupted_workspace_guard_stops_its_owned_process_group(tmp_pat
     async with asyncio.timeout(2):
         while True:
             state = Path(f"/proc/{pid}/stat")
-            if not state.exists() or state.read_text().split()[2] == "Z":
+            try:
+                status = state.read_text().split()[2]
+            except FileNotFoundError:
+                break  # The child can exit between procfs checks.
+            if status == "Z":
                 break
             await asyncio.sleep(0.005)
 

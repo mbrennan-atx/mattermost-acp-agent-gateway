@@ -157,3 +157,14 @@ The cancellation worker passes 321 affected cases, including all 31 new cases
 (16 baseline failures and 15 controls). The parent passes all six live-HTTP/CLI
 regressions. Final combined tests, immutable packaging, full-branch review,
 source CI and real delivery/cancellation/continuity acceptance remain required.
+
+## Final combined candidate and procfs observation
+
+The complete combined source passes 1,290 tests with one optional adapter skip
+on Python 3.15.0. Its Python 3.12.15 run passes 1,289 cases and exposes a
+test observation race: an owned guard child exits between procfs existence and
+read checks. The fixture now treats FileNotFoundError from that read as the
+verified child exit; all 28 SessionService cases pass. Production bytes remain
+identical to immutable source 7bb0649, whose export, source archive, wheel,
+46-file parity, seven real-profile imports and eight-unit staging pass.
+Final Python 3.12 checks, reviews, source CI and live acceptance remain pending.
