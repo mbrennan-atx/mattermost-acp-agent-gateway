@@ -75,14 +75,14 @@ def main() -> int:
         return 0
 
     if not args.force:
-        busy = hs.wait_idle(plan.db_path, timeout_s=args.wait)
-        if busy:
-            print(
-                f"still busy after {args.wait:.0f}s ({len(busy)} turn(s)); files are "
-                f"updated. Restart later or rerun with --force.",
-                file=sys.stderr,
-            )
-            return 3
+        # A foreground marker cannot prove that native goals, detached work,
+        # incoming requests or collaboration execution have all settled.
+        print(
+            "Files saved. Automatic CLI restart is deferred because native admission "
+            "cannot be verified here. Use the gateway's verified maintenance workflow.",
+            file=sys.stderr,
+        )
+        return 3
     hs.restart_unit(plan.unit)
     time.sleep(5)
     if not hs.unit_active(plan.unit):

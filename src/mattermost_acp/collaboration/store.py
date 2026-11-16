@@ -591,6 +591,9 @@ class CollaborationStore:
             ).fetchone()[0]
             if (stop and order <= stop[0]) or self.remaining_seconds(project) <= 0:
                 project = self.cancel(project["id"], actor)
+            if "discussion_created_at" not in project and intent.get("discussion_created_at"):
+                project["discussion_created_at"] = intent["discussion_created_at"]
+                self.save_project(project)
             intent["status"] = "complete"
             self.save_creation(actor, intent["body"]["key"], intent)
             return project
@@ -1616,7 +1619,9 @@ class CollaborationStore:
             ).fetchall()
             return [self.cancel(row[0], actor) for row in rows]
 
-    def mention(self, actor, channel, thread, recipient, body, key, *, post_created_at=None):
+    def mention(
+        self, actor, channel, thread, recipient, body, key, *, post_created_at=None, project_id=None
+    ):
         with self.transaction():
             projects = [
                 json.loads(raw)
@@ -1633,6 +1638,7 @@ class CollaborationStore:
                 ).fetchone():
                     raise PermissionError("Project discussion creation requires reconciliation")
                 return None
+            generations = len(projects)
             projects = [
                 project
                 for project in projects
@@ -1647,11 +1653,23 @@ class CollaborationStore:
                     (project["id"], actor, key),
                 ).fetchone():
                     return self.send(project["id"], actor, request)
-            selected = next((p for p in projects if p["status"] == "active"), projects[0])
-            # Mattermost timestamps are integer milliseconds. Compare at that
-            # precision to the durable intent admission, never finalization time.
+            if project_id is not None:
+                selected = next((p for p in projects if p["id"] == project_id), None)
+                if selected is None:
+                    raise PermissionError(
+                        "Mention project does not match this discussion generation"
+                    )
+            elif generations > 1:
+                raise PermissionError(
+                    "Mention source predates or lacks this project discussion generation; "
+                    "use ASK [project_id]: on a reused discussion"
+                )
+            else:
+                selected = projects[0]
+            # Compare only Mattermost-side timestamps. Explicit project IDs
+            # distinguish generations when a discussion root is reused.
             if type(post_created_at) is not int or post_created_at <= 0:
                 raise PermissionError("Mention source creation time could not be verified")
-            if post_created_at < math.floor(selected["created"] * 1000):
+            if post_created_at < selected.get("discussion_created_at", 0):
                 raise PermissionError("Mention source predates this project discussion generation")
             return self.send(selected["id"], actor, request)

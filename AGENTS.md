@@ -11,6 +11,7 @@ This repository contains the generic Mattermost ACP gateway. Read this file befo
 - Persist collaboration requests before delivery. Distinguish acceptance, execution, completion and cancellation. Never treat a cleared busy marker, an HTTP success or a running process as proof that work completed.
 - Serialize work for each native thread. Use active-only steering for ongoing sessions; preserve unconfirmed delivery rather than automatically repeating a potentially accepted request.
 - Keep project work bounded and preserve unrelated sessions when cancelling. Ordinary acknowledgements and status edits must not start model turns.
+- Active prompt turns have no default absolute lifetime limit. Keep real inactivity detection and separate control-plane RPC deadlines. Explicit prompt ceilings must be finite and nonnegative; zero disables them. A foreground busy marker alone never authorizes a native restart.
 - Project elapsed budgets require persisted boot/process evidence from creation admission. Clock rollback cannot extend them; missing recovery evidence closes work admission while preserving native execution debt. Stop retries must preserve unrelated mailbox progress, and new terminal settlement requires reservation-linked evidence.
 
 ## Development

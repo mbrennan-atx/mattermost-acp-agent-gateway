@@ -453,24 +453,15 @@ class CollaborationConsumer:
             # the original bounded stop attempt uncertain rather than repeat it.
             self.deadline_stops.add(stop)
             handled.add(id(owned))
+            await self.stop_owned_async_tasks(
+                binding["thread_id"],
+                owned["reporter"],
+                session=session,
+                epoch=epoch,
+                guard=still_owned,
+            )
             try:
                 async with asyncio.timeout(3):
-                    reporter = owned["reporter"]
-                    if hasattr(reporter, "stoppable_async_tasks"):
-                        for task_id in reporter.stoppable_async_tasks():
-
-                            def task_owned(
-                                task_id=task_id, reporter=reporter, still_owned=still_owned
-                            ):
-                                return still_owned() and reporter.owns_async_task(task_id)
-
-                            await self.gateway.sessions.stop_async_task(
-                                binding["thread_id"],
-                                task_id,
-                                expected_session=session,
-                                expected_epoch=epoch,
-                                guard=task_owned,
-                            )
                     await self.gateway.sessions.cancel(
                         binding["thread_id"],
                         expected_session=session,
@@ -483,6 +474,42 @@ class CollaborationConsumer:
                 # A refused/ambiguous stop cannot prove that native work ended.
                 logger.warning("Project deadline reached; native cancellation remains unresolved")
         await self.refresh_budget(pid)
+
+    async def stop_owned_async_tasks(
+        self, thread, reporter, *, session, epoch, guard, stopped=None
+    ):
+        # Child stop failures must leave time for an independent guarded parent
+        # cancellation. Acknowledgements do not establish native termination.
+        try:
+            async with asyncio.timeout(3):
+                if not hasattr(reporter, "stoppable_async_tasks"):
+                    return
+                for task_id in reporter.stoppable_async_tasks():
+                    if stopped is not None and task_id in stopped:
+                        continue
+
+                    def task_owned(task_id=task_id):
+                        return guard() and reporter.owns_async_task(task_id)
+
+                    try:
+                        accepted = await self.gateway.sessions.stop_async_task(
+                            thread,
+                            task_id,
+                            expected_session=session,
+                            expected_epoch=epoch,
+                            guard=task_owned,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning("Native background task cancellation remains unresolved")
+                    else:
+                        if accepted and stopped is not None:
+                            stopped.add(task_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Native background task cancellation remains unresolved")
 
     def active(self, thread):
         if self.gateway.sessions.is_busy(thread):
@@ -555,6 +582,7 @@ class CollaborationConsumer:
     def release_ownership(self, key):
         self.rejected_reservations.pop(key, None)
         self.pending_execution_restores.pop(key, None)
+        self.cancelled_claims.discard(key)
         report = self.ownership.pop(key, None)
         item = self.ownership_items.pop(key, {})
         pid = item.get("project")
@@ -1547,54 +1575,49 @@ class CollaborationConsumer:
                         item, "blocked", "Shared native turn; preserve unrelated work"
                     )
                     return
+                execution = reserved.get("execution_id")
+
+                def may_cancel(
+                    owned=owned,
+                    expected=expected,
+                    key=key,
+                    execution=execution,
+                    project=target["project"],
+                ):
+                    return (
+                        self.gateway._reports.get(expected) is owned
+                        and self.ownership.get(key) is owned
+                        and owned.get("execution_id") == execution
+                        and owned.get("collaboration_project") == project
+                        and key not in self.reserving
+                    )
+
+                await self.stop_owned_async_tasks(
+                    binding["thread_id"],
+                    current["reporter"],
+                    session=expected,
+                    epoch=reserved.get("native_epoch"),
+                    guard=may_cancel,
+                    stopped=current.setdefault("async_stop_requested", set()),
+                )
                 # Repeat an idempotent cancellation until actual termination is observed.
                 try:
-                    reporter = current["reporter"]
-                    if hasattr(reporter, "stoppable_async_tasks"):
-                        for task_id in reporter.stoppable_async_tasks():
-                            stopped = current.setdefault("async_stop_requested", set())
-                            if task_id in stopped:
-                                continue
-                            execution = reserved.get("execution_id")
-
-                            def may_stop(
-                                task_id=task_id,
-                                owned=owned,
-                                expected=expected,
-                                key=key,
-                                execution=execution,
-                                reporter=reporter,
-                            ):
-                                return (
-                                    self.gateway._reports.get(expected) is owned
-                                    and self.ownership.get(key) is owned
-                                    and owned.get("execution_id") == execution
-                                    and key not in self.reserving
-                                    and reporter.owns_async_task(task_id)
-                                )
-
-                            accepted = await self.gateway.sessions.stop_async_task(
-                                binding["thread_id"],
-                                task_id,
-                                expected_session=expected,
-                                expected_epoch=reserved.get("native_epoch"),
-                                guard=may_stop,
-                            )
-                            if accepted:
-                                stopped.add(task_id)
-                    await self.gateway.sessions.cancel(
-                        binding["thread_id"],
-                        expected_session=expected,
-                        expected_epoch=target.get("evidence", {}).get("native_epoch"),
-                        guard=lambda expected=expected, owned=owned: (
-                            self.gateway._reports.get(expected) is owned
-                        ),
-                    )
+                    async with asyncio.timeout(3):
+                        await self.gateway.sessions.cancel(
+                            binding["thread_id"],
+                            expected_session=expected,
+                            expected_epoch=reserved.get("native_epoch"),
+                            guard=may_cancel,
+                        )
                 except NativeDispatchChanged:
                     await self.update(
                         item, "blocked", "Native ownership changed before cancellation"
                     )
                     return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning("Native cancellation remains unresolved")
             elif expected and record is not None and record.session_id != expected:
                 await self.update(item, "blocked", "Native session changed; preserve other work")
                 return

@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
@@ -34,9 +35,9 @@ _DEFAULT_RPC_TIMEOUT_S = 120.0
 # produce no ACP events for several minutes.
 _DEFAULT_PROMPT_IDLE_TIMEOUT_S = 900.0
 
-# Absolute ceiling for one prompt turn regardless of activity.
-# Override with ACP_PROMPT_HARD_MAX_SEC.
-_DEFAULT_PROMPT_HARD_MAX_S = 7200.0
+# Active turns have no absolute deadline by default. Operators can opt into
+# a finite ceiling with ACP_PROMPT_HARD_MAX_SEC; zero disables that ceiling.
+_DEFAULT_PROMPT_HARD_MAX_S = 0.0
 
 _TOOL_DONE_STATUSES = frozenset(
     {"completed", "cancelled", "canceled", "success", "failed", "error"}
@@ -52,6 +53,17 @@ def _env_float(name: str, default: float) -> float:
     except ValueError:
         return default
     return val if val > 0 else default
+
+
+def _prompt_hard_max() -> float:
+    raw = (
+        os.environ.get("ACP_PROMPT_HARD_MAX_SEC")
+        or os.environ.get("GROK_ACP_PROMPT_HARD_MAX_SEC", "")
+    ).strip()
+    value = float(raw) if raw else _DEFAULT_PROMPT_HARD_MAX_S
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("ACP_PROMPT_HARD_MAX_SEC must be finite and nonnegative")
+    return value
 
 
 def is_tool_complete_update(update: SessionUpdate) -> bool:
@@ -245,10 +257,10 @@ class AcpBroker:
             else _env_float("ACP_PROMPT_IDLE_TIMEOUT_SEC", _DEFAULT_PROMPT_IDLE_TIMEOUT_S)
         )
         self.prompt_hard_max_s = (
-            prompt_hard_max_s
-            if prompt_hard_max_s is not None
-            else _env_float("ACP_PROMPT_HARD_MAX_SEC", _DEFAULT_PROMPT_HARD_MAX_S)
+            prompt_hard_max_s if prompt_hard_max_s is not None else _prompt_hard_max()
         )
+        if not math.isfinite(self.prompt_hard_max_s) or self.prompt_hard_max_s < 0:
+            raise ValueError("prompt_hard_max_s must be finite and nonnegative")
 
         self._proc: asyncio.subprocess.Process | None = None
         self._native_spawned = initial_native_uncertainty
@@ -479,9 +491,12 @@ class AcpBroker:
         self._pending[req_id] = fut
 
         msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
-        # None → control-plane default. session/prompt passes a hard max; idle
-        # kill for prompts is owned by prompt_turn (resets on tool completion).
+        # None selects the control-plane default. Only session/prompt can
+        # explicitly disable its absolute ceiling with zero; prompt_turn still
+        # enforces inactivity independently.
         wait_s = self.rpc_timeout_s if timeout is None else timeout
+        if method == "session/prompt" and timeout == 0:
+            wait_s = None
         try:
             if guard is None and on_write is None:
                 await self._write(msg)
@@ -734,8 +749,8 @@ class AcpBroker:
         wall for the whole turn. The idle clock resets whenever a tool call
         completes (and when the agent streams message/thought chunks so a
         long final answer does not get killed). Synthetic heartbeats do not
-        reset it. A separate hard max (default 2h) still bounds pathological
-        turns.
+        reset it. There is no default absolute ceiling on active turns.
+        Operators can opt into a finite hard maximum.
         """
         async with self._turn_lock(session_id):
             q: asyncio.Queue[SessionUpdate | None] = asyncio.Queue()
@@ -778,6 +793,33 @@ class AcpBroker:
 
             last_heartbeat = turn_started
             result: Any = None
+
+            async def enforce_idle(now):
+                if not prompt_task.done() and now - last_progress >= idle_s:
+                    logger.warning(
+                        "session/prompt idle timeout session=%s idle=%.0fs",
+                        session_id,
+                        idle_s,
+                    )
+                    try:
+                        await self.cancel(session_id)
+                    except Exception:
+                        logger.debug(
+                            "session/cancel after idle timeout failed",
+                            exc_info=True,
+                        )
+                    if not prompt_task.done():
+                        prompt_task.cancel()
+                        try:
+                            await prompt_task
+                        except (asyncio.CancelledError, AcpError):
+                            pass
+                    raise AcpError(
+                        f"RPC idle timeout: session/prompt "
+                        f"(no tool completion or agent output for "
+                        f"{idle_s:.0f}s)"
+                    ) from None
+
             try:
                 while True:
                     if prompt_task.done() and q.empty():
@@ -788,31 +830,7 @@ class AcpBroker:
                         if prompt_task.done() and q.empty():
                             break
                         now = loop.time()
-                        # Idle kill: no tool completion / agent output for idle_s.
-                        if now - last_progress >= idle_s:
-                            logger.warning(
-                                "session/prompt idle timeout session=%s idle=%.0fs",
-                                session_id,
-                                idle_s,
-                            )
-                            try:
-                                await self.cancel(session_id)
-                            except Exception:
-                                logger.debug(
-                                    "session/cancel after idle timeout failed",
-                                    exc_info=True,
-                                )
-                            if not prompt_task.done():
-                                prompt_task.cancel()
-                                try:
-                                    await prompt_task
-                                except (asyncio.CancelledError, AcpError):
-                                    pass
-                            raise AcpError(
-                                f"RPC idle timeout: session/prompt "
-                                f"(no tool completion or agent output for "
-                                f"{idle_s:.0f}s)"
-                            ) from None
+                        await enforce_idle(now)
                         # Periodic heartbeat so chat status doesn't look frozen
                         # during long tool/model phases with no session/update traffic.
                         # Heartbeats intentionally do NOT reset last_progress.
@@ -854,6 +872,9 @@ class AcpBroker:
                     if item.model_id:
                         model_id = item.model_id
 
+                    # Nonprogress notifications must not keep a stalled turn
+                    # alive merely by keeping its update queue nonempty.
+                    await enforce_idle(loop.time())
                     if on_update is not None:
                         await on_update(item)
                         last_heartbeat = loop.time()

@@ -90,7 +90,7 @@ async def test_shared_root_requests_select_a_project_with_both_members(admission
             },
         )
     for peer in reversed(peers):
-        text = "@" + peer + " ASK: Verify this project's dependency"
+        text = "@" + peer + " ASK [" + projects[peer]["id"] + "]: Verify this project's dependency"
         post_id = "shared-request-" + peer
         state["posts"][post_id] = {
             "id": post_id,

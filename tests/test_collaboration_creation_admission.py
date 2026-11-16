@@ -26,6 +26,7 @@ async def admission_api(tmp_path):
             "channel_id": body["channel_id"],
             "user_id": actors[actor]["user_id"],
             "props": dict(body["props"]),
+            "create_at": int(state.get("mm_now", state["now"]) * 1000),
         }
         state["roots"]["discussion"] = root
         return root
@@ -70,8 +71,9 @@ async def admission_api(tmp_path):
         store.close()
 
 
-def source_post(state, post_id, timestamp, *, thread="discussion"):
-    text = "@beta ASK: Verify the generation"
+def source_post(state, post_id, timestamp, *, thread="discussion", project_id=None):
+    scope = " [" + project_id + "]" if project_id else ""
+    text = "@beta ASK" + scope + ": Verify the generation"
     state["posts"][post_id] = {
         "id": post_id,
         "user_id": "alpha-user",
@@ -182,12 +184,12 @@ async def test_old_never_admitted_post_cannot_enter_replacement_generation(admis
     replacement = await clients["alpha"].request(
         "POST", "/creations", {**creation_body(), "key": "replacement", "thread_id": "discussion"}
     )
-    with pytest.raises(HubError, match="predates this project discussion generation"):
+    with pytest.raises(HubError, match="discussion generation"):
         await clients["beta"].request("POST", "/mentions", {**old_body, "create_at": 9999999999999})
     assert replacement["created"] == 1002.0 and replacement["dispatched"] == 0
     assert store.show(replacement["id"], "alpha")["messages"] == []
     assert store.show(first["id"], "alpha")["messages"] == []
-    fresh = source_post(state, "new-generation", 1002001)
+    fresh = source_post(state, "new-generation", 1002001, project_id=replacement["id"])
     admitted = await clients["beta"].request("POST", "/mentions", fresh)
     assert admitted["project"] == replacement["id"] and admitted["state"] == "queued"
 
@@ -263,3 +265,26 @@ async def test_post_admission_matches_mattermost_millisecond_precision(admission
     same_ms = source_post(state, "same-ms", 1000000)
     admitted = await clients["beta"].request("POST", "/mentions", same_ms)
     assert admitted["project"] == created["id"] and admitted["state"] == "queued"
+
+
+@pytest.mark.parametrize("hub_now", [10.0, 1000000.0])
+async def test_reused_discussion_scope_is_independent_of_hub_clock(admission_api, hub_now):
+    store, clients, state = admission_api
+    state["mm_now"] = 5000.0
+    first = await clients["alpha"].request("POST", "/creations", creation_body())
+    old = source_post(state, "old-generation", 5000001, project_id=first["id"])
+    store.cancel(first["id"], "alpha")
+    state["now"] = hub_now
+    replacement = await clients["alpha"].request(
+        "POST", "/creations", {**creation_body(), "key": "new-scope", "thread_id": "discussion"}
+    )
+    with pytest.raises(HubError):
+        await clients["beta"].request("POST", "/mentions", old)
+    unscoped = source_post(state, "unscoped-generation", 5000002)
+    with pytest.raises(HubError, match="discussion generation"):
+        await clients["beta"].request("POST", "/mentions", unscoped)
+    fresh = source_post(state, "fresh-generation", 5000003, project_id=replacement["id"])
+    # A supplied JSON scope cannot substitute for the scope in the real post.
+    admitted = await clients["beta"].request("POST", "/mentions", {**fresh, "project": first["id"]})
+    assert admitted["project"] == replacement["id"]
+    assert len(store.show(replacement["id"], "alpha")["messages"]) == 1

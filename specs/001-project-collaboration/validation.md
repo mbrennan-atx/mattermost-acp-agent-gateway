@@ -132,3 +132,28 @@ Parent inspected the finalized public Sol/high report at source 6f128bd and inte
 Child async-task capabilities retain verified initial tool ownership and route stop requests through the root native session. Settings commits share preparation locking with replacement. Persisted Linux BOOTTIME and boot UUID bound project elapsed budgets from creation admission across same-boot hub restart; unknown or different-boot evidence cancels further work while preserving native execution debt.
 
 The parent's 38 new integrated regressions pass. 73 settings/subagent/reporting/elapsed cases and 81 core/state/stop-order cases pass. The worker independently passes 555 distinct consumer/recovery tests, including 22 new cases; baseline source fails 13 of those 22. Eight parent settings/child cases and eight elapsed cases cover the remaining corrections. Ruff and diff checks pass. The complete public suite is running; immutable build, refreshed full-branch review, final-source CI and live acceptance remain required. None of these checks activates services or changes provider/model/connector state.
+
+## Final review corrections and long prompt lifetime
+
+Matthew required completion of the rollout and removal of the recurring two-hour
+prompt failure. Active prompts now have no default absolute ceiling; zero
+explicitly disables it, finite positive caps remain available, and malformed or
+nonfinite caps refuse. Real inactivity still cancels the native prompt, including
+when heartbeat/usage notifications keep the queue busy. Control RPC deadlines
+remain separate. Thirty-three new cases have 23 baseline failures and ten controls;
+all 67 new/existing broker cases pass against the candidate.
+
+The finalized public review supports six further defects; its replay proposal
+was excluded by synthesis because installed native emission evidence is missing.
+Mailbox receipts distinguish server waiting before the remaining-budget snapshot
+from transport delay. Child-stop errors cannot skip independently guarded parent
+cancellation, and later ownership release removes its cancellation marker.
+Mention generation uses verified Mattermost root timestamps and an explicit
+project ID on reused discussions, removing independent wall-clock comparisons.
+The standalone harness-switch CLI defers default restart without native admission
+proof. Empty URL delimiters refuse before endpoint construction.
+
+The cancellation worker passes 321 affected cases, including all 31 new cases
+(16 baseline failures and 15 controls). The parent passes all six live-HTTP/CLI
+regressions. Final combined tests, immutable packaging, full-branch review,
+source CI and real delivery/cancellation/continuity acceptance remain required.

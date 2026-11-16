@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
-from mattermost_acp.collaboration.store import CollaborationStore
+from mattermost_acp.collaboration.store import CollaborationStore, elapsed_clock
 from mattermost_acp.mm.chunk import DEFAULT_LIMIT
 
 
@@ -269,6 +269,9 @@ def build_app(
                 raise ValueError("Discussion read-back did not match its root binding")
             if intent.get("creation_id"):
                 verify_correlated_root(verified, actor, intent, intent["thread_id"])
+            created_at = verified.get("create_at")
+            if type(created_at) is int and created_at > 0:
+                intent["discussion_created_at"] = created_at
             return web.json_response(store.finish_creation(actor, intent))
 
     async def show(request):
@@ -356,6 +359,7 @@ def build_app(
         )
 
     async def mailbox(request):
+        started = elapsed_clock()
         instance = request.query.get("instance", "")
         if not instance or len(instance) > 128:
             raise ValueError("Worker instance required")
@@ -367,6 +371,9 @@ def build_app(
             mode = admission_fences.get((request["actor"], instance), "normal")
             if mode == "sealed":
                 return web.json_response(None)
+            # Measure only waiting before the budget snapshot, so response
+            # serialization cannot extend the local project deadline.
+            waited = max(0, elapsed_clock() - started)
             item = store.claim_next(
                 request["actor"], instance, controls_only=controls_only or mode == "controls"
             )
@@ -375,6 +382,8 @@ def build_app(
                 or asyncio.get_running_loop().time() >= deadline
                 or (mode == "controls" and not controls_only)
             ):
+                if item is not None:
+                    item["project_mailbox_wait_seconds"] = waited
                 return web.json_response(item)
             try:
                 # Deterministic lease/deadline checks; no model is polled or woken.
@@ -484,11 +493,12 @@ def build_app(
             "username"
         ):
             raise PermissionError("Recipient identity does not match the authenticated actor")
-        if not re.match(
-            r"^\s*@" + re.escape(recipient["username"]) + r"\s+ASK:\s+\S",
+        addressed = re.match(
+            r"^\s*@" + re.escape(recipient["username"]) + r"\s+ASK(?:\s+\[([0-9a-f]{32})\])?:\s+\S",
             verified.get("message", ""),
             re.IGNORECASE,
-        ):
+        )
+        if not addressed:
             raise PermissionError("Mention must explicitly address this actor with ASK:")
         return web.json_response(
             store.mention(
@@ -499,6 +509,7 @@ def build_app(
                 body["text"],
                 "post:" + body["post_id"],
                 post_created_at=verified.get("create_at"),
+                project_id=addressed.group(1).lower() if addressed.group(1) else None,
             )
         )
 

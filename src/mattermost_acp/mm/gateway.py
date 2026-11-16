@@ -381,7 +381,9 @@ class MattermostGateway:
             and posted.root_id
             and posted.channel_id == self.config.peer_channel_id
             and re.match(
-                r"^\s*@" + re.escape(self.client.username) + r"\s+ASK:\s+\S",
+                r"^\s*@"
+                + re.escape(self.client.username)
+                + r"\s+ASK(?:\s+\[[0-9a-f]{32}\])?:\s+\S",
                 posted.message,
                 re.IGNORECASE,
             )

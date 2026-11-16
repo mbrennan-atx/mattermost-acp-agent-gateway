@@ -167,3 +167,6 @@ tests/test_collaboration_child_lifecycle.py
 tests/test_collaboration_deadline_admission_followup.py
 tests/test_collaboration_deadline_enforcement_overlap.py
 specs/001-project-collaboration/deadline-admission-followup.md
+tests/test_broker_long_turn_timeouts.py
+tests/test_collaboration_final_review.py
+tests/test_collaboration_independent_cancellation.py

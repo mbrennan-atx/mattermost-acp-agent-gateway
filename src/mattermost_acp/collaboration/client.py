@@ -53,6 +53,8 @@ class Settings:
             or parsed.path
             or parsed.query
             or parsed.fragment
+            or "?" in url
+            or "#" in url
         ):
             raise ValueError("Collaboration URL must be a plain loopback HTTP origin")
         path = os.environ.get("MATTERMOST_COLLAB_TOKEN_FILE", "")
@@ -95,6 +97,7 @@ class HubClient:
                     status=response.status,
                 )
             result = await response.json()
+            received = elapsed_clock()
             for item in result if isinstance(result, list) else [result]:
                 if not isinstance(item, dict):
                     continue
@@ -106,7 +109,13 @@ class HubClient:
                     and math.isfinite(remaining)
                     and remaining >= 0
                 ):
-                    deadline = min(self.deadlines.get(pid, float("inf")), started + remaining)
+                    waited = item.get("project_mailbox_wait_seconds", 0)
+                    if type(waited) not in {int, float} or not math.isfinite(waited) or waited < 0:
+                        raise HubError("Invalid mailbox wait receipt")
+                    # The hub measures its wait before taking the budget
+                    # snapshot. Unaccounted transport time remains deducted.
+                    observed = started + min(waited, max(0, received - started))
+                    deadline = min(self.deadlines.get(pid, float("inf")), observed + remaining)
                     if (
                         item.get("project_admission_closed") is True
                         and item.get("project_execution_pending") is False

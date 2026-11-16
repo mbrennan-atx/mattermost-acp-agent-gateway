@@ -83,7 +83,7 @@ Unsupported busy steering leaves the message queued. A timeout or unknown inject
 
 Deployments can set `AGENT_WORKSPACE_GUARD_COMMAND` to one trusted executable path. Before native startup and session creation or resume, it receives the thread ID, canonical workspace and prior session ID (empty if there is no stored session). A failed check prevents native work. The private sidecar helper uses it to record selected workspace configuration before work and detect later changes without adopting missing evidence. The executable runs directly with literal arguments; it supplies no native goal or queue idle proof.
 
-In a registered project discussion, a participant can address a request with `@assistant-b ASK: <specific question>`. The explicit `ASK:` marker distinguishes requests from normal answers and acknowledgements. The gateway and hub verify the post's author and discussion before routing it. Existing floor threads retain their previous wake policy.
+In a registered project discussion, a participant can address a request with `@assistant-b ASK: <specific question>`. If a discussion root has hosted multiple projects, include the current ID: `@assistant-b ASK [PROJECT_ID]: <specific question>`. This identifies the project independently of server clocks. The gateway and hub verify the real post, author, recipient and discussion before routing it. Existing floor threads retain their previous wake policy.
 
 ## Working areas
 

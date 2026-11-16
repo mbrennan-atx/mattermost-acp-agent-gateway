@@ -304,7 +304,7 @@ def tag_legacy_rows(db_path: Path, harness: str) -> None:
 
 
 def wait_idle(db_path: Path, *, timeout_s: float, poll_s: float = 5.0) -> list[str]:
-    """Wait for the agent to finish in-flight turns. Returns threads still busy."""
+    """Inspect foreground turns only; this does not authorize a native restart."""
     marker = busy_path(db_path)
     deadline = time.monotonic() + timeout_s
     while True:
