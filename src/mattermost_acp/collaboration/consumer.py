@@ -188,17 +188,27 @@ class CollaborationConsumer:
         if self.workers.get(key) is completed:
             self.workers.pop(key)
 
-    async def update(self, item, state, result="", evidence=None):
+    async def update(self, item, state, result="", evidence=None, *, expected_execution_id=None):
+        if expected_execution_id is None and state not in {"dispatch", "post_dispatch"}:
+            if state != "heartbeat" or evidence:
+                known = item.get("reservation_evidence", {}).get("execution_id") or item.get(
+                    "evidence", {}
+                ).get("execution_id")
+                if known is not None:
+                    expected_execution_id = (evidence or {}).get("execution_id") or known
+        body = {
+            "instance": self.instance,
+            "state": state,
+            "result": result,
+            "evidence": evidence or {},
+            "claim": item.get("claim"),
+        }
+        if expected_execution_id is not None:
+            body["expected_execution_id"] = expected_execution_id
         return await self.hub.request(
             "POST",
             f"/messages/{item['id']}/update",
-            {
-                "instance": self.instance,
-                "state": state,
-                "result": result,
-                "evidence": evidence or {},
-                "claim": item.get("claim"),
-            },
+            body,
         )
 
     def active(self, thread):
@@ -429,7 +439,12 @@ class CollaborationConsumer:
                     continue
                 raise
             if receipt["state"] == "cancelling":
-                await self.update(parent, "heartbeat", evidence=evidence)
+                await self.update(
+                    parent,
+                    "heartbeat",
+                    evidence=evidence,
+                    expected_execution_id=receipt.get("evidence", {}).get("execution_id"),
+                )
             if receipt["state"] != "running" or key in self.cancelled_claims:
                 report["cancel_requested"] = True
         return not report.get("cancel_requested")
@@ -461,7 +476,12 @@ class CollaborationConsumer:
                 if current["state"] in {"done", "failed", "blocked", "cancelled"}
                 else "heartbeat"
             )
-            await self.update(current, state, evidence=evidence)
+            await self.update(
+                current,
+                state,
+                evidence=evidence,
+                expected_execution_id=current.get("evidence", {}).get("execution_id"),
+            )
             if self.ownership.get(key) is owned:
                 self.ownership[key] = old
         self.gateway.prune_reports()
@@ -787,12 +807,14 @@ class CollaborationConsumer:
             raise
         except HubError:
             logger.warning("Collaboration receipt rejected; shared state remains authoritative")
+            await self.wait_for_continuation(item)
         except Exception:
             logger.exception("Collaboration delivery interrupted request=%s", item["id"])
             try:
                 await self.update(item, "interrupted", "Delivery failed; reconcile before retry")
             except Exception:
                 pass
+            await self.wait_for_continuation(item)
         finally:
             renewal.cancel()
             await asyncio.gather(renewal, return_exceptions=True)
@@ -815,6 +837,30 @@ class CollaborationConsumer:
                     except Exception:
                         pass
 
+    async def wait_for_continuation(self, item):
+        if item["kind"] not in {"ask", "work"}:
+            return
+        key = (item["id"], item.get("claim"))
+        original = item.get("reservation_evidence", {}).get("execution_id")
+        owned = self.ownership.get(key)
+        if (
+            original is None
+            or owned is None
+            or owned.get("execution_id") == original
+            or owned.get("collaboration_project") != item["project"]
+        ):
+            return
+        current = await self.hub.request("GET", "/messages/" + item["id"])
+        if (
+            current.get("claim") == key[1]
+            and current.get("instance") == self.instance
+            and current.get("evidence", {}).get("execution_id") == owned.get("execution_id")
+            and current.get("execution_pending")
+        ):
+            # This handler still supervises the parent claim and renews its
+            # lease while a child-result worker owns the continued execution.
+            await self.injected_wait(item)
+
     @staticmethod
     def foreground(item, result):
         evidence = {key: value for key, value in result.items() if key != "answer"}
@@ -822,8 +868,14 @@ class CollaborationConsumer:
         if len(answer) > 8000:
             folder = Path.home() / ".local/state/mattermost-acp-collaboration/results"
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            execution = hashlib.sha256(str(result.get("execution_id") or "").encode()).hexdigest()
             path = folder / (
-                item["id"] + "-" + str(item.get("claim") or item.get("attempt", 0)) + ".txt"
+                item["id"]
+                + "-"
+                + str(item.get("claim") or item.get("attempt", 0))
+                + "-"
+                + execution
+                + ".txt"
             )
             path.write_text(answer)
             path.chmod(0o600)
@@ -913,6 +965,15 @@ class CollaborationConsumer:
             else:
                 if receipt.get("claim") == item.get("claim") and receipt.get("execution_pending"):
                     receipt = await self.undispatched(item, evidence)
+                if (
+                    receipt.get("claim") == item.get("claim")
+                    and not receipt.get("execution_pending")
+                    and receipt.get("evidence", {}).get("execution_id") != evidence["execution_id"]
+                ):
+                    if prior_reservation is None:
+                        item.pop("reservation_evidence", None)
+                    else:
+                        item["reservation_evidence"] = prior_reservation
                 if receipt["state"] == "running":
                     await self.update(item, "queued")
                 self.release_ownership(key)

@@ -1,6 +1,7 @@
 """Native dispatch tracking, rebound ownership and acyclic delegation contracts."""
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -13,7 +14,7 @@ from test_collaboration import (
     execution_report,
     project,
 )
-from test_collaboration_continuation_review import terminal
+from test_collaboration_continuation_review import retained_parent, terminal
 from test_collaboration_dispatch_review import close_reports, native_gateway
 
 from mattermost_acp.acp import TurnResult
@@ -679,3 +680,228 @@ async def test_rejected_dispatch_with_failed_read_recovers_on_ownership_reconcil
     finally:
         await consumer.close()
         await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["heartbeat", "evidence", "done", "failed", "cancelled", "execution_settled"],
+)
+async def test_hub_native_receipt_updates_match_current_execution_atomically(tmp_path, state):
+    async with retained_parent(tmp_path) as (store, clients, _gateway, consumer, p, parent, _old):
+        old_receipt = terminal()
+        store.update(
+            parent["id"],
+            "beta",
+            consumer.instance,
+            "dispatch",
+            evidence={"session_id": "existing-native", "execution_id": "continued-execution"},
+            claim=parent["claim"],
+        )
+        if state in {"evidence", "execution_settled"}:
+            store.reply(parent["id"], "beta", "Continued result", claim=parent["claim"])
+        before = store.show(p["id"], "alpha")
+        with pytest.raises(HubError, match="HTTP 409"):
+            await clients["beta"].request(
+                "POST",
+                f"/messages/{parent['id']}/update",
+                {
+                    "instance": consumer.instance,
+                    "claim": parent["claim"],
+                    "state": state,
+                    "result": "Stale foreground result",
+                    "evidence": old_receipt,
+                },
+            )
+        assert store.show(p["id"], "alpha") == before
+
+
+@pytest.mark.parametrize("state", ["queued", "interrupted", "unconfirmed"])
+async def test_hub_recovery_update_cannot_change_a_continued_execution(tmp_path, state):
+    async with retained_parent(tmp_path) as (store, clients, _gateway, consumer, p, parent, _old):
+        store.update(
+            parent["id"],
+            "beta",
+            consumer.instance,
+            "dispatch",
+            evidence={"session_id": "existing-native", "execution_id": "continued-execution"},
+            claim=parent["claim"],
+        )
+        before = store.show(p["id"], "alpha")
+        with pytest.raises(HubError, match="HTTP 409"):
+            await clients["beta"].request(
+                "POST",
+                f"/messages/{parent['id']}/update",
+                {
+                    "instance": consumer.instance,
+                    "claim": parent["claim"],
+                    "state": state,
+                    "result": "Old handler stopped",
+                    "expected_execution_id": "parent-execution",
+                },
+            )
+        assert store.show(p["id"], "alpha") == before
+
+
+@pytest.mark.parametrize(
+    "race",
+    ["before_get", "after_get", "before_update", "read_error", "artifact_error", "cancel_handler"],
+)
+@pytest.mark.parametrize("early_reply", [False, True])
+async def test_stale_parent_handler_preserves_continuation_and_native_settlement(
+    tmp_path, race, early_reply
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway, broker, _writer = native_gateway(tmp_path)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.sessions.store.get = AsyncMock(
+        return_value=SimpleNamespace(session_id="existing-native", harness="claude")
+    )
+    broker.capabilities.steering = False
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    original_request, original_foreground = consumer.hub.request, consumer.foreground
+    old_blocked, release_old = asyncio.Event(), asyncio.Event()
+    continued_started, release_continued = asyncio.Event(), asyncio.Event()
+    stale_rejected = asyncio.Event()
+    executions = []
+    delayed = False
+    parent_task = continuation_task = None
+    try:
+        p = project(store)
+        requested = ask(store, p["id"])
+        parent = store.claim_next("beta", consumer.instance)
+
+        async def native(_thread, _text, **options):
+            assert await options["before_prompt"]("existing-native")
+            assert options["dispatch_guard"]()
+            executions.append(gateway._reports["existing-native"]["execution_id"])
+            if len(executions) == 2:
+                continued_started.set()
+                await release_continued.wait()
+            return TurnResult("existing-native", "end_turn", "Native answer", "")
+
+        async def delayed_request(method, path, body=None):
+            nonlocal delayed
+            is_old = asyncio.current_task().get_name() == "stale-parent"
+            is_parent = path in {
+                "/messages/" + requested["id"],
+                f"/messages/{requested['id']}/update",
+            }
+            if is_old and is_parent and executions and not delayed:
+                if method == "GET" and race != "before_update":
+                    delayed = True
+                    receipt = (
+                        await original_request(method, path, body) if race != "before_get" else None
+                    )
+                    old_blocked.set()
+                    await release_old.wait()
+                    if race == "read_error":
+                        raise TimeoutError("Old parent receipt read failed")
+                    return (
+                        receipt
+                        if receipt is not None
+                        else await original_request(method, path, body)
+                    )
+                if (
+                    method == "POST"
+                    and race == "before_update"
+                    and body.get("state") == "heartbeat"
+                    and body.get("evidence", {}).get("execution_id") == executions[0]
+                ):
+                    delayed = True
+                    old_blocked.set()
+                    await release_old.wait()
+            try:
+                return await original_request(method, path, body)
+            except HubError as exc:
+                if (
+                    is_old
+                    and path == f"/messages/{requested['id']}/update"
+                    and body.get("expected_execution_id") == executions[0]
+                    and exc.status == 409
+                ):
+                    stale_rejected.set()
+                raise
+
+        def foreground(item, receipt):
+            if race == "artifact_error" and item["id"] == requested["id"]:
+                if receipt.get("execution_id") == executions[0]:
+                    raise OSError("Old parent artifact write failed")
+            return original_foreground(item, receipt)
+
+        gateway.sessions.run_turn = AsyncMock(side_effect=native)
+        consumer.hub.request, consumer.foreground = delayed_request, foreground
+        parent_task = asyncio.create_task(consumer.handle(parent), name="stale-parent")
+        await asyncio.wait_for(old_blocked.wait(), 2)
+        child = ask(store, p["id"], sender="beta", recipient="gamma", parent=requested["id"])
+        child_claim = store.claim_next("gamma", "peer")
+        store.reply(child["id"], "gamma", "Peer result", claim=child_claim["claim"])
+        delivery = store.claim_next("beta", consumer.instance)
+        continuation_task = asyncio.create_task(consumer.handle(delivery), name="continued-parent")
+        await asyncio.wait_for(continued_started.wait(), 2)
+        assert executions[0] != executions[1]
+        current_report = gateway._reports["existing-native"]
+        if early_reply:
+            store.reply(requested["id"], "beta", "Continued result", claim=parent["claim"])
+        if race == "cancel_handler":
+            parent_task.cancel()
+        release_old.set()
+        await asyncio.wait_for(stale_rejected.wait(), 2)
+        current = store.get_message(requested["id"], "beta")
+        assert current["state"] == ("done" if early_reply else "running")
+        assert current["execution_pending"] and "recovery" not in current
+        assert current["evidence"]["execution_id"] == executions[1]
+        assert consumer.ownership[(requested["id"], parent["claim"])] is current_report
+        assert current_report["active"]
+        if race != "cancel_handler":
+            assert not parent_task.done(), (
+                "The original parent still supervises its continued claim"
+            )
+        # Claim-scoped lease renewal remains valid across native continuation.
+        if not early_reply:
+            renewed = await consumer.update(parent, "heartbeat")
+            assert renewed["state"] == current["state"]
+            assert renewed["evidence"]["execution_id"] == executions[1]
+        if not early_reply:
+            store.reply(requested["id"], "beta", "Continued result", claim=parent["claim"])
+        release_continued.set()
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(parent_task, continuation_task, return_exceptions=True), 4
+        )
+        if race == "cancel_handler":
+            assert isinstance(outcomes[0], asyncio.CancelledError)
+        else:
+            assert outcomes[0] is None
+        assert outcomes[1] is None
+        await consumer.reconcile_ownership()
+        settled = store.get_message(requested["id"], "beta")
+        assert settled["state"] == "done" and settled["result"] == "Continued result"
+        assert settled["evidence"]["execution_id"] == executions[1]
+        assert not settled["execution_pending"] and not consumer.owns_thread("discussion")
+        followup = ask(store, p["id"], key="followup")
+        assert store.claim_next("beta", consumer.instance)["id"] == followup["id"]
+    finally:
+        release_old.set()
+        release_continued.set()
+        tasks = [task for task in (parent_task, continuation_task) if task]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await close_reports(gateway)
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+def test_continued_foreground_artifact_survives_a_late_old_receipt(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    item = {"id": "request", "claim": "same-claim"}
+    continued = CollaborationConsumer.foreground(
+        item, {"answer": "C" * 9000, "execution_id": "continued-execution"}
+    )
+    old = CollaborationConsumer.foreground(
+        item, {"answer": "O" * 9000, "execution_id": "old-execution"}
+    )
+    assert old["result_file"] != continued["result_file"]
+    assert Path(continued["result_file"]).read_text() == "C" * 9000
+    assert Path(old["result_file"]).read_text() == "O" * 9000

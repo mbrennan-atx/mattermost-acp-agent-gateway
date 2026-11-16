@@ -617,7 +617,18 @@ class CollaborationStore:
                 }
             return None
 
-    def update(self, mid, actor, instance, state, result="", evidence=None, claim=None):
+    def update(
+        self,
+        mid,
+        actor,
+        instance,
+        state,
+        result="",
+        evidence=None,
+        claim=None,
+        *,
+        expected_execution_id=None,
+    ):
         with self.transaction():
             if isinstance(result, str):
                 result = result.strip()
@@ -629,6 +640,18 @@ class CollaborationStore:
                 or (claim is not None and claim != item.get("claim"))
             ):
                 raise PermissionError("Stale or foreign worker instance")
+            if (
+                expected_execution_id is None
+                and state not in {"dispatch", "post_dispatch"}
+                and item.get("evidence", {}).get("execution_id") is not None
+            ):
+                expected_execution_id = (evidence or {}).get("execution_id")
+            if expected_execution_id is not None:
+                expected_execution_id = text(expected_execution_id, "expected execution ID", 200)
+                if item.get("evidence", {}).get("execution_id") != expected_execution_id:
+                    if state == "execution_settled":
+                        raise ValueError("Native settlement must match the reserved execution")
+                    raise ValueError("Native execution changed before update")
             if state in {"evidence", "execution_settled", "undispatched"}:
                 if state == "undispatched":
                     receipt = evidence or {}

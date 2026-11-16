@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
+
 from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpError, SessionUpdate
 from mattermost_acp.acp.broker import NativeDispatchChanged
@@ -19,6 +21,7 @@ from mattermost_acp.attachments import (
     save_files,
 )
 from mattermost_acp.channel_context import load_role_text, wrap_user_prompt
+from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.commands.defs import (
     TEXT_COMMANDS,
     help_text,
@@ -387,6 +390,13 @@ class MattermostGateway:
                     reason,
                 )
             return
+        if (
+            self.collaboration is not None
+            and posted.root_id
+            and posted.channel_id == self.config.peer_channel_id
+            and not await self._ordinary_floor_reply_allowed(posted)
+        ):
+            return
         content = (posted.message or "").strip()
         if not content and not posted.file_ids:
             return
@@ -418,6 +428,27 @@ class MattermostGateway:
             author_name=str(posted.raw.get("user_id") or posted.user_id),
             has_attachments=bool(posted.file_ids),
         )
+
+    async def _ordinary_floor_reply_allowed(self, posted: PostedEvent) -> bool:
+        """Allow ordinary wake only after confirming an unregistered discussion."""
+        try:
+            result = await self.collaboration.hub.request(
+                "POST",
+                "/mentions",
+                {
+                    # An unknown author selects the hub's read-only fallback.
+                    # Registered discussions reject before any work is created.
+                    "author_id": None,
+                    "channel_id": posted.channel_id,
+                    "thread_id": posted.root_id,
+                    "post_id": posted.post_id,
+                    "text": posted.message,
+                },
+            )
+        except (HubError, aiohttp.ClientError, TimeoutError, ValueError):
+            logger.info("ordinary floor wake suppressed post=%s", posted.post_id)
+            return False
+        return result is None
 
     async def handle_slash(self, req: SlashRequest) -> dict[str, str]:
         self._active_controls += 1

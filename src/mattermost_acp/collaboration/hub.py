@@ -206,6 +206,7 @@ def build_app(
                 body.get("result", ""),
                 body.get("evidence"),
                 body.get("claim"),
+                expected_execution_id=body.get("expected_execution_id"),
             )
         elif action == "reply":
             result = store.reply(

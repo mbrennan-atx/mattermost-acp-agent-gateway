@@ -45,6 +45,10 @@ Workspace guards run before native startup and session creation or resume. Reuse
 
 Warmed native clients without authoritative goal and queue idle evidence report `native_boundary_unknown`. Maintenance counts that uncertainty as pending and refuses sealing, retirement or refresh even after foreground and correlated answers finish or ACP exits. Normal collaboration remains available. Cold sidecars can be retired before their first native task.
 
+Atomic expected-execution checks fence stale foreground evidence, settlement and fallback errors after a correlated result reserves a newer continuation. The parent handler keeps renewing and supervising that claim until the continued execution settles. Long-result artifacts include the execution generation, so a delayed older result cannot overwrite the continuation output. Declined preparation discards only its unaccepted provisional reservation. Twenty-two additional regressions cover paused GET/POST races, errors, cancellation and valid continued settlement.
+
+Ordinary floor wake admission now requires an authoritative unregistered-discussion result from the read-only unknown-author lookup. Registered acknowledgements, malformed lookup responses and unavailable lookup services stay quiet. Explicit project ASK handling and ordinary unregistered/home routing remain available. The worker affected checks pass 381 collaboration/filter cases and 70 delivery/admission/filter cases; a parent full-suite rerun is in progress.
+
 ## Release acceptance still required
 
 SC-001 through SC-003 require live evidence. Local tests establish implementation behavior, not fleet activation or production capacity.
