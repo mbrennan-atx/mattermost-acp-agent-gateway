@@ -221,8 +221,8 @@ async def test_native_gemini_direct_adapter_session_keeps_unknown_idle_boundary(
     )
     actual_write = b._write
 
-    async def written(message, *, guard=None):
-        await actual_write(message, guard=guard)
+    async def written(message, *, guard=None, on_write=None):
+        await actual_write(message, guard=guard, on_write=on_write)
         writes.append(message)
 
     b._write = written

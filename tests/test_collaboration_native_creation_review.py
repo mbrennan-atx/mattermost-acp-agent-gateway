@@ -9,8 +9,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from fake_agent import spawn_fake_agent_process
-from test_collaboration import FakeMattermost, gateway_config
-from test_collaboration_regressions import close_creation, creation_api, creation_body
+from test_collaboration import FakeMattermost, ask, gateway_config, project
+from test_collaboration_dispatch_review import close_reports
+from test_collaboration_regressions import (
+    close_creation,
+    creation_api,
+    creation_body,
+    maintenance_gateway,
+)
 
 from mattermost_acp.acp.broker import (
     AcpBroker,
@@ -551,3 +557,398 @@ def test_collaboration_settings_accept_valid_loopback_tcp_ports(tmp_path, monkey
     monkeypatch.setenv("MATTERMOST_COLLAB_URL", origin)
     monkeypatch.setenv("MATTERMOST_COLLAB_TOKEN_FILE", str(credential))
     assert Settings.load().url == origin
+
+
+@pytest.mark.parametrize(
+    "pending", ["unknown", "foreground", "background", "ownership", "native_rpc"]
+)
+async def test_explicit_restart_preserves_other_thread_native_work(pending):
+    gateway = maintenance_gateway()
+    gateway.collaboration.owns_thread = lambda _thread: False
+    gateway._request_restart = AsyncMock(return_value="Synthetic restart scheduled")
+    if pending == "unknown":
+        del gateway.sessions.broker.native_boundary_idle
+    elif pending == "foreground":
+        gateway.sessions.busy_threads.add("other-project-thread")
+    elif pending == "background":
+        gateway._reports["other-session"] = {
+            "thread_id": "other-project-thread",
+            "active": False,
+            "reporter": SimpleNamespace(has_pending_work=lambda: True),
+        }
+    elif pending == "ownership":
+        gateway.collaboration.ownership = {("other-request", "claim"): None}
+    else:
+        gateway.sessions.broker._pending[1] = object()
+    await command(gateway, "restart")
+    tasks = list(gateway._slash_tasks)
+    assert tasks
+    await asyncio.wait_for(asyncio.gather(*tasks), 2)
+    gateway._request_restart.assert_not_awaited()
+    assert not gateway.draining and not gateway.sealed
+    assert any("Restart deferred" in text for _, text, _ in gateway.client.posts)
+
+
+async def test_explicit_restart_uses_verified_idle_maintenance_transition():
+    gateway = maintenance_gateway()
+    gateway.collaboration.owns_thread = lambda _thread: False
+    gateway._request_restart = AsyncMock(return_value="Synthetic restart scheduled")
+    await command(gateway, "restart")
+    await asyncio.wait_for(asyncio.gather(*list(gateway._slash_tasks)), 2)
+    gateway._request_restart.assert_awaited_once_with(
+        thread_id="discussion",
+        channel_id="floor",
+        user_id="human-user",
+        reason="slash_restart",
+    )
+    assert gateway.draining and gateway.sealed
+    assert [call.args[0] for call in gateway.collaboration.set_admission.await_args_list] == [
+        "controls",
+        "sealed",
+    ]
+
+
+async def test_explicit_restart_waits_for_originating_reply_to_settle():
+    gateway = maintenance_gateway()
+    gateway.collaboration.owns_thread = lambda _thread: False
+    gateway._request_restart = AsyncMock(return_value="Synthetic restart scheduled")
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = gateway.client.create_post
+
+    async def reply(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    gateway.client.create_post = reply
+    task = asyncio.create_task(command(gateway, "restart"))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert gateway._active_controls == 1 and not gateway._slash_tasks
+        gateway._request_restart.assert_not_awaited()
+        release.set()
+        await asyncio.wait_for(task, 2)
+        await asyncio.wait_for(asyncio.gather(*list(gateway._slash_tasks)), 2)
+        gateway._request_restart.assert_awaited_once()
+        assert gateway.draining and gateway.sealed
+    finally:
+        release.set()
+        await asyncio.gather(task, *list(gateway._slash_tasks), return_exceptions=True)
+
+
+@pytest.mark.parametrize("preparation", [1, 2])
+async def test_ordinary_native_preparation_carries_admission_through_workspace_wait(
+    native, preparation
+):
+    gateway, svc = native.gateway, native.sessions
+    gateway.collaboration = ownership()
+    calls = 0
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def guard(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == preparation:
+            entered.set()
+            await release.wait()
+
+    svc.workspace_guard = guard
+    task = asyncio.create_task(
+        gateway.run_prompt(
+            thread_id="discussion",
+            channel_id="floor",
+            prompt="Ordinary follow-up",
+            author_id="human-user",
+            author_name="human",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        writes = list(native.writes)
+        gateway.collaboration_recovery_pending = True
+        release.set()
+        assert await asyncio.wait_for(task, 3) is None
+        assert native.writes == writes
+        assert not svc.is_busy("discussion")
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await close_reports(gateway)
+
+
+async def test_refused_ordinary_prompt_restores_predecessor_cancellation_epoch(native):
+    gateway, svc = native.gateway, native.sessions
+    gateway.collaboration = ownership()
+    record = await svc.store.get("discussion")
+    predecessor = {
+        "execution_id": "prior-execution",
+        "collaboration_project": "prior-project",
+        "thread_id": "discussion",
+        "channel_id": "floor",
+        "active": False,
+        "foreground_complete": True,
+        "native_dispatched": True,
+        "reporter": SimpleNamespace(has_pending_work=lambda: False),
+        "task": None,
+    }
+    gateway._reports[record.session_id] = predecessor
+    epoch = svc.native_epoch("discussion")
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def guard(*_args):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            await release.wait()
+
+    svc.workspace_guard = guard
+    task = asyncio.create_task(
+        gateway.run_prompt(
+            thread_id="discussion",
+            channel_id="floor",
+            prompt="Ordinary follow-up",
+            author_id="human-user",
+            author_name="human",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert gateway._reports[record.session_id] is not predecessor
+        gateway.collaboration = ownership(owned=True)
+        release.set()
+        assert await asyncio.wait_for(task, 3) is None
+        assert gateway._reports[record.session_id] is predecessor
+        assert svc.native_epoch("discussion") == epoch
+        native.writes.clear()
+        assert await svc.cancel(
+            "discussion", expected_session=record.session_id, expected_epoch=epoch
+        )
+        assert [item["method"] for item in native.writes] == ["session/cancel"]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await close_reports(gateway)
+
+
+async def test_native_start_rechecks_admission_after_awaited_start_marker(tmp_path):
+    admitted = True
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def mark():
+        entered.set()
+        await release.wait()
+
+    factory = AsyncMock(side_effect=spawn_fake_agent_process)
+    broker = AcpBroker(process_factory=factory, on_native_start=mark)
+
+    async def start():
+        with native_command_admission(lambda: admitted):
+            return await broker.start()
+
+    task = asyncio.create_task(start())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        admitted = False
+        release.set()
+        with pytest.raises(NativeDispatchChanged):
+            await asyncio.wait_for(task, 2)
+        factory.assert_not_awaited()
+        assert broker._proc is None and broker._reader_task is None
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await broker.stop()
+
+
+@pytest.mark.parametrize("revoke", ["spawn", "initialize-write", "authentication"])
+async def test_refused_native_initialization_retains_one_process_for_admitted_retry(
+    revoke, tmp_path
+):
+    admitted = True
+    processes = []
+    writes = []
+    broker = None
+
+    async def factory(argv):
+        nonlocal admitted
+        process = await spawn_fake_agent_process(argv)
+        processes.append(process)
+        original = process.stdin.write
+
+        def write(payload):
+            writes.append(json.loads(payload))
+            original(payload)
+
+        process.stdin.write = write
+        if revoke == "spawn":
+            admitted = False
+        return process
+
+    broker = AcpBroker(
+        process_factory=factory, backend="cursor" if revoke == "authentication" else "grok"
+    )
+    request = broker.request
+    entered = asyncio.Event()
+
+    async def rpc(method, *args, **kwargs):
+        nonlocal admitted
+        if method == "initialize":
+            entered.set()
+        result = await request(method, *args, **kwargs)
+        if method == "initialize" and revoke == "authentication":
+            admitted = False
+        return result
+
+    broker.request = rpc
+
+    async def start():
+        with native_command_admission(lambda: admitted):
+            return await broker.start()
+
+    if revoke == "initialize-write":
+        await broker._write_lock.acquire()
+    task = asyncio.create_task(start())
+    try:
+        if revoke == "initialize-write":
+            await asyncio.wait_for(entered.wait(), 2)
+            async with asyncio.timeout(2):
+                while not broker._write_lock._waiters:
+                    await asyncio.sleep(0)
+            admitted = False
+            broker._write_lock.release()
+        with pytest.raises(NativeDispatchChanged):
+            await asyncio.wait_for(task, 2)
+        assert len(processes) == 1 and broker._proc is processes[0]
+        assert broker.is_running and not broker._started
+        assert (
+            writes == []
+            if revoke != "authentication"
+            else [item["method"] for item in writes] == ["initialize"]
+        )
+        reader = broker._reader_task
+        admitted = True
+        await broker.start()
+        assert len(processes) == 1 and broker._proc is processes[0]
+        assert broker._reader_task is reader and broker._started
+        assert [item["method"] for item in writes].count("initialize") == 1
+    finally:
+        if broker._write_lock.locked():
+            broker._write_lock.release()
+        await asyncio.gather(task, return_exceptions=True)
+        await broker.stop()
+        assert all(process.returncode is not None for process in processes)
+
+
+async def test_uncertain_accepted_initialization_cannot_relaunch_or_replay(tmp_path):
+    factory = AsyncMock(side_effect=spawn_fake_agent_process)
+    broker = AcpBroker(process_factory=factory)
+    request = broker.request
+
+    async def lost_result(method, *args, **kwargs):
+        await request(method, *args, **kwargs)
+        raise AcpError("Synthetic initialization result loss")
+
+    broker.request = lost_result
+    try:
+        with pytest.raises(AcpError, match="initialization result loss"):
+            await broker.start()
+        process, reader = broker._proc, broker._reader_task
+        broker.request = request
+        with pytest.raises(AcpError, match="initialization is unconfirmed"):
+            await broker.start()
+        assert factory.await_count == 1
+        assert broker._proc is process and broker._reader_task is reader
+        assert broker.is_running and not broker._started
+    finally:
+        await broker.stop()
+
+
+async def test_ordinary_preparation_cannot_swallow_refused_model_pin(native):
+    svc, gateway = native.sessions, native.gateway
+    await svc.switch_model("discussion", "grok-4.5")
+    gateway.collaboration = ownership()
+    native.writes.clear()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = native.broker.set_model
+
+    async def set_model(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    native.broker.set_model = set_model
+    task = asyncio.create_task(
+        gateway.run_prompt(
+            thread_id="discussion",
+            channel_id="floor",
+            prompt="Ordinary follow-up",
+            author_id="human-user",
+            author_name="human",
+        )
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        gateway.collaboration_recovery_pending = True
+        release.set()
+        assert await asyncio.wait_for(task, 3) is None
+        assert [item["method"] for item in native.writes] == ["session/resume"]
+        assert not gateway._reports
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await close_reports(gateway)
+
+
+@pytest.mark.parametrize("pending", ["missing", None, 0, "false", True])
+def test_execution_settlement_requires_explicit_false_pending_proof(tmp_path, pending):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        claim = store.claim_next("beta", "worker")
+        reserved = store.update(
+            request["id"],
+            "beta",
+            "worker",
+            "dispatch",
+            evidence={
+                "session_id": "native",
+                "execution_id": "execution",
+            },
+            claim=claim["claim"],
+        )
+        store.reply(request["id"], "beta", "Early correlated reply", claim=claim["claim"])
+        receipt = {
+            "session_id": "native",
+            "execution_id": "execution",
+            "native_dispatched": True,
+            "stop_reason": "end_turn",
+            "completed_at": reserved["evidence"]["dispatch_started"] + 1,
+        }
+        if pending != "missing":
+            receipt["pending"] = pending
+        with pytest.raises(ValueError, match="settlement must match"):
+            store.update(
+                request["id"],
+                "beta",
+                "worker",
+                "execution_settled",
+                evidence=receipt,
+                claim=claim["claim"],
+                expected_execution_id="execution",
+            )
+        assert store.get_message(request["id"], "beta")["execution_pending"] is True
+        settled = store.update(
+            request["id"],
+            "beta",
+            "worker",
+            "execution_settled",
+            evidence={**receipt, "pending": False},
+            claim=claim["claim"],
+            expected_execution_id="execution",
+        )
+        assert settled["execution_pending"] is False
+    finally:
+        store.close()

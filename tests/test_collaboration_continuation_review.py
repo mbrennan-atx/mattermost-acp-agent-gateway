@@ -276,7 +276,11 @@ async def test_cancellation_during_continuation_transfer_keeps_parent_unsettled(
 
 async def test_before_prompt_rejection_has_false_dispatch_flag_and_no_native_write(tmp_path):
     broker, writer = memory_broker()
-    sessions = SessionService(broker, SimpleNamespace(), default_cwd=tmp_path)
+    sessions = SessionService(
+        broker,
+        SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(session_id="existing-native"))),
+        default_cwd=tmp_path,
+    )
     sessions.ensure_session = AsyncMock(return_value="existing-native")
     before_prompt = AsyncMock(return_value=False)
     result = await sessions.run_turn(
@@ -289,7 +293,7 @@ async def test_before_prompt_rejection_has_false_dispatch_flag_and_no_native_wri
 
 
 @pytest.mark.parametrize("refusal", ["workspace", "background"])
-async def test_rejected_preparation_refreshes_parent_epoch_before_cancellation(tmp_path, refusal):
+async def test_rejected_preparation_preserves_parent_epoch_before_cancellation(tmp_path, refusal):
     async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, old):
         delivery = child_result(store, p, parent, consumer)
         broker, writer = memory_broker()
@@ -312,7 +316,7 @@ async def test_rejected_preparation_refreshes_parent_epoch_before_cancellation(t
         gateway.sessions = sessions
         gateway.run_prompt = type(gateway).run_prompt.__get__(gateway)
         await consumer.handle(delivery)
-        assert preparations == 2 and sessions.native_epoch("discussion") == 8
+        assert preparations == 2 and sessions.native_epoch("discussion") == 7
         assert writer.messages == []
         assert store.get_message(delivery["id"], "beta")["state"] == "queued"
         assert consumer.ownership[(parent["id"], parent["claim"])] is old

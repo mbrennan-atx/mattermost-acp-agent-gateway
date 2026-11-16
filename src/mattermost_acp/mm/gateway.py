@@ -649,13 +649,13 @@ class MattermostGateway:
             )
             return
         if cmd == "restart":
-            msg = await self._request_restart(
-                thread_id=thread_id,
-                channel_id=channel_id,
-                user_id=user_id,
-                reason="slash_restart",
+            await reply("Restart requires verified idle status across this agent's sessions.")
+            self._track_control(
+                self._restart_when_idle(
+                    thread_id, channel_id, user_id, timeout_s=0, reason="slash_restart"
+                ),
+                "explicit-restart",
             )
-            await reply(msg)
             return
         if cmd in {"mcps", "mcp"}:
             report = await mcp_status_report(
@@ -965,7 +965,17 @@ class MattermostGateway:
                 if record is not None and Path(record.cwd).resolve() != Path(workspace).resolve():
                     raise ValueError("Existing native session uses a different workspace")
                 options["cwd"] = Path(workspace)
-            await self.sessions.ensure_session(thread_id, **options)
+            if ordinary_collaboration:
+                with native_command_admission(
+                    lambda: (
+                        self.ordinary_admitted(thread_id, ownership_guard)
+                        and not self.draining
+                        and not self.sealed
+                    )
+                ):
+                    await self.sessions.ensure_session(thread_id, **options)
+            else:
+                await self.sessions.ensure_session(thread_id, **options)
         except NativeDispatchChanged:
             logger.warning("Workspace verification refused native preparation")
             if before_native is not None:
@@ -1179,7 +1189,18 @@ class MattermostGateway:
                         and not self.sealed
                         and not report.get("cancel_requested")
                     )
-                result = await self.sessions.run_turn(thread_id, text, **turn_options)
+                if ordinary_collaboration:
+                    with native_command_admission(
+                        lambda: (
+                            self.ordinary_admitted(thread_id, ownership_guard)
+                            and not self.draining
+                            and not self.sealed
+                            and not report.get("cancel_requested")
+                        )
+                    ):
+                        result = await self.sessions.run_turn(thread_id, text, **turn_options)
+                else:
+                    result = await self.sessions.run_turn(thread_id, text, **turn_options)
             finally:
                 report["active"] = False
                 if not reporter.has_pending_work():
@@ -1558,7 +1579,13 @@ class MattermostGateway:
             )
 
     async def _restart_when_idle(
-        self, thread_id: str, channel_id: str, user_id: str, *, timeout_s: float = 900
+        self,
+        thread_id: str,
+        channel_id: str,
+        user_id: str,
+        *,
+        timeout_s: float = 900,
+        reason: str = "harness_switch",
     ) -> None:
         deadline = time.monotonic() + timeout_s
         admission = getattr(self.collaboration, "set_admission", None)
@@ -1586,6 +1613,8 @@ class MattermostGateway:
                         notice = (
                             "The new harness is saved. Native goal/queue idle status is unknown; "
                             "automatic restart is deferred."
+                            if reason == "harness_switch"
+                            else "Restart deferred. Native goal/queue idle status is unknown."
                         )
                     elif not any(
                         state[key]
@@ -1612,14 +1641,18 @@ class MattermostGateway:
                             thread_id=thread_id,
                             channel_id=channel_id,
                             user_id=user_id,
-                            reason="harness_switch",
+                            reason=reason,
                         )
                         restart_scheduled = True
-                        logger.info("harness switch restart: %s", msg)
+                        logger.info("verified idle restart: %s", msg)
+                        if reason == "slash_restart":
+                            await self._post(channel_id, msg, root_id=thread_id)
                         break
                     elif time.monotonic() >= deadline:
                         notice = (
                             "The new harness is saved. Pending work prevents automatic restart."
+                            if reason == "harness_switch"
+                            else "Restart deferred. Pending work remains in this agent's sessions."
                         )
                 if notice is not None:
                     await self._post(channel_id, notice, root_id=thread_id)
@@ -1629,7 +1662,9 @@ class MattermostGateway:
             logger.exception("Automatic harness restart could not settle admission")
             await self._post(
                 channel_id,
-                "The new harness is saved. Automatic restart could not settle admission.",
+                "The new harness is saved. Automatic restart could not settle admission."
+                if reason == "harness_switch"
+                else "Restart deferred. Native admission could not be settled.",
                 root_id=thread_id,
             )
         finally:

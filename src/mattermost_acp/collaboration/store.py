@@ -763,7 +763,7 @@ class CollaborationStore:
                         or receipt.get("execution_id") != reserved.get("execution_id")
                         or not receipt.get("native_dispatched")
                         or not receipt.get("stop_reason")
-                        or receipt.get("pending")
+                        or receipt.get("pending") is not False
                         or type(completed) not in {int, float}
                         or not math.isfinite(completed)
                         or completed < reserved.get("dispatch_started", float("inf"))

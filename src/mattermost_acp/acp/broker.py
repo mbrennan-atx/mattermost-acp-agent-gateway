@@ -262,6 +262,8 @@ class AcpBroker:
         self.subagents = SubagentTracker()
         self.update_observer: Callable[[SessionUpdate], None] | None = None
         self._started = False
+        self._initialized = False
+        self._initialization_pending = False
         self._lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         # session_id → in-flight turn lock
@@ -332,55 +334,74 @@ class AcpBroker:
             if self.is_running and self._started:
                 return self._capabilities
 
-            self._cursor_live_sessions.clear()
-            self._live_sessions.clear()
-            argv = self._build_argv()
-            logger.info("Starting ACP agent: %s", " ".join(argv[:8]))
+            if not self.is_running:
+                self._initialized = False
+                self._initialization_pending = False
+                self._cursor_live_sessions.clear()
+                self._live_sessions.clear()
+                argv = self._build_argv()
+                logger.info("Starting ACP agent: %s", " ".join(argv[:8]))
 
-            # Persist before process creation, including a crash before the
-            # first thread mapping is saved. Persistence failure prevents launch.
-            await self.mark_native_boundary_unknown()
+                # Persist before process creation, including a crash before the
+                # first thread mapping is saved. Persistence failure prevents launch.
+                await self.mark_native_boundary_unknown()
+                check_native_command_admission()
 
-            if self._process_factory is not None:
-                self._proc = await self._process_factory(argv)
-            else:
-                env = {**os.environ, **(self.env or {})}
-                self._proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    limit=16 * 1024 * 1024,
+                if self._process_factory is not None:
+                    self._proc = await self._process_factory(argv)
+                else:
+                    env = {**os.environ, **(self.env or {})}
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        limit=16 * 1024 * 1024,
+                    )
+
+                assert self._proc.stdout is not None
+                # Persistent I/O tasks must not inherit one command's transient
+                # admission guard and apply it to unrelated later sessions.
+                with native_command_admission(None):
+                    self._reader_task = asyncio.create_task(
+                        self._read_loop(), name="acp-broker-reader"
+                    )
+                if self._proc.stderr is not None:
+                    asyncio.create_task(self._drain_stderr(self._proc.stderr), name="acp-stderr")
+            elif self._reader_task is None or self._reader_task.done():
+                raise AcpError(
+                    "Native process is running without a working reader; recovery required"
                 )
-
-            assert self._proc.stdout is not None
-            # Persistent I/O tasks must not inherit one command's transient
-            # admission guard and apply it to unrelated later sessions.
-            with native_command_admission(None):
-                self._reader_task = asyncio.create_task(self._read_loop(), name="acp-broker-reader")
-            # Drain stderr in background so the pipe cannot fill
-            if self._proc.stderr is not None:
-                asyncio.create_task(self._drain_stderr(self._proc.stderr), name="acp-stderr")
 
             # Do NOT advertise fs/terminal client capabilities. If we claim them,
             # Grok issues fs/* and terminal/* RPCs to us and blocks the turn until
             # we answer — this gateway is not an IDE, so those hang forever after the
             # first tool_call UI event. Empty caps force agent-side tools.
-            result = await self.request(
-                "initialize",
-                {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {"subagents": {}},
-                    "clientInfo": {
-                        "name": "mattermost-acp-gateway",
-                        "title": "Mattermost ACP gateway",
-                        "version": "0.1.0",
+            if not self._initialized:
+                if self._initialization_pending:
+                    raise AcpError("Native initialization is unconfirmed; recovery required")
+
+                def initialize_dispatched():
+                    self._initialization_pending = True
+
+                result = await self.request(
+                    "initialize",
+                    {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {"subagents": {}},
+                        "clientInfo": {
+                            "name": "mattermost-acp-gateway",
+                            "title": "Mattermost ACP gateway",
+                            "version": "0.1.0",
+                        },
                     },
-                },
-            )
-            caps_raw = result if isinstance(result, dict) else {}
-            self._capabilities = self._parse_capabilities(caps_raw)
+                    on_write=initialize_dispatched,
+                )
+                caps_raw = result if isinstance(result, dict) else {}
+                self._capabilities = self._parse_capabilities(caps_raw)
+                self._initialized = True
+                self._initialization_pending = False
             if self.backend == "cursor":
                 await self.request("authenticate", {"methodId": "cursor_login"})
             self._started = True
@@ -395,6 +416,8 @@ class AcpBroker:
     async def stop(self) -> None:
         async with self._lock:
             self._started = False
+            self._initialized = False
+            self._initialization_pending = False
             self._cursor_live_sessions.clear()
             self._live_sessions.clear()
             self.subagents = SubagentTracker()

@@ -1049,7 +1049,11 @@ async def test_cancel_during_dispatch_reservation_rejects_stale_success(tmp_path
 @pytest.mark.parametrize("invalidate", ["epoch", "cancel"])
 async def test_fresh_dispatch_fences_changes_during_awaited_reservation(tmp_path, invalidate):
     broker, writer = memory_broker()
-    sessions = SessionService(broker, SimpleNamespace(), default_cwd=tmp_path)
+    sessions = SessionService(
+        broker,
+        SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(session_id="native"))),
+        default_cwd=tmp_path,
+    )
     sessions.ensure_session = AsyncMock(return_value="native")
     permitted = True
 

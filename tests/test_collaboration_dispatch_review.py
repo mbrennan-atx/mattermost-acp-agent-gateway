@@ -325,7 +325,11 @@ async def test_repeated_harness_switches_share_one_idle_restart_waiter(monkeypat
 def native_gateway(tmp_path):
     gateway = active_gateway(busy=False)
     broker, writer = memory_broker()
-    sessions = SessionService(broker, SimpleNamespace(), default_cwd=tmp_path)
+    sessions = SessionService(
+        broker,
+        SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(session_id="existing-native"))),
+        default_cwd=tmp_path,
+    )
     sessions.ensure_session = AsyncMock(return_value="existing-native")
     sessions.status = AsyncMock(return_value={"session_id": "existing-native"})
     gateway.sessions = sessions

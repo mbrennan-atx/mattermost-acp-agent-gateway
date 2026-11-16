@@ -269,6 +269,8 @@ class SessionService:
             else:
                 # Agent still has in-memory session if process never died
                 pass
+        except NativeDispatchChanged:
+            raise
         except AcpError as exc:
             logger.warning(
                 "Resume/load failed for thread %s session %s: %s — creating new",
@@ -326,8 +328,12 @@ class SessionService:
             raise ThreadBusy("This thread already has a turn in progress. Use /stop.")
 
         async with self._thread_locks.setdefault(thread_id, asyncio.Lock()), self._global_sem:
+            prior = await self.store.get(thread_id)
             check_native_command_admission()
+            predecessor_epoch = self.native_epoch(thread_id)
             self._advance_native(thread_id)
+            preparing_epoch = self.native_epoch(thread_id)
+            dispatched = False
             self._busy.add(thread_id)
             self._write_busy_marker()
             try:
@@ -347,15 +353,18 @@ class SessionService:
                         thought_text="",
                     )
                 guarded = before_prompt is not None or dispatch_guard is not None
+
+                def accepted():
+                    nonlocal dispatched
+                    dispatched = True
+                    if on_dispatched is not None:
+                        on_dispatched(session_id)
+
                 result = await self.broker.prompt_turn(
                     session_id,
                     prompt,
                     on_update=on_update,
-                    **(
-                        {"on_dispatched": lambda: on_dispatched(session_id)}
-                        if on_dispatched is not None
-                        else {}
-                    ),
+                    on_dispatched=accepted,
                     **(
                         {
                             "guard": lambda: (
@@ -367,12 +376,22 @@ class SessionService:
                         else {}
                     ),
                 )
+                dispatched = dispatched or result.native_dispatched
                 if result.model_id and self.native_epoch(thread_id) == epoch:
                     await self.store.save_model_if_session(thread_id, session_id, result.model_id)
                 return result
             finally:
-                self._busy.discard(thread_id)
-                self._write_busy_marker()
+                try:
+                    if not dispatched:
+                        current = await self.store.get(thread_id)
+                        if self.native_epoch(thread_id) == preparing_epoch and (
+                            (current.session_id if current else None)
+                            == (prior.session_id if prior else None)
+                        ):
+                            self._native_epochs[thread_id] = predecessor_epoch
+                finally:
+                    self._busy.discard(thread_id)
+                    self._write_busy_marker()
 
     async def hint(
         self, thread_id: str, text: str, *, expected_session=None, expected_epoch=None, guard=None
@@ -748,6 +767,8 @@ class SessionService:
         if stored_model:
             try:
                 return await self.broker.set_model(session_id, stored_model, effort=stored_effort)
+            except NativeDispatchChanged:
+                raise
             except AcpError as exc:
                 logger.warning(
                     "set_model(%s) failed session=%s: %s",
@@ -766,6 +787,8 @@ class SessionService:
         if desired:
             try:
                 return await self.broker.set_model(session_id, desired, effort=stored_effort)
+            except NativeDispatchChanged:
+                raise
             except AcpError as exc:
                 logger.warning(
                     "pin default model %s failed session=%s: %s",

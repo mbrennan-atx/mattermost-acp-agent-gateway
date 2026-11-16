@@ -337,6 +337,7 @@ async def test_saturated_global_slot_serializes_thread_preparation(tmp_path):
 
     async def prompt(_session, _text, **_kwargs):
         nonlocal active, maximum
+        _kwargs["on_dispatched"]()
         active += 1
         maximum = max(maximum, active)
         await asyncio.sleep(0.01)
@@ -347,7 +348,12 @@ async def test_saturated_global_slot_serializes_thread_preparation(tmp_path):
         )
 
     broker = SimpleNamespace(prompt_turn=prompt)
-    sessions = SessionService(broker, SimpleNamespace(), default_cwd=tmp_path, max_parallel_turns=1)
+    sessions = SessionService(
+        broker,
+        SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(session_id="native"))),
+        default_cwd=tmp_path,
+        max_parallel_turns=1,
+    )
     sessions.ensure_session = ensure
     await sessions._global_sem.acquire()
     tasks = [asyncio.create_task(sessions.run_turn("same-thread", str(i))) for i in range(2)]
@@ -629,7 +635,11 @@ def test_failed_result_prompt_preserves_status_parent_and_evidence(tmp_path):
 
 async def test_final_native_dispatch_callback_can_cancel_without_prompt(tmp_path):
     broker = SimpleNamespace(prompt_turn=AsyncMock())
-    sessions = SessionService(broker, SimpleNamespace(), default_cwd=tmp_path)
+    sessions = SessionService(
+        broker,
+        SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(session_id="reserved-native"))),
+        default_cwd=tmp_path,
+    )
     sessions.ensure_session = AsyncMock(return_value="reserved-native")
     callback = AsyncMock(return_value=False)
     result = await sessions.run_turn("project", "do work", before_prompt=callback)
