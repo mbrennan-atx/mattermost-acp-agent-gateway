@@ -51,6 +51,7 @@ class SubagentTracker:
         self.workers: dict[str, Worker] = {}
         self._retired_sessions: set[str] = set()
         self._task_sources: dict[str, set[str]] = {}
+        self._pending_task_sources: dict[str, set[str]] = {}
         self._root_tasks: dict[str, dict[str, str]] = {}
         self._root_pending_tasks: dict[str, set[str]] = {}
 
@@ -86,6 +87,14 @@ class SubagentTracker:
             task_id
             for task_id in self._root_pending_tasks.get(root, ())
             if task_id in worker.async_tasks
+        )
+        # A terminal sibling copy still fences a live task's cached ownership.
+        # Retain just collisions with current pending IDs, never scan history.
+        task_ids.update(
+            task_id
+            for task_id, sources in self._pending_task_sources.items()
+            if task_id in worker.async_tasks
+            and any(self._root(self.workers[source]) == root for source in sources)
         )
         for task_id in task_ids:
             task = dict(worker.async_tasks[task_id])
@@ -137,6 +146,11 @@ class SubagentTracker:
                         sources.discard(child)
                         if not sources:
                             self._task_sources.pop(task_id)
+                    pending = self._pending_task_sources.get(task_id)
+                    if pending is not None:
+                        pending.discard(child)
+                        if not pending:
+                            self._pending_task_sources.pop(task_id)
             self._retired_sessions.discard(child)
 
     def pending(self, session_id: str) -> bool:
@@ -310,11 +324,17 @@ class SubagentTracker:
                 worker.async_tasks_by_tool.setdefault(tool_id, set()).add(task_id)
             if task.get("state") in ASYNC_TERMINAL:
                 worker.pending_async_tasks.discard(task_id)
+                pending = self._pending_task_sources.get(task_id)
+                if pending is not None:
+                    pending.discard(worker.session_id)
+                    if not pending:
+                        self._pending_task_sources.pop(task_id)
                 if isinstance(tool_id, str):
                     worker.terminal_tasks_by_tool.setdefault(tool_id, set()).add(task_id)
                 worker.detached_tools.discard(tool_id)
             else:
                 worker.pending_async_tasks.add(task_id)
+                self._pending_task_sources.setdefault(task_id, set()).add(worker.session_id)
             worker.latest_async_task = task_id
             self._task_sources.setdefault(task_id, set()).add(worker.session_id)
         elif update.model_id:
