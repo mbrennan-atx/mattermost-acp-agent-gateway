@@ -80,3 +80,35 @@ async def test_store_roundtrip(tmp_path: Path) -> None:
     assert await store.delete("root111") is True
     assert await store.get("root111") is None
     await store.close()
+
+
+async def test_native_boundary_marker_survives_restart_without_thread_history(tmp_path):
+    path = tmp_path / "native.db"
+    store = ThreadStore(path, harness="claude")
+    await store.open()
+    assert not await store.native_boundary_unknown()
+    await store.mark_native_boundary_unknown()
+    assert await store.get("uncreated-thread") is None
+    await store.close()
+    reopened = ThreadStore(path, harness="codex")
+    await reopened.open()
+    try:
+        assert await reopened.native_boundary_unknown()
+    finally:
+        await reopened.close()
+
+
+async def test_legacy_thread_history_retains_warmth_after_mapping_deletion(tmp_path):
+    path = tmp_path / "native.db"
+    store = ThreadStore(path, harness="claude")
+    await store.open()
+    await store.save("historic-thread", "historic-native", "/isolated")
+    await store.close()
+    reopened = ThreadStore(path, harness="codex")
+    await reopened.open()
+    try:
+        assert await reopened.native_boundary_unknown()
+        await reopened.delete("historic-thread")
+        assert await reopened.native_boundary_unknown()
+    finally:
+        await reopened.close()

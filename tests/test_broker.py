@@ -474,3 +474,52 @@ async def test_permission_policy_respects_explicit_denial():
     broker.always_approve = True
     await broker._handle_permission(2, request)
     assert writes[-1]["result"]["outcome"]["optionId"] == "allow"
+
+
+async def test_native_start_commits_warmth_before_spawn_and_survives_no_thread_creation(tmp_path):
+    from mattermost_acp.store import ThreadStore
+
+    path = tmp_path / "native.db"
+    store = ThreadStore(path, harness="claude")
+    await store.open()
+
+    async def checked_spawn(argv):
+        # A separately opened connection proves the marker was committed.
+        independent = ThreadStore(path, harness="claude")
+        await independent.open()
+        try:
+            assert await independent.native_boundary_unknown()
+            assert await independent.get("not-yet-created") is None
+        finally:
+            await independent.close()
+        return await spawn_fake_agent_process(argv)
+
+    broker = AcpBroker(
+        process_factory=checked_spawn,
+        initial_native_uncertainty=await store.native_boundary_unknown(),
+        on_native_start=store.mark_native_boundary_unknown,
+    )
+    try:
+        assert broker.native_boundary_idle
+        await broker.start()
+        await broker.stop()
+        assert not broker.native_boundary_idle
+        await store.close()
+        await store.open()
+        restarted = AcpBroker(initial_native_uncertainty=await store.native_boundary_unknown())
+        assert not restarted.is_running and not restarted.native_boundary_idle
+    finally:
+        await broker.stop()
+        await store.close()
+
+
+async def test_failed_native_boundary_persistence_prevents_process_launch():
+    async def failed_persistence():
+        raise OSError("Native state could not be committed")
+
+    factory = AsyncMock()
+    broker = AcpBroker(process_factory=factory, on_native_start=failed_persistence)
+    with pytest.raises(OSError, match="could not be committed"):
+        await broker.start()
+    factory.assert_not_awaited()
+    assert not broker.is_running and not broker.native_boundary_idle

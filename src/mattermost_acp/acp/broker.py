@@ -197,6 +197,8 @@ class AcpBroker:
         rpc_timeout_s: float | None = None,
         prompt_idle_timeout_s: float | None = None,
         prompt_hard_max_s: float | None = None,
+        initial_native_uncertainty: bool = False,
+        on_native_start: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.command = command
         # "grok" spawns `grok agent ... stdio`, a CLI-specific subcommand
@@ -226,7 +228,8 @@ class AcpBroker:
         )
 
         self._proc: asyncio.subprocess.Process | None = None
-        self._native_spawned = False
+        self._native_spawned = initial_native_uncertainty
+        self._on_native_start = on_native_start
         self._reader_task: asyncio.Task[None] | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -268,6 +271,11 @@ class AcpBroker:
         """ACP foreground completion does not prove native goals/queues are idle."""
         return not self._native_spawned and not self.is_running
 
+    async def mark_native_boundary_unknown(self) -> None:
+        self._native_spawned = True
+        if self._on_native_start is not None:
+            await self._on_native_start()
+
     def set_permission_handler(self, handler: PermissionHandler | None) -> None:
         self._permission_handler = handler
 
@@ -305,6 +313,10 @@ class AcpBroker:
             argv = self._build_argv()
             logger.info("Starting ACP agent: %s", " ".join(argv[:8]))
 
+            # Persist before process creation, including a crash before the
+            # first thread mapping is saved. Persistence failure prevents launch.
+            await self.mark_native_boundary_unknown()
+
             if self._process_factory is not None:
                 self._proc = await self._process_factory(argv)
             else:
@@ -318,8 +330,6 @@ class AcpBroker:
                     limit=16 * 1024 * 1024,
                 )
 
-            # Process exit alone cannot prove native descendants or goals idle.
-            self._native_spawned = True
             assert self._proc.stdout is not None
             self._reader_task = asyncio.create_task(self._read_loop(), name="acp-broker-reader")
             # Drain stderr in background so the pipe cannot fill

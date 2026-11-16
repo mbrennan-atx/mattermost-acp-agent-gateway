@@ -360,10 +360,12 @@ async def test_admission_cannot_forget_unobserved_native_execution_after_early_r
 
 
 async def test_posted_result_has_no_native_debt_and_cold_sidecar_can_seal(tmp_path):
-    store, server, clients = await api_fixture(tmp_path)
+    store, server, clients = await api_fixture(tmp_path, sidecar_actors={"alpha"})
     gateway = active_gateway(steering=False, busy=False)
     gateway.config.db_path = tmp_path / "project.db"
     gateway.config.collab_sidecar = True
+    gateway.config.collab_origin_actor = "alpha"
+    gateway.client.user_id = "alpha-user"
     gateway.config.slash_port = 0
     gateway.config.slash_tokens = frozenset({"synthetic-slash-token"})
     gateway.sessions.broker = AcpBroker()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +110,7 @@ class Config:
     collab_sidecar: bool = False
     collab_origin_actor: str = ""
     workspace_guard_command: str | None = None
+    workspace_guard_timeout_s: float = 15
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -191,6 +193,10 @@ class Config:
         )
         status_progress_lines = max(0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3")))
 
+        guard_timeout = float(os.environ.get("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "15"))
+        if not math.isfinite(guard_timeout) or not 0 < guard_timeout <= 300:
+            raise ValueError("AGENT_WORKSPACE_GUARD_TIMEOUT_S must be positive and at most 300")
+
         return cls(
             mattermost_url=url,
             mattermost_token=token,
@@ -207,6 +213,7 @@ class Config:
             grok_command=command,
             workspace_guard_command=os.environ.get("AGENT_WORKSPACE_GUARD_COMMAND", "").strip()
             or None,
+            workspace_guard_timeout_s=guard_timeout,
             grok_model=model,
             grok_cwd=cwd,
             always_approve=_truthy(_env("AGENT_ALWAYS_APPROVE"), default=True),

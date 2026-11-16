@@ -40,6 +40,9 @@ class CollaborationConsumer:
         self.claim_settled = asyncio.Event()
         self.claim_settled.set()
         self.claim_uncertain = False
+        self.recovery_pending = True
+        self.inherited_claims = []
+        self.recovery_lock = asyncio.Lock()
         self.admission_pending = 0
         self.admission_lock = asyncio.Lock()
         self.poll_paused = False
@@ -85,17 +88,7 @@ class CollaborationConsumer:
     async def run(self):
         while not self.closing:
             try:
-                if not self.actor:
-                    identity = await self.hub.request("GET", "/identity")
-                    if self.sidecar and (
-                        identity["actor"] != getattr(self.gateway.config, "collab_origin_actor", "")
-                        or identity.get("user_id") != self.gateway.client.user_id
-                    ):
-                        raise ValueError("Collaboration actor does not match the sidecar identity")
-                    self.actor = identity["actor"]
-                    if bool(identity.get("sidecar")) != self.sidecar:
-                        self.actor = ""
-                        raise ValueError("Hub and consumer delivery modes do not match")
+                await self.reconcile_inherited_claims()
                 for thread in list(self.pending_stops):
                     await self.cancel_thread(thread, retry=True)
                 await self.reconcile_ownership()
@@ -136,12 +129,55 @@ class CollaborationConsumer:
                 logger.warning("Collaboration mailbox unavailable; durable requests retained")
                 await asyncio.sleep(2)
 
+    async def reconcile_inherited_claims(self):
+        """Read older execution debt without taking over or replaying it."""
+        async with self.recovery_lock:
+            await self._reconcile_inherited_claims()
+
+    async def _reconcile_inherited_claims(self):
+        self.recovery_pending = True
+        if not self.actor:
+            identity = await self.hub.request("GET", "/identity")
+            if self.sidecar and (
+                identity["actor"] != getattr(self.gateway.config, "collab_origin_actor", "")
+                or identity.get("user_id") != self.gateway.client.user_id
+            ):
+                raise RuntimeError("Collaboration actor does not match the sidecar identity")
+            if bool(identity.get("sidecar")) != self.sidecar:
+                raise RuntimeError("Hub and consumer delivery modes do not match")
+            self.actor = identity["actor"]
+        claims = await self.hub.request("GET", "/claims")
+        if not isinstance(claims, list) or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("id"), str)
+            or item.get("recipient") != self.actor
+            or not isinstance(item.get("evidence", {}), dict)
+            for item in claims
+        ):
+            raise RuntimeError("Actor execution recovery evidence is unavailable")
+        inherited = [item for item in claims if item.get("instance") != self.instance]
+        if any(
+            item.get("evidence", {}).get("session_id")
+            and item.get("evidence", {}).get("dispatch_started") is not None
+            for item in inherited
+        ):
+            mark_unknown = getattr(
+                self.gateway.sessions.broker, "mark_native_boundary_unknown", None
+            )
+            if mark_unknown is not None:
+                await mark_unknown()
+        self.inherited_claims = inherited
+        self.recovery_pending = False
+        self.gateway.collaboration_recovery_pending = False
+
     async def set_admission(self, mode):
         """Fence hub claims before settling local mailbox uncertainty."""
         self.admission_pending += 1
         try:
             async with self.admission_lock:
                 self.poll_paused = True
+                async with asyncio.timeout(3):
+                    await self.reconcile_inherited_claims()
                 # An unstarted consumer has never submitted a mailbox request.
                 if self.task is None and not self.claim_uncertain:
                     return
@@ -390,6 +426,24 @@ class CollaborationConsumer:
             "thread": thread,
         }
         return info if self.continuation_idle(info) else None
+
+    async def unresolved_parent(self, item):
+        parent_id = item.get("continuation_parent")
+        if item["kind"] != "result" or not parent_id:
+            return False
+        parent = await self.hub.request("GET", "/messages/" + parent_id)
+        evidence = parent.get("evidence", {})
+        return parent["state"] not in {"done", "failed", "blocked", "cancelled"} or bool(
+            parent.get(
+                "execution_pending",
+                evidence.get("session_id") and evidence.get("dispatch_started") is not None,
+            )
+        )
+
+    async def reserve_independent(self, item, session):
+        if await self.unresolved_parent(item):
+            return False
+        return await self.reserve(item, session)
 
     def continuation_idle(self, info, *, reserved=False):
         report = info["report"]
@@ -654,6 +708,9 @@ class CollaborationConsumer:
                 return
             broker = self.gateway.sessions.broker
             prompt = self.prompt(item)
+            if await self.unresolved_parent(item) and await self.continuation(item) is None:
+                await self.update(item, "queued")
+                return
             outcome = None
             caps = broker.capabilities
             report = self.gateway._reports.get(record.session_id) if record is not None else None
@@ -725,6 +782,9 @@ class CollaborationConsumer:
                 await self.undispatched(item)
             self.release_ownership((item["id"], item.get("claim")))
             continuation = await self.continuation(item)
+            if continuation is None and await self.unresolved_parent(item):
+                await self.update(item, "queued")
+                return
             if self.active(thread) and continuation is None:
                 await self.update(item, "queued")
                 return
@@ -745,7 +805,7 @@ class CollaborationConsumer:
                     before_native=(
                         (lambda session: self.reserve_continuation(item, session, continuation))
                         if continuation is not None
-                        else (lambda session: self.reserve(item, session))
+                        else (lambda session: self.reserve_independent(item, session))
                     ),
                     ownership_guard=(lambda: self.continuation_idle(continuation, reserved=True))
                     if continuation is not None

@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS model_settings (
     harness     TEXT,
     updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS runtime_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -72,6 +76,12 @@ class ThreadStore:
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(_SCHEMA)
         await self._migrate()
+        # Existing histories predate the durable native-start marker. Preserve
+        # that uncertainty even if their thread mappings are later deleted.
+        await self._db.execute(
+            "INSERT OR IGNORE INTO runtime_state(key,value) "
+            "SELECT 'native_boundary_unknown','1' WHERE EXISTS(SELECT 1 FROM threads)"
+        )
         await self._db.commit()
 
     async def _migrate(self) -> None:
@@ -112,6 +122,20 @@ class ThreadStore:
         if self._db is None:
             raise RuntimeError("ThreadStore is not open")
         return self._db
+
+    async def native_boundary_unknown(self) -> bool:
+        cursor = await self._conn().execute(
+            "SELECT EXISTS(SELECT 1 FROM runtime_state "
+            "WHERE key='native_boundary_unknown') OR EXISTS(SELECT 1 FROM threads)"
+        )
+        return bool((await cursor.fetchone())[0])
+
+    async def mark_native_boundary_unknown(self) -> None:
+        """Commit a monotonic boundary marker before launching native work."""
+        await self._conn().execute(
+            "INSERT OR IGNORE INTO runtime_state(key,value) VALUES('native_boundary_unknown','1')"
+        )
+        await self._conn().commit()
 
     async def get(self, thread_id: str) -> ThreadRecord | None:
         cur = await self._conn().execute(

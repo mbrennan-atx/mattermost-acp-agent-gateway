@@ -243,6 +243,11 @@ def build_app(
         changed.set()
         return web.json_response(claims)
 
+    async def claims(request):
+        # Recovery inspection spans this actor's instances without changing
+        # leases, admission fences or the ownership of another instance.
+        return web.json_response(store.active_claims(request["actor"]))
+
     async def mailbox(request):
         instance = request.query.get("instance", "")
         if not instance or len(instance) > 128:
@@ -393,6 +398,7 @@ def build_app(
     app.router.add_post("/messages/{mid}/{action}", message_action)
     app.router.add_get("/mailbox", mailbox)
     app.router.add_post("/mailbox/admission", mailbox_admission)
+    app.router.add_get("/claims", claims)
     app.router.add_post("/cancel-thread", cancel_thread)
     app.router.add_post("/mentions", mention)
     return app

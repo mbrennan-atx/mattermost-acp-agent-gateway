@@ -2,7 +2,7 @@
 
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 705 tests pass, one optional installed Codex adapter fixture skipped, 99.58 seconds.
+- Python 3.12.15 with locked dependencies: 795 parent-verified tests pass with one optional installed Codex adapter fixture skipped in 122.62 seconds. This combined suite includes restart ownership, legacy debt and bounded guard-timeout coverage.
 - Ruff passes across the repository. Formatting passes for all 31 changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
 - Preceding full-branch Sol/high reports and finalized synthesis were inspected. All supported findings have fixes and meaningful regressions. Latest fixes reject unknown and unverified authors in registered discussions, retain ordinary behavior outside projects, and apply expiry inside dispatch transactions after native preparation. A fresh committed-source review precedes publication.
@@ -47,7 +47,11 @@ Warmed native clients without authoritative goal and queue idle evidence report 
 
 Atomic expected-execution checks fence stale foreground evidence, settlement and fallback errors after a correlated result reserves a newer continuation. The parent handler keeps renewing and supervising that claim until the continued execution settles. Long-result artifacts include the execution generation, so a delayed older result cannot overwrite the continuation output. Declined preparation discards only its unaccepted provisional reservation. Twenty-two additional regressions cover paused GET/POST races, errors, cancellation and valid continued settlement.
 
-Ordinary floor wake admission now requires an authoritative unregistered-discussion result from the read-only unknown-author lookup. Registered acknowledgements, malformed lookup responses and unavailable lookup services stay quiet. Explicit project ASK handling and ordinary unregistered/home routing remain available. The worker affected checks pass 381 collaboration/filter cases and 70 delivery/admission/filter cases; a parent full-suite rerun is in progress.
+Ordinary floor wake admission now requires an authoritative unregistered-discussion result from the read-only unknown-author lookup. Registered acknowledgements, malformed lookup responses and unavailable lookup services stay quiet. Explicit project ASK handling and ordinary unregistered/home routing remain available. The worker affected checks pass 381 collaboration/filter cases and 70 delivery/admission/filter cases; the parent full suite previously passed all 765 cases with one optional adapter skipped.
+
+Gateway recovery now checks actor-wide execution debt before mailbox admission and before maintenance can report idle. Interrupted/unconfirmed parents and older-instance terminal execution debt block fresh native turns. Binding and worker-slot checks use the same legacy pending-execution fallback. A read-only actor claims endpoint does not mutate other instances' leases. Native uncertainty is committed before process creation and recovered from runtime markers or older thread history; individual request settlement cannot clear complete native goal/queue uncertainty. The worker full suite passed 787 cases with one optional adapter skipped, and its final focused coverage passed 224 cases. Parent verifies the combined final source independently.
+
+Native Gemini configuration requires one executable wrapper that supplies ACP mode arguments. The packaged gateway has no launch-argument selector. Workspace guard timeout defaults to 15 seconds and accepts a positive bounded AGENT_WORKSPACE_GUARD_TIMEOUT_S override up to 300 seconds. The private project deployment selects 60 seconds because current bundle inspection can take 12 seconds per scan, including repeated warm checks.
 
 ## Release acceptance still required
 

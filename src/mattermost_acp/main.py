@@ -90,6 +90,8 @@ async def _amain() -> None:
         backend=config.harness,
         model=config.grok_model,
         always_approve=config.always_approve,
+        initial_native_uncertainty=await store.native_boundary_unknown(),
+        on_native_start=store.mark_native_boundary_unknown,
     )
     sessions = SessionService(
         broker,
@@ -101,7 +103,9 @@ async def _amain() -> None:
         inject_channel_context=config.inject_channel_context,
         busy_marker=busy_path(config.db_path),
         router=load_router_from_env(),
-        workspace_guard=build_workspace_guard(config.workspace_guard_command),
+        workspace_guard=build_workspace_guard(
+            config.workspace_guard_command, timeout_s=config.workspace_guard_timeout_s
+        ),
     )
 
     client = MattermostClient(config.mattermost_url, config.mattermost_token)

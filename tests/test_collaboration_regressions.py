@@ -15,6 +15,7 @@ from test_collaboration import (
     api_fixture,
     ask,
     close_api,
+    execution_report,
     project,
 )
 
@@ -133,7 +134,17 @@ async def test_nested_owner_result_continues_project_native_session(tmp_path):
     try:
         p = sidecar_project(store)
         parent = ask(store, p["id"], sender="beta", recipient="alpha")
-        store.claim_next("alpha", "owner-worker")
+        parent = store.claim_next("alpha", consumer.instance)
+        owned = execution_report(p["id"])
+        owned.update(active=False, foreground_complete=True)
+        gateway._reports["existing-native"] = owned
+        assert await consumer.reserve(parent, "existing-native")
+        gateway._last_terminal["discussion"] = {
+            "session_id": "existing-native",
+            "execution_id": owned["execution_id"],
+            "stop_reason": "end_turn",
+            "pending": False,
+        }
         child = ask(
             store, p["id"], sender="alpha", recipient="gamma", key="child", parent=parent["id"]
         )

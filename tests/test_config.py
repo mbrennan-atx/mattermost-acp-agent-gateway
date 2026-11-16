@@ -159,3 +159,23 @@ def test_native_gemini_retains_explicit_adapter_model_and_directory(tmp_path, mo
     assert cfg.grok_command == "synthetic-gemini-adapter"
     assert cfg.grok_model == "carbon-test"
     assert cfg.grok_cwd == tmp_path
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf", "301"])
+def test_workspace_guard_timeout_refuses_unbounded_or_invalid_values(monkeypatch, timeout):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", timeout)
+    with pytest.raises(ValueError, match="AGENT_WORKSPACE_GUARD_TIMEOUT_S"):
+        Config.load("/dev/null")
+
+
+def test_workspace_guard_timeout_loads_bounded_override(monkeypatch):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.delenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", raising=False)
+    assert Config.load("/dev/null").workspace_guard_timeout_s == 15
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "60")
+    assert Config.load("/dev/null").workspace_guard_timeout_s == 60

@@ -75,9 +75,12 @@ def test_durable_request_and_idempotent_result(tmp_path):
     reopened.close()
 
 
-async def api_fixture(tmp_path):
+async def api_fixture(tmp_path, *, sidecar_actors=()):
     store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
-    actors = {name: {"token": name * 32, "user_id": name + "-user"} for name in store.actors}
+    actors = {
+        name: {"token": name * 32, "user_id": name + "-user", "sidecar": name in sidecar_actors}
+        for name in store.actors
+    }
 
     async def verify_post(post_id, _actor):
         return {

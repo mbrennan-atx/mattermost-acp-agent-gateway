@@ -14,13 +14,16 @@ from test_collaboration import (
     execution_report,
     project,
 )
-from test_collaboration_continuation_review import retained_parent, terminal
+from test_collaboration_continuation_review import child_result, retained_parent, terminal
 from test_collaboration_dispatch_review import close_reports, native_gateway
+from test_collaboration_regressions import maintenance_client, maintenance_gateway
 
 from mattermost_acp.acp import TurnResult
+from mattermost_acp.acp.broker import AcpBroker
 from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
+from mattermost_acp.store import ThreadStore
 
 
 @pytest.mark.parametrize("early_reply", [False, True])
@@ -905,3 +908,372 @@ def test_continued_foreground_artifact_survives_a_late_old_receipt(tmp_path, mon
     assert old["result_file"] != continued["result_file"]
     assert Path(continued["result_file"]).read_text() == "C" * 9000
     assert Path(old["result_file"]).read_text() == "O" * 9000
+
+
+@pytest.mark.parametrize("parent_state", ["interrupted", "unconfirmed", "done"])
+async def test_restarted_result_recipient_waits_for_unresolved_parent(tmp_path, parent_state):
+    async with retained_parent(tmp_path) as (
+        store,
+        clients,
+        gateway,
+        old_consumer,
+        p,
+        parent,
+        _old,
+    ):
+        restarted = CollaborationConsumer(gateway, clients["beta"].settings)
+        gateway.collaboration = restarted
+        try:
+            delivery = child_result(store, p, parent, restarted)
+            if parent_state == "done":
+                store.reply(parent["id"], "beta", "Early answer", claim=parent["claim"])
+            else:
+                store.update(
+                    parent["id"],
+                    "beta",
+                    old_consumer.instance,
+                    parent_state,
+                    "Native outcome is unconfirmed",
+                    claim=parent["claim"],
+                )
+            gateway._reports.clear()
+            gateway._last_terminal.clear()
+            await restarted.handle(delivery)
+            gateway.sessions.hint.assert_not_awaited()
+            gateway.run_prompt.assert_not_awaited()
+            current = store.get_message(delivery["id"], "beta")
+            assert current["state"] == "queued" and not current.get("execution_pending")
+            assert current["evidence"] == {} and not restarted.ownership
+            retained = store.get_message(parent["id"], "beta")
+            assert retained["state"] == parent_state and retained["execution_pending"]
+            assert retained["instance"] == old_consumer.instance
+        finally:
+            await restarted.close()
+
+
+async def test_independent_result_rechecks_parent_before_reserving(tmp_path):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, _old):
+        delivery = child_result(store, p, parent, consumer)
+        store.update(
+            parent["id"],
+            "beta",
+            consumer.instance,
+            "interrupted",
+            "Native result unavailable",
+            claim=parent["claim"],
+        )
+        assert not await consumer.reserve_independent(delivery, "existing-native")
+        assert (delivery["id"], delivery["claim"]) not in consumer.ownership
+        current = store.get_message(delivery["id"], "beta")
+        assert current["evidence"] == {} and not current.get("execution_pending")
+
+
+@pytest.mark.parametrize("kind", ["ask", "work"])
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_old_terminal_execution_fences_new_work_until_verified_settlement(
+    tmp_path, kind, legacy
+):
+    store, server, clients = await api_fixture(tmp_path)
+    try:
+        p = project(store)
+        previous = ask(store, p["id"])
+        claimed = store.claim_next("beta", "old-worker")
+        dispatched = store.update(
+            previous["id"],
+            "beta",
+            "old-worker",
+            "dispatch",
+            evidence={"session_id": "old-native", "execution_id": "old-execution"},
+            claim=claimed["claim"],
+        )
+        store.reply(previous["id"], "beta", "Early reply", claim=claimed["claim"])
+        if legacy:
+            with store.transaction():
+                current = store.get_message(previous["id"], "beta")
+                current.pop("execution_pending")
+                store.save_message(current)
+        next_work = ask(store, p["id"], key="new-work", kind=kind)
+        assert store.claim_next("beta", "new-worker") is None
+        assert store.get_message(next_work["id"], "beta")["state"] == "queued"
+        receipt = {
+            "session_id": "old-native",
+            "execution_id": "old-execution",
+            "native_dispatched": True,
+            "stop_reason": "end_turn",
+            "pending": False,
+            "completed_at": dispatched["evidence"]["dispatch_started"] + 1,
+        }
+        body = {
+            "instance": "old-worker",
+            "claim": claimed["claim"],
+            "state": "execution_settled",
+            "expected_execution_id": "old-execution",
+            "evidence": receipt,
+        }
+        with pytest.raises(HubError):
+            await clients["alpha"].request("POST", f"/messages/{previous['id']}/update", body)
+        with pytest.raises(HubError):
+            await clients["beta"].request(
+                "POST",
+                f"/messages/{previous['id']}/update",
+                {**body, "evidence": {**receipt, "execution_id": "another-execution"}},
+            )
+        settled = await clients["beta"].request("POST", f"/messages/{previous['id']}/update", body)
+        assert settled["state"] == "done" and not settled["execution_pending"]
+        assert store.claim_next("beta", "new-worker")["id"] == next_work["id"]
+    finally:
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("stored_instance", [None, "same-worker"])
+def test_pending_execution_requires_matching_instance_for_ask_admission(tmp_path, stored_instance):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    try:
+        p = project(store)
+        previous = ask(store, p["id"])
+        claimed = store.claim_next("beta", "same-worker")
+        store.update(
+            previous["id"],
+            "beta",
+            "same-worker",
+            "dispatch",
+            evidence={"session_id": "native", "execution_id": "execution"},
+            claim=claimed["claim"],
+        )
+        store.reply(previous["id"], "beta", "Early reply", claim=claimed["claim"])
+        with store.transaction():
+            current = store.get_message(previous["id"], "beta")
+            current["instance"] = stored_instance
+            store.save_message(current)
+        next_work = ask(store, p["id"], key="new-work")
+        next_claim = store.claim_next("beta", "same-worker")
+        if stored_instance is None:
+            assert next_claim is None
+        else:
+            assert next_claim["id"] == next_work["id"]
+    finally:
+        store.close()
+
+
+async def test_actor_claim_recovery_is_read_only_and_admission_stays_instance_scoped(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    try:
+        p = project(store)
+        previous = ask(store, p["id"])
+        claimed = store.claim_next("beta", "old-worker")
+        snapshot = store.get_message(previous["id"], "beta")
+        assert await clients["alpha"].request("GET", "/claims") == []
+        recovered = await clients["beta"].request("GET", "/claims")
+        assert len(recovered) == 1 and recovered[0]["id"] == previous["id"]
+        assert recovered[0]["claim"] == claimed["claim"]
+        assert (
+            await clients["beta"].request(
+                "POST", "/mailbox/admission", {"instance": "new-worker", "mode": "controls"}
+            )
+            == []
+        )
+        assert store.get_message(previous["id"], "beta") == snapshot
+        async with clients["beta"].session.get(
+            str(server.make_url("/claims")), headers={"Authorization": "Bearer invalid"}
+        ) as response:
+            assert response.status == 401
+    finally:
+        await close_api(store, server, clients)
+
+
+async def test_maintenance_recovers_old_debt_and_keeps_native_warmth_after_settlement(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    local = ThreadStore(tmp_path / "local.db", harness="claude")
+    await local.open()
+    gateway = maintenance_gateway()
+    broker = AcpBroker(on_native_start=local.mark_native_boundary_unknown)
+    gateway.sessions.broker = broker
+    gateway.config.db_path = tmp_path / "project.db"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    headers = {"Authorization": "Bearer " + consumer.hub.settings.token}
+    client = await maintenance_client(gateway)
+    try:
+        p = project(store)
+        previous = ask(store, p["id"])
+        claimed = store.claim_next("beta", "old-worker")
+        dispatched = store.update(
+            previous["id"],
+            "beta",
+            "old-worker",
+            "dispatch",
+            evidence={"session_id": "old-native", "execution_id": "old-execution"},
+            claim=claimed["claim"],
+        )
+        store.reply(previous["id"], "beta", "Early reply", claim=claimed["claim"])
+        before = store.get_message(previous["id"], "beta")
+        assert not gateway.maintenance_state()["idle"] and consumer.recovery_pending
+        response = await client.post("/maintenance", json={"action": "drain"}, headers=headers)
+        assert response.status == 200
+        state = await response.json()
+        assert not state["idle"] and state["collaboration"] == 1
+        assert state["native_boundary_unknown"] and await local.native_boundary_unknown()
+        assert not consumer.recovery_pending and len(consumer.inherited_claims) == 1
+        assert store.get_message(previous["id"], "beta") == before
+        response = await client.post("/maintenance", json={"action": "seal"}, headers=headers)
+        assert response.status == 409 and not gateway.sealed
+        await clients["beta"].request(
+            "POST",
+            f"/messages/{previous['id']}/update",
+            {
+                "instance": "old-worker",
+                "claim": claimed["claim"],
+                "state": "execution_settled",
+                "expected_execution_id": "old-execution",
+                "evidence": {
+                    "session_id": "old-native",
+                    "execution_id": "old-execution",
+                    "native_dispatched": True,
+                    "stop_reason": "end_turn",
+                    "pending": False,
+                    "completed_at": dispatched["evidence"]["dispatch_started"] + 1,
+                },
+            },
+        )
+        await consumer.set_admission("controls")
+        assert consumer.inherited_claims == []
+        state = gateway.maintenance_state()
+        assert (
+            state["collaboration"] == 0 and state["native_boundary_unknown"] and not state["idle"]
+        )
+    finally:
+        await consumer.close()
+        await client.close()
+        await local.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "missing", "foreign"])
+async def test_missing_actor_recovery_cannot_prove_maintenance_idle(tmp_path, failure):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = maintenance_gateway()
+    gateway.config.db_path = tmp_path / "project.db"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    real_request = consumer.hub.request
+
+    async def failed_recovery(method, path, body=None):
+        if path == "/claims":
+            if failure == "unavailable":
+                raise HubError("Recovery evidence unavailable", status=503)
+            if failure == "missing":
+                return None
+            return [{"id": "foreign", "recipient": "alpha", "evidence": {}}]
+        return await real_request(method, path, body)
+
+    consumer.hub.request = failed_recovery
+    client = await maintenance_client(gateway)
+    headers = {"Authorization": "Bearer " + consumer.hub.settings.token}
+    try:
+        response = await client.post("/maintenance", json={"action": "drain"}, headers=headers)
+        assert response.status == 409
+        assert consumer.recovery_pending and not gateway.maintenance_state()["idle"]
+        response = await client.post("/maintenance", json={"action": "seal"}, headers=headers)
+        assert response.status == 409 and not gateway.sealed
+        consumer.hub.request = real_request
+        response = await client.post("/maintenance", json={"action": "drain"}, headers=headers)
+        assert response.status == 200
+        assert not consumer.recovery_pending and not consumer.claim_uncertain
+        assert gateway.maintenance_state()["idle"]
+    finally:
+        await consumer.close()
+        await client.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("sidecar", [False, True])
+async def test_configured_gateway_cannot_report_idle_before_consumer_initializes(
+    monkeypatch, sidecar
+):
+    if sidecar:
+        monkeypatch.delenv("MATTERMOST_COLLAB_URL", raising=False)
+    else:
+        monkeypatch.setenv("MATTERMOST_COLLAB_URL", "http://127.0.0.1:18781")
+    gateway = active_gateway(busy=False)
+    gateway.collaboration = None
+    gateway.sessions.broker.native_boundary_idle = True
+    if sidecar:
+        # Recreate with sidecar configuration so its constructor observes it.
+        gateway.config.collab_sidecar = True
+        gateway = type(gateway)(gateway.config, gateway.client, gateway.sessions)
+    state = gateway.maintenance_state()
+    assert not state["idle"] and state["collaboration"] == 1
+
+
+async def test_consumer_recovers_actor_debt_before_first_mailbox_poll(tmp_path):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    consumer = CollaborationConsumer(gateway, clients["beta"].settings)
+    gateway.collaboration = consumer
+    recovering, release, polling = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    real_request = consumer.hub.request
+
+    async def delayed_recovery(method, path, body=None):
+        if path == "/claims":
+            recovering.set()
+            await release.wait()
+        if path.startswith("/mailbox?"):
+            assert not consumer.recovery_pending
+            assert len(consumer.inherited_claims) == 1
+            polling.set()
+        return await real_request(method, path, body)
+
+    consumer.hub.request = delayed_recovery
+    try:
+        p = project(store)
+        request = ask(store, p["id"])
+        store.claim_next("beta", "old-worker")
+        before = store.get_message(request["id"], "beta")
+        consumer.start()
+        await asyncio.wait_for(recovering.wait(), 2)
+        assert not polling.is_set() and not gateway.maintenance_state()["idle"]
+        release.set()
+        await asyncio.wait_for(polling.wait(), 2)
+        gateway.run_prompt.assert_not_awaited()
+        assert store.get_message(request["id"], "beta") == before
+    finally:
+        release.set()
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("settled", [False, True])
+def test_legacy_native_debt_retains_worker_slot_and_binding_until_settled(tmp_path, settled):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    try:
+        p = project(store, max_workers=1)
+        previous = ask(store, p["id"])
+        claimed = store.claim_next("beta", "old-worker")
+        store.update(
+            previous["id"],
+            "beta",
+            "old-worker",
+            "dispatch",
+            evidence={"session_id": "old-native", "execution_id": "old-execution"},
+            claim=claimed["claim"],
+        )
+        store.reply(previous["id"], "beta", "Early reply", claim=claimed["claim"])
+        with store.transaction():
+            current = store.get_message(previous["id"], "beta")
+            if settled:
+                current["execution_pending"] = False
+            else:
+                current.pop("execution_pending")
+            store.save_message(current)
+        another = ask(store, p["id"], recipient="gamma", key="another-worker")
+        binding = {"thread_id": "another-thread", "channel_id": "floor"}
+        if settled:
+            assert store.bind(p["id"], "beta", binding)["thread_id"] == "another-thread"
+            assert store.claim_next("gamma", "new-worker")["id"] == another["id"]
+        else:
+            with pytest.raises(ValueError, match="active requests"):
+                store.bind(p["id"], "beta", binding)
+            assert store.claim_next("gamma", "new-worker") is None
+    finally:
+        store.close()

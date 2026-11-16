@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import time
 import uuid
@@ -100,6 +101,12 @@ class MattermostGateway:
         self._prompt_locks: dict[str, asyncio.Lock] = {}
         self._last_terminal: dict[str, dict] = {}
         self.collaboration = None
+        # The maintenance listener starts before run() constructs its consumer.
+        # A configured project gateway cannot declare idleness in that interval.
+        self.collaboration_recovery_pending = bool(
+            os.environ.get("MATTERMOST_COLLAB_URL", "").strip()
+            or getattr(config, "collab_sidecar", False)
+        )
         self.draining = False
         self.sealed = False
         self._inbound_tasks = set()
@@ -128,6 +135,8 @@ class MattermostGateway:
         from mattermost_acp.collaboration.consumer import CollaborationConsumer
 
         settings = Settings.load()
+        if settings is not None:
+            self.collaboration_recovery_pending = True
         if getattr(self.config, "collab_sidecar", False) and settings is None:
             raise ValueError("A collaboration sidecar requires a configured hub")
         await self._ensure_peer_membership()
@@ -790,9 +799,11 @@ class MattermostGateway:
                 + int(getattr(self.collaboration, "claiming", False))
                 + int(getattr(self.collaboration, "claim_uncertain", False))
                 + getattr(self.collaboration, "admission_pending", 0)
+                + int(getattr(self.collaboration, "recovery_pending", False))
+                + len(getattr(self.collaboration, "inherited_claims", ()))
             )
             if self.collaboration
-            else 0,
+            else int(self.collaboration_recovery_pending),
             "sidecar": getattr(self.config, "collab_sidecar", False),
             "actor": getattr(self.collaboration, "actor", ""),
             "harness": self.config.harness,

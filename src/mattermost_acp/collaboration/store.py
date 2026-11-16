@@ -14,6 +14,11 @@ from pathlib import Path
 ACTIVE = {"running", "unconfirmed", "cancelling"}
 TERMINAL = {"done", "failed", "blocked", "cancelled"}
 WORK = {"ask", "work"}
+PENDING_EXECUTION = (
+    "COALESCE(json_extract(data,'$.execution_pending'),"
+    "(json_extract(data,'$.evidence.session_id') IS NOT NULL "
+    "AND json_extract(data,'$.evidence.dispatch_started') IS NOT NULL))=1"
+)
 
 
 def identifier() -> str:
@@ -339,7 +344,7 @@ class CollaborationStore:
             if self.db.execute(
                 "SELECT 1 FROM messages WHERE project=? AND recipient=? "
                 "AND (state IN ('running','unconfirmed','interrupted','cancelling') "
-                "OR json_extract(data,'$.execution_pending')=1)",
+                "OR " + PENDING_EXECUTION + ")",
                 (pid, actor),
             ).fetchone():
                 raise ValueError("Cannot change a binding with active requests")
@@ -501,14 +506,19 @@ class CollaborationStore:
                     item["recovery"] = "Worker lease expired; reconcile before retry"
                     self.save_message(item)
 
-    def active_claims(self, actor, instance):
+    def active_claims(self, actor, instance=None):
         rows = self.db.execute(
             "SELECT data FROM messages WHERE recipient=? AND (state IN "
             "('running','cancelling','unconfirmed','interrupted') "
-            "OR json_extract(data,'$.execution_pending')=1)",
+            "OR " + PENDING_EXECUTION + ")",
             (actor,),
         ).fetchall()
-        return [item for row in rows if (item := json.loads(row[0])).get("instance") == instance]
+        return [
+            item
+            for row in rows
+            if (item := json.loads(row[0]))
+            and (instance is None or item.get("instance") == instance)
+        ]
 
     def claim_next(self, actor, instance, *, controls_only=False):
         with self.transaction():
@@ -530,8 +540,10 @@ class CollaborationStore:
                         continue
                     if self.db.execute(
                         "SELECT 1 FROM messages WHERE project=? AND recipient=? "
-                        "AND state IN ('unconfirmed','interrupted')",
-                        (project["id"], actor),
+                        "AND (state IN ('unconfirmed','interrupted') OR ("
+                        + PENDING_EXECUTION
+                        + " AND json_extract(data,'$.instance') IS NOT ?))",
+                        (project["id"], actor, instance),
                     ).fetchone():
                         continue
                     if any(
@@ -543,7 +555,7 @@ class CollaborationStore:
                         "SELECT count(*) FROM messages WHERE project=? "
                         "AND kind IN ('ask','work') AND (state IN "
                         "('running','unconfirmed','interrupted','cancelling') "
-                        "OR json_extract(data,'$.execution_pending')=1)",
+                        "OR " + PENDING_EXECUTION + ")",
                         (project["id"],),
                     ).fetchone()[0]
                     if active >= project["limits"]["max_workers"]:
@@ -556,7 +568,7 @@ class CollaborationStore:
                         sibling = self.db.execute(
                             "SELECT data FROM messages WHERE project=? AND kind IN ('ask','work') "
                             "AND (state IN ('running','unconfirmed','interrupted','cancelling') "
-                            "OR json_extract(data,'$.execution_pending')=1)",
+                            "OR " + PENDING_EXECUTION + ")",
                             (project["id"],),
                         ).fetchall()
                         if (
@@ -578,7 +590,7 @@ class CollaborationStore:
                             "SELECT 1 FROM messages WHERE project=? AND recipient=? "
                             "AND kind IN ('ask','work') AND (state IN "
                             "('running','unconfirmed','interrupted','cancelling') "
-                            "OR json_extract(data,'$.execution_pending')=1)",
+                            "OR " + PENDING_EXECUTION + ")",
                             (project["id"], actor),
                         ).fetchone()
                     ):
