@@ -184,6 +184,9 @@ class MattermostGateway:
             )
 
     async def _handle_posted_safe(self, posted: PostedEvent) -> None:
+        task = asyncio.current_task()
+        owns_tracking = task not in self._inbound_tasks
+        self._inbound_tasks.add(task)
         try:
             await self.handle_posted(posted)
         except Exception:
@@ -197,6 +200,9 @@ class MattermostGateway:
                 )
             except Exception:
                 logger.exception("failed to post error notice")
+        finally:
+            if owns_tracking:
+                self._inbound_tasks.discard(task)
 
     async def _join_all_public_channels(self) -> None:
         """Join every public channel on the team. WS `posted` events only
@@ -255,11 +261,17 @@ class MattermostGateway:
             "tool_call",
             "tool_call_update",
             "subagent_activity",
+            "async_task_spawned",
+            "async_task_progress",
+            "async_task_state_update",
         }:
             return
         previous = report.get("previous")
         while previous is not None:
-            previous["reporter"].observe(update)
+            if report.get("preparing") or report.get("native_dispatched") is False:
+                previous["reporter"].observe(update)
+            else:
+                previous["reporter"].observe_retained(update)
             previous = previous.get("previous")
         # Observe native work before a queued prompt callback or final write
         # guard can run. The callback consumes the same event without applying
@@ -355,11 +367,13 @@ class MattermostGateway:
 
     async def handle_posted(self, posted: PostedEvent) -> None:
         task = asyncio.current_task()
+        owns_tracking = task not in self._inbound_tasks
         self._inbound_tasks.add(task)
         try:
             await self._handle_posted(posted)
         finally:
-            self._inbound_tasks.discard(task)
+            if owns_tracking:
+                self._inbound_tasks.discard(task)
 
     async def _handle_posted(self, posted: PostedEvent) -> None:
         if (
@@ -1037,7 +1051,10 @@ class MattermostGateway:
                     reporter.observe(update)
                     prior = report.get("previous")
                     while prior is not None:
-                        prior["reporter"].observe(update)
+                        if report.get("preparing") or report.get("native_dispatched") is False:
+                            prior["reporter"].observe(update)
+                        else:
+                            prior["reporter"].observe_retained(update)
                         prior = prior.get("previous")
                 if update.kind == "agent_message_chunk":
                     if not update.text:

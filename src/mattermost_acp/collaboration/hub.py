@@ -510,7 +510,9 @@ def main():
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         # The path fence also covers creation; the inode fence covers hard-link
         # aliases before recovery can touch a running database.
-        with args.db.open("a+b") as database:
+        with os.fdopen(
+            os.open(args.db, os.O_CREAT | os.O_RDWR | os.O_APPEND, 0o600), "a+b"
+        ) as database:
             fcntl.flock(database, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if os.fstat(database.fileno()).st_nlink != 1:
                 raise ValueError("Collaboration databases must not have hard-link aliases")

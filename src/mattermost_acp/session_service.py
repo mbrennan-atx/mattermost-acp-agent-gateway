@@ -578,6 +578,22 @@ class SessionService:
         await self.broker.cancel(record.session_id)
         return True
 
+    async def stop_async_task(
+        self, thread_id: str, task_id: str, *, expected_session, expected_epoch, guard
+    ) -> bool:
+        record = await self.store.get(thread_id)
+        if record is None or record.session_id != expected_session:
+            raise NativeDispatchChanged("Native session changed before task cancellation")
+        return await self.broker.stop_async_task(
+            expected_session,
+            task_id,
+            guard=lambda: (
+                thread_id not in self._replacement_pending
+                and self.native_epoch(thread_id) == expected_epoch
+                and guard()
+            ),
+        )
+
     async def new_session(
         self,
         thread_id: str,

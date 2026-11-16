@@ -1231,6 +1231,39 @@ class CollaborationConsumer:
                     return
                 # Repeat an idempotent cancellation until actual termination is observed.
                 try:
+                    reporter = current["reporter"]
+                    if hasattr(reporter, "stoppable_async_tasks"):
+                        for task_id in reporter.stoppable_async_tasks():
+                            stopped = current.setdefault("async_stop_requested", set())
+                            if task_id in stopped:
+                                continue
+                            execution = reserved.get("execution_id")
+
+                            def may_stop(
+                                task_id=task_id,
+                                owned=owned,
+                                expected=expected,
+                                key=key,
+                                execution=execution,
+                                reporter=reporter,
+                            ):
+                                return (
+                                    self.gateway._reports.get(expected) is owned
+                                    and self.ownership.get(key) is owned
+                                    and owned.get("execution_id") == execution
+                                    and key not in self.reserving
+                                    and reporter.owns_async_task(task_id)
+                                )
+
+                            accepted = await self.gateway.sessions.stop_async_task(
+                                binding["thread_id"],
+                                task_id,
+                                expected_session=expected,
+                                expected_epoch=reserved.get("native_epoch"),
+                                guard=may_stop,
+                            )
+                            if accepted:
+                                stopped.add(task_id)
                     await self.gateway.sessions.cancel(
                         binding["thread_id"],
                         expected_session=expected,

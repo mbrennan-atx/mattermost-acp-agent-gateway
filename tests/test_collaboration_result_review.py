@@ -5,6 +5,7 @@ import json
 import os
 import re
 import stat
+import sys
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -23,12 +24,256 @@ from test_collaboration_regressions import (
 )
 
 from mattermost_acp.acp import AcpBroker, SessionUpdate, TurnResult
+from mattermost_acp.acp.broker import NativeDispatchChanged
 from mattermost_acp.collaboration.client import HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import MattermostClient, PostedEvent
 from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
+
+
+@pytest.mark.parametrize("termination", ["verified", "ack-only", "missing-lifecycle", "foreign-id"])
+async def test_detached_claude_command_requires_owned_task_stop_and_terminal_lifecycle(
+    tmp_path, termination
+):
+    marker = tmp_path / "command-running"
+    command = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text('running'); time.sleep(300)",
+        str(marker),
+        start_new_session=True,
+    )
+    try:
+        async with asyncio.timeout(3):
+            while not marker.exists():
+                await asyncio.sleep(0.01)
+        async with retained_parent(tmp_path) as (
+            store,
+            _clients,
+            gateway,
+            consumer,
+            p,
+            parent,
+            report,
+        ):
+            broker, writer = memory_broker()
+            sessions = SessionService(broker, gateway.sessions.store, default_cwd=tmp_path)
+            sessions._native_epochs["discussion"] = 7
+            gateway.sessions = sessions
+            broker.update_observer = gateway._observe_background_update
+            report["reporter"] = TurnReporter()
+
+            async def native(update):
+                await broker._dispatch(
+                    {
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "existing-native",
+                            "update": update,
+                        },
+                    }
+                )
+
+            await native(
+                {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "project-bash",
+                    "status": "in_progress",
+                    "_meta": {"claudeCode": {"toolName": "Bash"}},
+                    "rawInput": {
+                        "command": "synthetic detached command",
+                        "run_in_background": True,
+                    },
+                }
+            )
+            if termination != "missing-lifecycle":
+                await native(
+                    {
+                        "sessionUpdate": "async_task_spawned",
+                        "asyncTaskId": "command-task",
+                        "taskType": "local_bash",
+                        "canStop": True,
+                        "toolCallId": "foreign-bash"
+                        if termination == "foreign-id"
+                        else "project-bash",
+                    }
+                )
+            await native(
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "project-bash",
+                    "status": "completed",
+                    "_meta": {"claudeCode": {"toolName": "Bash"}},
+                }
+            )
+            assert report["reporter"].has_pending_work()
+            store.reply(parent["id"], "beta", "Early result", claim=parent["claim"])
+            assert store.cancel(p["id"], "alpha")["status"] == "cancelling"
+            control = store.claim_next("beta", consumer.instance, controls_only=True)
+            native_cancelled = asyncio.Event()
+            replies = []
+
+            async def stop_reply(message):
+                if termination == "verified":
+                    command.terminate()
+                    await command.wait()
+                    await native(
+                        {
+                            "sessionUpdate": "async_task_state_update",
+                            "asyncTaskId": "command-task",
+                            "state": "stopped",
+                        }
+                    )
+                await broker._dispatch({"id": message["id"], "result": {"stopped": True}})
+
+            def write(payload):
+                message = json.loads(payload)
+                writer.messages.append(message)
+                if message["method"] == "_session/async_task/stop":
+                    replies.append(asyncio.create_task(stop_reply(message)))
+                elif message["method"] == "session/cancel":
+                    native_cancelled.set()
+
+            writer.write = write
+            task = asyncio.create_task(consumer.handle_cancel(control))
+            try:
+                await asyncio.wait_for(native_cancelled.wait(), 3)
+                stops = [
+                    msg for msg in writer.messages if msg["method"] == "_session/async_task/stop"
+                ]
+                assert len(stops) == (1 if termination in {"verified", "ack-only"} else 0)
+                if stops:
+                    assert stops[0]["params"] == {
+                        "sessionId": "existing-native",
+                        "asyncTaskId": "command-task",
+                    }
+                if termination == "verified":
+                    await asyncio.wait_for(task, 3)
+                    assert command.returncode is not None
+                    assert store.get_project(p["id"], "alpha")["status"] == "cancelled"
+                    assert store.get_message(parent["id"], "beta")["execution_pending"] is False
+                    assert gateway.maintenance_state()["native_boundary_unknown"] is True
+                else:
+                    assert command.returncode is None and marker.read_text() == "running"
+                    assert store.get_project(p["id"], "alpha")["status"] == "cancelling"
+                    assert store.get_message(parent["id"], "beta")["execution_pending"] is True
+                    assert consumer.ownership[(parent["id"], parent["claim"])] is report
+                    assert gateway.background_pending("discussion")
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, *replies, return_exceptions=True)
+                await close_reports(gateway)
+    finally:
+        if command.returncode is None:
+            command.terminate()
+        await command.wait()
+
+
+@pytest.mark.parametrize("changed", ["epoch", "ownership"])
+async def test_native_async_task_stop_rechecks_ownership_at_actual_write(tmp_path, changed):
+    broker, writer = memory_broker()
+    sessions = SessionService(
+        broker,
+        SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(session_id="native"))),
+        default_cwd=tmp_path,
+    )
+    owned = True
+    await broker._write_lock.acquire()
+    task = asyncio.create_task(
+        sessions.stop_async_task(
+            "discussion",
+            "project-task",
+            expected_session="native",
+            expected_epoch=0,
+            guard=lambda: owned,
+        )
+    )
+    try:
+        async with asyncio.timeout(2):
+            while not broker._pending:
+                await asyncio.sleep(0)
+        if changed == "epoch":
+            sessions._advance_native("discussion")
+        else:
+            owned = False
+        broker._write_lock.release()
+        with pytest.raises(NativeDispatchChanged):
+            await task
+        assert writer.messages == [] and not broker._pending
+    finally:
+        if broker._write_lock.locked():
+            broker._write_lock.release()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_native_child_foreground_completion_does_not_settle_its_detached_command(tmp_path):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, report):
+        broker, writer = memory_broker()
+        gateway.sessions = SessionService(broker, gateway.sessions.store, default_cwd=tmp_path)
+        gateway.sessions._native_epochs["discussion"] = 7
+        broker.update_observer = gateway._observe_background_update
+        report["reporter"] = TurnReporter()
+
+        async def native(session, update):
+            await broker._dispatch(
+                {
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session,
+                        "update": update,
+                    },
+                }
+            )
+
+        await native(
+            "existing-native",
+            {
+                "sessionUpdate": "subagent_spawned",
+                "subagentSessionId": "native-child",
+                "name": "child",
+            },
+        )
+        await native(
+            "native-child",
+            {
+                "sessionUpdate": "async_task_spawned",
+                "asyncTaskId": "child-command",
+                "toolCallId": "child-bash",
+                "canStop": True,
+            },
+        )
+        await native(
+            "existing-native",
+            {
+                "sessionUpdate": "subagent_state_update",
+                "subagentSessionId": "native-child",
+                "state": "completed",
+            },
+        )
+        assert report["reporter"].has_pending_work()
+        assert report["reporter"].stoppable_async_tasks() == []
+        store.reply(parent["id"], "beta", "Early result", claim=parent["claim"])
+        assert store.cancel(p["id"], "alpha")["status"] == "cancelling"
+        state = store.get_message(parent["id"], "beta")
+        await consumer.settle_ownership((parent["id"], parent["claim"]), state)
+        assert store.get_message(parent["id"], "beta")["execution_pending"] is True
+        assert writer.messages == []
+        await native(
+            "native-child",
+            {
+                "sessionUpdate": "async_task_state_update",
+                "asyncTaskId": "child-command",
+                "state": "stopped",
+            },
+        )
+        assert not report["reporter"].has_pending_work()
+        await consumer.settle_ownership((parent["id"], parent["claim"]), state)
+        assert store.get_message(parent["id"], "beta")["execution_pending"] is False
+        assert store.get_project(p["id"], "alpha")["status"] == "cancelled"
+        await close_reports(gateway)
 
 
 def test_result_retry_at_full_work_budget_preserves_result_and_requires_reconciliation(tmp_path):

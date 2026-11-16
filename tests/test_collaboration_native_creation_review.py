@@ -35,6 +35,32 @@ from mattermost_acp.session_service import SessionService, ThreadBusy
 from mattermost_acp.store import ThreadStore
 
 
+@pytest.mark.parametrize("backend", ["claude", "codex", "grok"])
+async def test_async_task_capability_negotiation_reaches_only_claude_initialize(backend):
+    broker = AcpBroker(backend=backend, process_factory=spawn_fake_agent_process)
+    actual = broker._write
+    writes = []
+
+    async def capture(message, **kwargs):
+        writes.append(message)
+        return await actual(message, **kwargs)
+
+    broker._write = capture
+    try:
+        await broker.start()
+        initialize = next(message for message in writes if message["method"] == "initialize")
+        caps = initialize["params"]["clientCapabilities"]
+        assert caps["subagents"] == {}
+        if backend == "claude":
+            assert caps["_meta"] == {
+                "jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}
+            }
+        else:
+            assert caps == {"subagents": {}}
+    finally:
+        await broker.stop()
+
+
 @pytest.fixture
 async def native(tmp_path):
     broker = AcpBroker(process_factory=spawn_fake_agent_process)

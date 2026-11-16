@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -30,6 +31,7 @@ from mattermost_acp.acp import SessionUpdate, TurnResult
 from mattermost_acp.collaboration import hub
 from mattermost_acp.collaboration.client import HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
+from mattermost_acp.mm.client import PostedEvent
 from mattermost_acp.mm.http import build_slash_app
 from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
@@ -45,6 +47,105 @@ def hub_config(tmp_path):
     config = tmp_path / "actors.json"
     config.write_text(json.dumps({"actors": {"alpha": {"token_file": str(token)}}}))
     return config
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_hub_database_is_private_before_inode_lock_or_sqlite(tmp_path, monkeypatch, existing):
+    config = hub_config(tmp_path)
+    db = tmp_path / "hub.db"
+    if existing:
+        db.write_bytes(b"preserved existing bytes")
+        db.chmod(0o640)
+    before_inode = db.stat().st_ino if existing else None
+    actual_flock = hub.fcntl.flock
+    observed = []
+
+    def checked_flock(file, operation):
+        info = os.fstat(file.fileno())
+        if db.exists() and info.st_ino == db.stat().st_ino:
+            observed.append(stat.S_IMODE(info.st_mode))
+            assert observed[-1] == (0o640 if existing else 0o600)
+            if existing:
+                assert info.st_ino == before_inode
+                assert db.read_bytes() == b"preserved existing bytes"
+            raise RuntimeError("Reached inode lock before SQLite")
+        return actual_flock(file, operation)
+
+    monkeypatch.setattr(hub.fcntl, "flock", checked_flock)
+    monkeypatch.setattr(
+        hub, "CollaborationStore", lambda *args: pytest.fail("Unexpected SQLite open")
+    )
+    monkeypatch.setattr(sys, "argv", hub_arguments(config, db))
+    old_umask = os.umask(0)
+    try:
+        with pytest.raises(RuntimeError, match="Reached inode lock"):
+            hub.main()
+    finally:
+        os.umask(old_umask)
+    assert observed == [0o640 if existing else 0o600]
+
+
+@pytest.mark.parametrize("outcome", ["posted", "failed", "cancelled"])
+async def test_accepted_attachment_error_delivery_blocks_cold_gateway_seal(tmp_path, outcome):
+    gateway = maintenance_gateway()
+    gateway.config.all_channels = True
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    gateway.config.attachments_dir = tmp_path / "blocked-directory"
+    gateway.config.attachments_dir.write_text("prevents attachment directory creation")
+    gateway.config.attachments_max_bytes = 1000
+    gateway.client.get_file_info = AsyncMock(return_value={"name": "notes.txt", "size": 5})
+    gateway.client.get_file = AsyncMock(return_value=b"notes")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def post_error(channel, message, root_id=None):
+        assert "gateway error" in message and channel == "home" and root_id == "origin"
+        entered.set()
+        await release.wait()
+        if outcome == "failed":
+            raise RuntimeError("Error notice unavailable")
+        return {"id": "error-notice"}
+
+    gateway.client.create_post = post_error
+    posted = PostedEvent(
+        "accepted-post", "home", "alpha-user", "Read attachment", "origin", file_ids=("attachment",)
+    )
+    task = asyncio.create_task(gateway._handle_posted_safe(posted))
+    client = await maintenance_client(gateway)
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        state = gateway.maintenance_state()
+        assert state["inbound"] == 1 and state["native_boundary_unknown"] is False
+        response = await client.post(
+            "/maintenance",
+            json={"action": "drain"},
+            headers={"Authorization": "Bearer synthetic-maintenance-token"},
+        )
+        assert response.status == 200
+        response = await client.post(
+            "/maintenance",
+            json={"action": "seal"},
+            headers={"Authorization": "Bearer synthetic-maintenance-token"},
+        )
+        assert response.status == 409 and not gateway.sealed
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            await asyncio.wait_for(task, 2)
+        assert gateway.maintenance_state()["inbound"] == 0
+        response = await client.post(
+            "/maintenance",
+            json={"action": "seal"},
+            headers={"Authorization": "Bearer synthetic-maintenance-token"},
+        )
+        assert response.status == 200 and gateway.sealed
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.close()
 
 
 @pytest.mark.parametrize("alias", ["file", "directory", "hard-link"])

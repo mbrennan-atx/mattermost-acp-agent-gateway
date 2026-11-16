@@ -390,7 +390,20 @@ class AcpBroker:
                     "initialize",
                     {
                         "protocolVersion": 1,
-                        "clientCapabilities": {"subagents": {}},
+                        "clientCapabilities": {
+                            "subagents": {},
+                            **(
+                                {
+                                    "_meta": {
+                                        "jetbrains": {
+                                            "air": {"version": 1, "capabilities": ["asyncTasks"]}
+                                        }
+                                    }
+                                }
+                                if self.backend == "claude"
+                                else {}
+                            ),
+                        },
                         "clientInfo": {
                             "name": "mattermost-acp-gateway",
                             "title": "Mattermost ACP gateway",
@@ -694,6 +707,17 @@ class AcpBroker:
                 guard=guard,
                 on_write=on_dispatched,
             )
+
+    async def stop_async_task(self, session_id: str, task_id: str, *, guard) -> bool:
+        if self.backend != "claude":
+            raise AcpError("Native async task stop is unsupported by this adapter")
+        result = await self.request(
+            "_session/async_task/stop",
+            {"sessionId": session_id, "asyncTaskId": task_id},
+            guard=guard,
+        )
+        # This acknowledges the request; lifecycle notifications prove completion.
+        return isinstance(result, dict) and result.get("stopped") is True
 
     async def prompt_turn(
         self,

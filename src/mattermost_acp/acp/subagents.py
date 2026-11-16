@@ -22,6 +22,7 @@ class Worker:
     latest: str = ""
     updated_at: float = field(default_factory=time.monotonic)
     parts: str = ""
+    async_tasks: dict[str, str] = field(default_factory=dict)
 
 
 class SubagentTracker:
@@ -52,6 +53,10 @@ class SubagentTracker:
                         "model": worker.model,
                         "latest": worker.latest,
                         "updated_at": worker.updated_at,
+                        "pending_async_work": any(
+                            state not in {"completed", "failed", "stopped"}
+                            for state in worker.async_tasks.values()
+                        ),
                     },
                 )
             )
@@ -117,6 +122,23 @@ class SubagentTracker:
             worker.parts = ""
             if not worker.latest:
                 worker.latest = "Using tools"
+        elif update.kind in {
+            "async_task_spawned",
+            "async_task_progress",
+            "async_task_state_update",
+        }:
+            task_id = raw.get("asyncTaskId")
+            if not isinstance(task_id, str) or not task_id:
+                return []
+            previous = worker.async_tasks.get(task_id, "running")
+            state = raw.get("state", previous)
+            state = state if isinstance(state, str) else "unknown"
+            if previous not in {"completed", "failed", "stopped"} or state in {
+                "completed",
+                "failed",
+                "stopped",
+            }:
+                worker.async_tasks[task_id] = state
         elif update.model_id:
             worker.model = _short(update.model_id, 80)
         else:
