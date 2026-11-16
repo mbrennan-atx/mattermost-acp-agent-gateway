@@ -10,6 +10,7 @@ import math
 import os
 import re
 import shlex
+import stat
 import sys
 import time
 import uuid
@@ -1766,18 +1767,64 @@ class CollaborationConsumer:
 
     def save_stops(self):
         self.stops_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = self.stops_path.with_name(self.stops_path.name + "." + self.instance)
-        with temporary.open("w") as stream:
-            temporary.chmod(0o600)
-            json.dump(self.pending_stops, stream, sort_keys=True)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, self.stops_path)
-        directory = os.open(self.stops_path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        directory = os.open(
+            self.stops_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+        temporary = f".{self.stops_path.name}.{uuid.uuid4().hex}.tmp"
+        identity = None
+        fd = None
         try:
+            info = os.fstat(directory)
+            if info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                raise PermissionError("Project stop state directory is not privately writable")
+
+            def check_directory():
+                named = self.stops_path.parent.lstat()
+                if not stat.S_ISDIR(named.st_mode) or (named.st_dev, named.st_ino) != (
+                    info.st_dev,
+                    info.st_ino,
+                ):
+                    raise OSError("Project stop state directory changed during persistence")
+
+            check_directory()
+            fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=directory,
+            )
+            with os.fdopen(fd, "w", closefd=False) as stream:
+                created = os.fstat(stream.fileno())
+                identity = (created.st_dev, created.st_ino)
+                os.fchmod(stream.fileno(), 0o600)
+                json.dump(self.pending_stops, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            check_directory()
+            named = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != identity:
+                raise OSError("Project stop temporary file changed during persistence")
+            os.replace(
+                temporary, self.stops_path.name, src_dir_fd=directory, dst_dir_fd=directory
+            )
             os.fsync(directory)
+            check_directory()
         finally:
-            os.close(directory)
+            try:
+                if identity is not None:
+                    try:
+                        named = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if (named.st_dev, named.st_ino) == identity:
+                            os.unlink(temporary, dir_fd=directory)
+            finally:
+                try:
+                    if fd is not None:
+                        os.close(fd)
+                finally:
+                    os.close(directory)
 
     async def post_result(self, item):
         thread, channel = item["origin_thread_id"], item["origin_channel_id"]

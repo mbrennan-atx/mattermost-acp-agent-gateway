@@ -34,6 +34,7 @@ class TurnReporter:
         self.background_requested: set[str] = set()
         self.detached_tools: set[str] = set()
         self.async_tasks: dict[str, dict] = {}
+        self._terminal_async_tasks_by_tool: dict[str, set[str]] = {}
         self.parts = ""
         self.post_id: str | None = None
 
@@ -75,10 +76,7 @@ class TurnReporter:
                     or (isinstance(background, dict) and background.get("backgrounded") is True)
                 ):
                     self.detached_tools.add(tool_id)
-                    if any(
-                        task.get("toolCallId") == tool_id and task.get("state") in ASYNC_TERMINAL
-                        for task in self.async_tasks.values()
-                    ):
+                    if self._terminal_async_tasks_by_tool.get(tool_id):
                         self.detached_tools.discard(tool_id)
                 if state in {"completed", "success", "failed", "cancelled", "canceled", "error"}:
                     self.active_tools.discard(tool_id)
@@ -104,6 +102,13 @@ class TurnReporter:
                 return
             task = self.async_tasks.setdefault(task_id, {"state": "running"})
             prior_state = task.get("state")
+            prior_tool = task.get("toolCallId")
+            if prior_state in ASYNC_TERMINAL and isinstance(prior_tool, str):
+                prior_tasks = self._terminal_async_tasks_by_tool.get(prior_tool)
+                if prior_tasks is not None:
+                    prior_tasks.discard(task_id)
+                    if not prior_tasks:
+                        self._terminal_async_tasks_by_tool.pop(prior_tool)
             task.update(update.raw)
             if not isinstance(task.get("state"), str):
                 task["state"] = "unknown"
@@ -113,6 +118,8 @@ class TurnReporter:
             tool_id = tool_id if isinstance(tool_id, str) else None
             task["owned"] = tool_id in self.observed_tools
             if task.get("state") in ASYNC_TERMINAL:
+                if tool_id is not None:
+                    self._terminal_async_tasks_by_tool.setdefault(tool_id, set()).add(task_id)
                 self.detached_tools.discard(tool_id)
 
     def observe_retained(self, update: SessionUpdate) -> None:
