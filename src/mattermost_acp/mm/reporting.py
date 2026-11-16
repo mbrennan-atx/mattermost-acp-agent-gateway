@@ -129,7 +129,17 @@ class TurnReporter:
         self.observe(update)
 
     def owns_async_task(self, task_id: str) -> bool:
-        task = self.async_tasks.get(task_id, {})
+        tasks = []
+        if task_id in self.async_tasks:
+            tasks.append(self.async_tasks[task_id])
+        for worker in self.workers.values():
+            child_tasks = worker.get("async_tasks", {})
+            if isinstance(child_tasks, dict) and task_id in child_tasks:
+                tasks.append(child_tasks[task_id])
+        # A task ID shared by distinct protocol sources has ambiguous stop ownership.
+        if len(tasks) != 1 or not isinstance(tasks[0], dict):
+            return False
+        task = tasks[0]
         return (
             task.get("owned") is True
             and task.get("canStop") is True
@@ -137,7 +147,12 @@ class TurnReporter:
         )
 
     def stoppable_async_tasks(self) -> list[str]:
-        return [task_id for task_id in self.async_tasks if self.owns_async_task(task_id)]
+        task_ids = set(self.async_tasks)
+        for worker in self.workers.values():
+            tasks = worker.get("async_tasks", {})
+            if isinstance(tasks, dict):
+                task_ids.update(tasks)
+        return sorted(task_id for task_id in task_ids if self.owns_async_task(task_id))
 
     def has_live_workers(self) -> bool:
         return any(

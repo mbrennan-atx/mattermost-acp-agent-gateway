@@ -115,3 +115,12 @@ The combined parent suite passes 1,094 tests with one optional adapter skip in 1
 Queryable execution-debt and discussion metadata preserve legacy receipts while indexed actor recovery and floor admission avoid decoding unrelated retained history. Migration/reopen, query-plan and decode guards pass. An actual cold standalone slash launcher now schedules restart after completion; unfinished commands still block it. The 21-case index/restart batch passes.
 
 The finalized late ordinary-Claude injection finding did not reproduce with the installed adapter: steer returned promptRequired/noRunningTurn, and the local broker/hub path queued then completed in a fresh turn. This does not establish complete native goal or queue idleness. Durable stop ordering, final integrated review, hosted CI and live acceptance remain pending.
+
+
+## Cancellation, settings and elapsed-clock corrections
+
+Parent inspected the finalized public Sol/high report at source 6f128bd and integrated all six supported corrections. Stop retry failures retain their native/origin fence while unrelated mailbox work proceeds. Transient lease renewal failures retry. New reservation tokens and native epochs link terminal settlement independently of wall-clock order; legacy unlinked receipts keep their prior check and may require reconciliation after a clock change. Current gateway terminal write sites retain the old receipt object for background refresh; only a new foreground result installs a new object, supporting the pre-reservation observation fence.
+
+Child async-task capabilities retain verified initial tool ownership and route stop requests through the root native session. Settings commits share preparation locking with replacement. Persisted Linux BOOTTIME and boot UUID bound project elapsed budgets from creation admission across same-boot hub restart; unknown or different-boot evidence cancels further work while preserving native execution debt.
+
+The parent's 38 new integrated regressions pass. 73 settings/subagent/reporting/elapsed cases and 81 core/state/stop-order cases pass. The worker independently passes 555 distinct consumer/recovery tests, including 22 new cases; baseline source fails 13 of those 22. Eight parent settings/child cases and eight elapsed cases cover the remaining corrections. Ruff and diff checks pass. The complete public suite is running; immutable build, refreshed full-branch review, final-source CI and live acceptance remain required. None of these checks activates services or changes provider/model/connector state.

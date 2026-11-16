@@ -22,7 +22,8 @@ class Worker:
     latest: str = ""
     updated_at: float = field(default_factory=time.monotonic)
     parts: str = ""
-    async_tasks: dict[str, str] = field(default_factory=dict)
+    async_tasks: dict[str, dict] = field(default_factory=dict)
+    observed_tools: set[str] = field(default_factory=set)
 
 
 class SubagentTracker:
@@ -53,9 +54,12 @@ class SubagentTracker:
                         "model": worker.model,
                         "latest": worker.latest,
                         "updated_at": worker.updated_at,
+                        "async_tasks": {
+                            task_id: dict(task) for task_id, task in worker.async_tasks.items()
+                        },
                         "pending_async_work": any(
-                            state not in {"completed", "failed", "stopped"}
-                            for state in worker.async_tasks.values()
+                            task.get("state") not in {"completed", "failed", "stopped"}
+                            for task in worker.async_tasks.values()
                         ),
                     },
                 )
@@ -119,6 +123,10 @@ class SubagentTracker:
             worker.parts = (worker.parts + update.text)[-2000:]
             worker.latest = _short(worker.parts)
         elif update.kind in {"tool_call", "tool_call_update"}:
+            if update.kind == "tool_call" and update.tool_call_id:
+                worker.observed_tools.add(update.tool_call_id)
+                for task in worker.async_tasks.values():
+                    task["owned"] = task.get("toolCallId") in worker.observed_tools
             worker.parts = ""
             if not worker.latest:
                 worker.latest = "Using tools"
@@ -130,15 +138,23 @@ class SubagentTracker:
             task_id = raw.get("asyncTaskId")
             if not isinstance(task_id, str) or not task_id:
                 return []
-            previous = worker.async_tasks.get(task_id, "running")
+            task = worker.async_tasks.setdefault(task_id, {"state": "running"})
+            previous = task.get("state")
+            if "toolCallId" in raw:
+                value = raw["toolCallId"]
+                task["toolCallId"] = value if isinstance(value, str) else None
+            if "canStop" in raw:
+                task["canStop"] = raw["canStop"] is True
             state = raw.get("state", previous)
             state = state if isinstance(state, str) else "unknown"
-            if previous not in {"completed", "failed", "stopped"} or state in {
-                "completed",
-                "failed",
-                "stopped",
-            }:
-                worker.async_tasks[task_id] = state
+            task["state"] = (
+                previous
+                if previous in {"completed", "failed", "stopped"}
+                and state not in {"completed", "failed", "stopped"}
+                else state
+            )
+            tool_id = task.get("toolCallId")
+            task["owned"] = isinstance(tool_id, str) and tool_id in worker.observed_tools
         elif update.model_id:
             worker.model = _short(update.model_id, 80)
         else:

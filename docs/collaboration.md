@@ -146,3 +146,16 @@ Mailbox claims remain counted until their responses are parsed and workers are r
 Inherited execution debt also fences independent peer results and ordinary native prompts in the same thread. Missing legacy thread bindings conservatively retain admission. Recovery arriving during native preparation refuses only that provisional turn. Cancellation can settle a retained, claim/execution/epoch-matched non-dispatch proof without cancelling its predecessor. Missing or stale proof remains unresolved.
 
 Native-mutating commands also require current project admission. Recovery, inherited execution and active project background work block new/session, restart, model, effort and harness commands. Stop and active-only hints remain available. Preparation, broker locks and native writes recheck admission. Session epochs advance at actual creation/cancellation/compaction dispatch; queued model changes and delayed settings persistence cannot restore a replaced session.
+
+
+## Cancellation, renewal and elapsed limits
+
+A failed origin-stop capture keeps its origin and native-thread admission closed while unrelated mailbox work, results and controls continue. Uncertain stop captures reconcile through their saved key; retries do not repeat an ambiguous capture POST. Lease renewal retries transient HTTP failures and stops on definitive ownership or settlement rejection.
+
+New execution reservations carry a unique token and native epoch. Matching terminal receipts can settle after a backward wall-clock step. The consumer also retains the terminal observation from before reservation, preventing that unchanged old completion from settling newer work. Legacy receipts without linked ordering retain their older timestamp check and can require reconciliation after a clock change.
+
+Project elapsed budgets start at durable creation intent. On Linux, BOOTTIME and the boot UUID preserve that budget across hub-process restart, including before the first recipient receipt. A backward wall-clock step cannot extend it. Missing elapsed evidence or a different boot cancels further work while preserving pending native execution and its cancellation controls. Platforms without verified cross-process boot identity use process-scoped evidence and conservatively cancel previous-process projects on recovery.
+
+Native child background commands retain task identity, stop capability and ownership from their observed initial tool calls. Project cancellation can stop an owned command through the root native session after the child's foreground finishes. A stop acknowledgement retains pending execution until its matching task lifecycle reports termination. Duplicate task IDs from different sources leave stop ownership ambiguous.
+
+Model and effort persistence share the session-preparation lock with replacement. Replacement cancellation waits for an ongoing settings commit, and a replacement that already changed the session or epoch prevents stale persistence.

@@ -515,8 +515,35 @@ async def test_replacement_during_model_switch_cannot_restore_session_or_overrid
             channel_id="floor",
         )
     )
+    replacement_task = None
     try:
         await asyncio.wait_for(entered.wait(), 2)
+        if window == "persistence":
+            epoch = svc.native_epoch("discussion")
+            replacement_task = asyncio.create_task(svc.new_session("discussion"))
+            lock = svc._preparation_locks["discussion"]
+            async with asyncio.timeout(2):
+                while not lock._waiters:
+                    await asyncio.sleep(0)
+            assert not replacement_task.done()
+            assert svc.native_epoch("discussion") == epoch
+            release.set()
+            await asyncio.wait_for(task, 2)
+            replacement = await asyncio.wait_for(replacement_task, 2)
+            await svc.store.set_thread_override("discussion", "floor", "grok-4.5", "high")
+            snapshot = await svc.store.get("discussion")
+            assert snapshot.session_id == replacement
+            assert snapshot.model_override == "grok-4.5"
+            assert snapshot.effort_override == "high"
+            for target in ("channel:floor", "harness"):
+                expected = (
+                    "hub-claude-5-sonnet"
+                    if target == ("channel:floor" if scope == "channel" else scope)
+                    else None
+                )
+                setting = await svc.store.get_model_setting(target)
+                assert (setting.model if setting else None) == expected
+            return
         replacement = await svc.new_session("discussion")
         await svc.store.set_thread_override("discussion", "floor", "grok-4.5", "high")
         snapshot = await svc.store.get("discussion")
@@ -529,7 +556,9 @@ async def test_replacement_during_model_switch_cannot_restore_session_or_overrid
         assert await svc.store.get_model_setting("harness") is None
     finally:
         release.set()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.gather(
+            task, *([replacement_task] if replacement_task else []), return_exceptions=True
+        )
 
 
 async def test_compaction_write_guard_preserves_epoch_and_nested_admission(native):

@@ -160,3 +160,6 @@ tests/test_validate.py
 tests/test_wake.py
 uv.lock
 tests/test_collaboration_stop_order.py
+tests/test_collaboration_cancellation_recovery_followup.py
+tests/test_collaboration_elapsed_deadlines.py
+tests/test_collaboration_settings_child_review.py

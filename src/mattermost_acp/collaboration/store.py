@@ -33,8 +33,38 @@ def text(value, name="text", maximum=16000) -> str:
     return value.strip()
 
 
+_PROCESS_ELAPSED_EPOCH = uuid.uuid4().hex
+
+
+def elapsed_clock():
+    # Linux BOOTTIME includes suspended time and survives a hub-process restart.
+    return (
+        time.clock_gettime(time.CLOCK_BOOTTIME)
+        if hasattr(time, "CLOCK_BOOTTIME")
+        else time.monotonic()
+    )
+
+
+def elapsed_epoch():
+    try:
+        boot = str(uuid.UUID(Path("/proc/sys/kernel/random/boot_id").read_text().strip()))
+        return "linux-boottime:" + boot
+    except (OSError, ValueError):
+        # On platforms without a verified boot clock, a new process cannot reuse
+        # another process's elapsed receipt. Existing work requires cancellation.
+        return "process:" + _PROCESS_ELAPSED_EPOCH
+
+
 class CollaborationStore:
-    def __init__(self, path: Path, actors: set[str], *, clock=time.time):
+    def __init__(
+        self,
+        path: Path,
+        actors: set[str],
+        *,
+        clock=time.time,
+        elapsed=elapsed_clock,
+        epoch=None,
+    ):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, timeout=10)
         path.chmod(0o600)
@@ -43,6 +73,8 @@ class CollaborationStore:
         self.db.execute("PRAGMA synchronous=FULL")
         self.actors = actors
         self.clock = clock
+        self.elapsed = elapsed
+        self.elapsed_epoch = elapsed_epoch() if epoch is None else epoch
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS projects(
                 id TEXT PRIMARY KEY, data TEXT NOT NULL, status TEXT, deadline REAL,
@@ -76,6 +108,8 @@ class CollaborationStore:
                 ("origin_thread", "TEXT"),
                 ("channel", "TEXT"),
                 ("thread", "TEXT"),
+                ("elapsed_epoch", "TEXT"),
+                ("elapsed_deadline", "REAL"),
             ):
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE projects ADD COLUMN {name} {kind}")
@@ -88,6 +122,15 @@ class CollaborationStore:
                 self.save_project(json.loads(row[0]))
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS project_expiry ON projects(status,deadline)"
+            )
+            self.db.execute(
+                "UPDATE projects SET elapsed_epoch=json_extract(data,'$.elapsed_epoch'),"
+                "elapsed_deadline=json_extract(data,'$.elapsed_deadline') "
+                "WHERE elapsed_epoch IS NULL OR elapsed_deadline IS NULL"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS project_elapsed_expiry "
+                "ON projects(status,elapsed_epoch,elapsed_deadline)"
             )
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS origin_projects "
@@ -261,8 +304,8 @@ class CollaborationStore:
             self.db.execute(
                 "INSERT OR REPLACE INTO projects"
                 "(id,data,status,deadline,created,owner,origin_thread,channel,thread,"
-                "admission_order) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "admission_order,elapsed_epoch,elapsed_deadline) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     item["id"],
                     json.dumps(item),
@@ -274,6 +317,8 @@ class CollaborationStore:
                     item["channel_id"],
                     item["thread_id"],
                     order,
+                    item.get("elapsed_epoch"),
+                    item.get("elapsed_deadline"),
                 ),
             )
 
@@ -324,12 +369,22 @@ class CollaborationStore:
         self.get_project(item["project"], actor)
         return item
 
+    def remaining_seconds(self, project):
+        deadline = project.get("elapsed_deadline")
+        if (
+            project.get("elapsed_epoch") != self.elapsed_epoch
+            or type(deadline) not in {int, float}
+            or not math.isfinite(deadline)
+        ):
+            return 0.0
+        return max(0.0, min(project["deadline"] - self.clock(), deadline - self.elapsed()))
+
     def deadline_receipt(self, item, actor):
         project = self.get_project(item["project"], actor)
         return {
             **item,
             "project_deadline": project["deadline"],
-            "project_remaining_seconds": max(0.0, project["deadline"] - self.clock()),
+            "project_remaining_seconds": self.remaining_seconds(project),
         }
 
     def prepare_creation(self, actor, body):
@@ -372,6 +427,7 @@ class CollaborationStore:
                 "creation_id": identifier() if not body.get("thread_id") else None,
                 "status": "reserved",
                 "created": self.clock(),
+                "elapsed_admission": {"epoch": self.elapsed_epoch, "started": self.elapsed()},
                 "admission_order": self.next_admission_order(),
             }
             self.save_creation(actor, key, intent)
@@ -466,6 +522,7 @@ class CollaborationStore:
                 actor,
                 {**intent["body"], "thread_id": intent["thread_id"]},
                 created=intent.get("created"),
+                elapsed_admission=intent.get("elapsed_admission"),
                 admission_order=self.db.execute(
                     "SELECT admission_order FROM creations WHERE actor=? AND key=?",
                     (actor, intent["body"]["key"]),
@@ -478,13 +535,15 @@ class CollaborationStore:
             order = self.db.execute(
                 "SELECT admission_order FROM projects WHERE id=?", (project["id"],)
             ).fetchone()[0]
-            if stop and order <= stop[0]:
+            if (stop and order <= stop[0]) or self.remaining_seconds(project) <= 0:
                 project = self.cancel(project["id"], actor)
             intent["status"] = "complete"
             self.save_creation(actor, intent["body"]["key"], intent)
             return project
 
-    def create_project(self, actor, body, *, created=None, admission_order=None):
+    def create_project(
+        self, actor, body, *, created=None, admission_order=None, elapsed_admission=None
+    ):
         body = {"owner_in_discussion": False, **body}
         key = body.get("key")
         fingerprint = hashlib.sha256(
@@ -516,6 +575,16 @@ class CollaborationStore:
         channel = text(body.get("channel_id"), "channel_id", 128)
         thread = text(body.get("thread_id"), "thread_id", 128)
         admitted = self.clock() if created is None else created
+        if elapsed_admission is None and created is None:
+            elapsed_admission = {"epoch": self.elapsed_epoch, "started": self.elapsed()}
+        elapsed_admission = elapsed_admission or {}
+        elapsed_started = elapsed_admission.get("started")
+        verified_elapsed = (
+            elapsed_admission.get("epoch") == self.elapsed_epoch
+            and type(elapsed_started) in {int, float}
+            and math.isfinite(elapsed_started)
+            and elapsed_started <= self.elapsed()
+        )
         item = {
             "id": identifier(),
             "title": text(body.get("title"), "title", 200),
@@ -530,6 +599,10 @@ class CollaborationStore:
             "created": admitted,
             "limits": limits,
             "deadline": admitted + limits["max_seconds"],
+            "elapsed_epoch": elapsed_admission.get("epoch") if verified_elapsed else None,
+            "elapsed_deadline": elapsed_started + limits["max_seconds"]
+            if verified_elapsed
+            else None,
             "dispatched": 0,
             "cost_coverage": "unknown",
             "bindings": {},
@@ -646,7 +719,7 @@ class CollaborationStore:
                 if existing.get("fingerprint") != fingerprint:
                     raise ValueError("Conflicting idempotency key payload")
                 return existing
-            if project["status"] != "active" or project["deadline"] <= self.clock():
+            if project["status"] != "active" or self.remaining_seconds(project) <= 0:
                 raise ValueError("Project is inactive or expired")
             recipient = body.get("recipient")
             if recipient is not None and recipient not in project["members"]:
@@ -758,7 +831,10 @@ class CollaborationStore:
         with self.transaction():
             now = self.clock()
             for row in self.db.execute(
-                "SELECT data FROM projects WHERE status='active' AND deadline<=?", (now,)
+                "SELECT data FROM projects WHERE status='active' AND "
+                "(deadline<=? OR elapsed_epoch IS NULL OR elapsed_epoch<>? "
+                "OR elapsed_deadline IS NULL OR elapsed_deadline<=?)",
+                (now, self.elapsed_epoch, self.elapsed()),
             ).fetchall():
                 project = json.loads(row[0])
                 self.cancel(project["id"], project["owner"])
@@ -907,7 +983,7 @@ class CollaborationStore:
                     "origin_channel_id": project["origin_channel_id"],
                     "project_owner_in_discussion": project.get("owner_in_discussion", False),
                     "project_deadline": project["deadline"],
-                    "project_remaining_seconds": max(0.0, project["deadline"] - self.clock()),
+                    "project_remaining_seconds": self.remaining_seconds(project),
                 }
             return None
 
@@ -1005,6 +1081,12 @@ class CollaborationStore:
                     receipt = evidence or {}
                     reserved = item.get("evidence", {})
                     completed = receipt.get("completed_at")
+                    linked = bool(
+                        reserved.get("reservation_id")
+                        and receipt.get("reservation_id") == reserved["reservation_id"]
+                        and "native_epoch" in reserved
+                        and receipt.get("native_epoch") == reserved["native_epoch"]
+                    )
                     if receipt.get("not_dispatched") and reserved.get("session_id"):
                         raise ValueError("A reserved session requires native settlement evidence")
                     if not receipt.get("not_dispatched") and (
@@ -1012,12 +1094,19 @@ class CollaborationStore:
                         or not reserved.get("execution_id")
                         or receipt.get("session_id") != reserved.get("session_id")
                         or receipt.get("execution_id") != reserved.get("execution_id")
+                        or receipt.get("reservation_id", reserved.get("reservation_id"))
+                        != reserved.get("reservation_id")
+                        or receipt.get("native_epoch", reserved.get("native_epoch"))
+                        != reserved.get("native_epoch")
                         or not receipt.get("native_dispatched")
                         or not receipt.get("stop_reason")
                         or receipt.get("pending") is not False
                         or type(completed) not in {int, float}
                         or not math.isfinite(completed)
-                        or completed < reserved.get("dispatch_started", float("inf"))
+                        or (
+                            not linked
+                            and completed < reserved.get("dispatch_started", float("inf"))
+                        )
                     ):
                         raise ValueError("Native settlement must match the reserved execution")
                     item["execution_pending"] = False
@@ -1202,7 +1291,7 @@ class CollaborationStore:
                 raise PermissionError("Only owner or recipient can reconcile delivery")
             if item["state"] not in {"interrupted", "unconfirmed"}:
                 raise ValueError("Only interrupted/unconfirmed delivery can be retried")
-            if project["status"] != "active" or project["deadline"] <= self.clock():
+            if project["status"] != "active" or self.remaining_seconds(project) <= 0:
                 raise ValueError("Project is inactive")
             if item["kind"] in WORK:
                 if project["dispatched"] >= project["limits"]["max_turns"]:

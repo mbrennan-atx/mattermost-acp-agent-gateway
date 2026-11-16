@@ -97,7 +97,12 @@ class CollaborationConsumer:
             try:
                 await self.reconcile_inherited_claims()
                 for thread in list(self.pending_stops):
-                    await self.cancel_thread(thread, retry=True)
+                    try:
+                        await self.cancel_thread(thread, retry=True)
+                    except Exception:
+                        # An unresolved capture remains fenced, but must not
+                        # block unrelated ownership and mailbox processing.
+                        logger.warning("Project stop unresolved; recorded intent retained")
                 await self.reconcile_ownership()
                 if self.gateway.sealed or self.poll_paused:
                     await asyncio.sleep(0.25)
@@ -298,10 +303,14 @@ class CollaborationConsumer:
 
     async def deadline_work(self, item, operation):
         try:
-            with native_command_admission(lambda: self.before_deadline(item)):
+            with native_command_admission(
+                lambda: self.before_deadline(item) and not self.stop_pending(item)
+            ):
                 return await operation
         finally:
-            if not self.before_deadline(item) and hasattr(operation, "close"):
+            if (not self.before_deadline(item) or self.stop_pending(item)) and hasattr(
+                operation, "close"
+            ):
                 operation.close()
 
     async def enforce_deadline(self, pid):
@@ -402,6 +411,7 @@ class CollaborationConsumer:
     def owns_thread(self, thread):
         return (
             self.inherited_thread_pending(thread)
+            or thread in self.pending_stops
             or thread in self.ownership_threads.values()
             or any(
                 report and report.get("thread_id") == thread for report in self.ownership.values()
@@ -413,6 +423,47 @@ class CollaborationConsumer:
             item.get("binding", {}).get("thread_id") in {None, thread}
             for item in self.inherited_claims
         )
+
+    def stop_pending(self, item):
+        return any(
+            thread in self.pending_stops
+            for thread in (
+                item.get("binding", {}).get("thread_id"),
+                item.get("origin_thread_id"),
+            )
+        )
+
+    def terminal_matches(self, key, reserved, terminal):
+        if (
+            not terminal
+            or not reserved.get("session_id")
+            or (reserved.get("reservation_id") and not reserved.get("execution_id"))
+            or terminal.get("session_id") != reserved["session_id"]
+            or terminal.get("execution_id") != reserved.get("execution_id")
+            or type(terminal.get("completed_at")) not in {int, float}
+            or not math.isfinite(terminal["completed_at"])
+            or type(reserved.get("dispatch_started")) not in {int, float}
+            or not math.isfinite(reserved["dispatch_started"])
+        ):
+            return False
+        token = reserved.get("reservation_id")
+        if not token:
+            # Legacy reservations have no independent ordering evidence.
+            return terminal["completed_at"] >= reserved["dispatch_started"]
+        if terminal.get("reservation_id", token) != token or terminal.get(
+            "native_epoch", reserved.get("native_epoch")
+        ) != reserved.get("native_epoch"):
+            return False
+        report = self.ownership.get(key) or {}
+        before = report.get("reservation_terminals", {}).get(token)
+        if before is not None:
+            previous, snapshot = before
+            if terminal is previous and (
+                terminal.get("completed_at") == snapshot.get("completed_at")
+                and not (snapshot.get("pending") and not terminal.get("pending"))
+            ):
+                return False
+        return True
 
     def release_ownership(self, key):
         self.rejected_reservations.pop(key, None)
@@ -495,10 +546,7 @@ class CollaborationConsumer:
             and report.get("foreground_complete")
             and not self.ownership_pending(key, terminal)
             and terminal
-            and terminal.get("session_id") == evidence.get("session_id")
-            and terminal.get("execution_id") == evidence.get("execution_id")
-            and terminal.get("completed_at", float("-inf"))
-            >= evidence.get("dispatch_started", float("inf"))
+            and self.terminal_matches(key, evidence, terminal)
             and terminal.get("native_dispatched", True)
         ):
             if not cancelled_retry:
@@ -679,12 +727,14 @@ class CollaborationConsumer:
                     "session_id": session,
                     "execution_id": report["execution_id"],
                     "native_epoch": epoch,
+                    "reservation_id": item["reservation_evidence"]["reservation_id"],
                 },
             }
             evidence = {
                 "session_id": session,
                 "execution_id": report["execution_id"],
                 "native_epoch": epoch,
+                "reservation_id": item["reservation_evidence"]["reservation_id"],
             }
             try:
                 receipt = await self.update(parent, "dispatch", evidence=evidence)
@@ -756,8 +806,10 @@ class CollaborationConsumer:
             await asyncio.sleep(10)
             try:
                 await self.update(item, "heartbeat")
-            except HubError:
-                return
+            except HubError as exc:
+                if exc.status in {400, 401, 403, 404, 409, 410, 422}:
+                    return
+                logger.warning("Collaboration lease renewal unavailable")
             except Exception:
                 logger.warning("Collaboration lease renewal unavailable")
 
@@ -776,9 +828,7 @@ class CollaborationConsumer:
                 if (
                     state["state"] in {"done", "failed", "blocked", "cancelled"}
                     and terminal
-                    and terminal.get("session_id") == receipt.get("session_id")
-                    and terminal.get("execution_id") == receipt.get("execution_id")
-                    and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
+                    and self.terminal_matches(key, receipt, terminal)
                 ):
                     await self.update(item, "evidence", evidence=self.foreground(item, terminal))
                 else:
@@ -795,10 +845,8 @@ class CollaborationConsumer:
             if (
                 receipt.get("session_id")
                 and terminal
-                and terminal.get("session_id") == receipt["session_id"]
-                and terminal.get("execution_id") == receipt.get("execution_id")
+                and self.terminal_matches(key, receipt, terminal)
                 and (terminal["stop_reason"] != "end_turn" or item["kind"] == "result")
-                and terminal["completed_at"] >= receipt.get("dispatch_started", float("inf"))
                 and not terminal.get("pending")
                 and terminal.get("native_dispatched", True)
             ):
@@ -907,6 +955,9 @@ class CollaborationConsumer:
                 )
                 return
             thread = binding["thread_id"]
+            if self.stop_pending(item):
+                await self.update(item, "queued")
+                return
             if self.inherited_thread_pending(thread):
                 await self.update(item, "queued")
                 return
@@ -1153,6 +1204,14 @@ class CollaborationConsumer:
     @staticmethod
     def foreground(item, result):
         evidence = {key: value for key, value in result.items() if key != "answer"}
+        reserved = item.get("reservation_evidence", item.get("evidence", {}))
+        if (
+            reserved.get("reservation_id")
+            and result.get("session_id") == reserved.get("session_id")
+            and result.get("execution_id") == reserved.get("execution_id")
+        ):
+            evidence.setdefault("reservation_id", reserved["reservation_id"])
+            evidence.setdefault("native_epoch", reserved.get("native_epoch"))
         answer = result.get("answer") or "No substantive answer"
         if len(answer) > 8000:
             folder = Path.home() / ".local/state/mattermost-acp-collaboration/results"
@@ -1199,7 +1258,7 @@ class CollaborationConsumer:
 
     async def reserve(self, item, session, *, steering=False):
         self.observe_deadline(item)
-        if self.inherited_thread_pending(item["binding"]["thread_id"]):
+        if self.stop_pending(item) or self.inherited_thread_pending(item["binding"]["thread_id"]):
             await self.update(item, "queued")
             return False
         report = self.gateway._reports.get(session)
@@ -1239,7 +1298,12 @@ class CollaborationConsumer:
             "session_id": session,
             "execution_id": report["execution_id"],
             "native_epoch": epoch,
+            "reservation_id": uuid.uuid4().hex,
         }
+        terminal = self.gateway._last_terminal.get(item["binding"]["thread_id"])
+        report.setdefault("reservation_terminals", {})[evidence["reservation_id"]] = (
+            (terminal, dict(terminal)) if terminal is not None else None
+        )
         item["reservation_evidence"] = evidence
         try:
             try:
@@ -1270,6 +1334,7 @@ class CollaborationConsumer:
                 and key not in self.cancelled_claims
                 and not self.inherited_thread_pending(item["binding"]["thread_id"])
                 and self.before_deadline(item)
+                and not self.stop_pending(item)
             )
             if accepted:
                 item["native_epoch"] = epoch
@@ -1348,14 +1413,11 @@ class CollaborationConsumer:
                     },
                 )
                 continue
-            started = target.get("evidence", {}).get("dispatch_started", target["created"])
             terminal = self.gateway._last_terminal.get(binding["thread_id"])
             if (
                 expected
                 and terminal
-                and terminal.get("session_id") == expected
-                and terminal.get("execution_id") == target.get("evidence", {}).get("execution_id")
-                and terminal["completed_at"] >= started
+                and self.terminal_matches(key, target.get("evidence", {}), terminal)
                 and not terminal.get("pending")
                 and not self.ownership_pending(key, terminal)
                 and terminal.get("native_dispatched", True)

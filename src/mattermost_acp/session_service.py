@@ -464,19 +464,22 @@ class SessionService:
                     active_model = await self.broker.set_model(
                         session_id, model_to_apply, effort=effort_to_apply
                     )
-            if self.native_epoch(thread_id) != epoch or not await self.store.save_switch_if_session(
-                thread_id,
-                session_id,
-                active_model,
-                effort_to_apply,
-                channel_id=channel_id or record.channel_id,
-                scope=scope,
-                requested_model=model_id,
-                requested_effort=effort,
-            ):
-                raise NativeDispatchChanged(
-                    "Native session changed before model settings were saved"
-                )
+            async with self._preparation_locks.setdefault(thread_id, asyncio.Lock()):
+                if self.native_epoch(
+                    thread_id
+                ) != epoch or not await self.store.save_switch_if_session(
+                    thread_id,
+                    session_id,
+                    active_model,
+                    effort_to_apply,
+                    channel_id=channel_id or record.channel_id,
+                    scope=scope,
+                    requested_model=model_id,
+                    requested_effort=effort,
+                ):
+                    raise NativeDispatchChanged(
+                        "Native session changed before model settings were saved"
+                    )
             self._pinned.add(thread_id)
             return ModelSwitch(model_id=model_id, compaction=compaction, active_model=active_model)
 
@@ -548,12 +551,15 @@ class SessionService:
             model_id = (record.model if record else None) or self.default_model or "grok-4.5"
             with native_command_admission(lambda: self.native_epoch(thread_id) == epoch):
                 resolved = await self.broker.set_model(session_id, model_id, effort=effort)
-            if self.native_epoch(thread_id) != epoch or not await self.store.save_switch_if_session(
-                thread_id, session_id, resolved, effort
-            ):
-                raise NativeDispatchChanged(
-                    "Native session changed before effort settings were saved"
-                )
+            async with self._preparation_locks.setdefault(thread_id, asyncio.Lock()):
+                if self.native_epoch(
+                    thread_id
+                ) != epoch or not await self.store.save_switch_if_session(
+                    thread_id, session_id, resolved, effort
+                ):
+                    raise NativeDispatchChanged(
+                        "Native session changed before effort settings were saved"
+                    )
             self._pinned.add(thread_id)
             return resolved, effort
 
