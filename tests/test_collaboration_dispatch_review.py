@@ -336,6 +336,7 @@ def native_gateway(tmp_path):
 
 def idle_report():
     return {
+        "native_dispatched": True,
         "execution_id": "prior-execution",
         "collaboration_project": "project",
         "thread_id": "discussion",

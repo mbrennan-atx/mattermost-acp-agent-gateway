@@ -189,9 +189,9 @@ async def test_execution_report_disappearing_before_reservation_leaves_no_dispat
         requested = ask(store, p["id"])
         gateway._reports["existing-native"] = execution_report(p["id"])
 
-        async def lost_report(item, session):
+        async def lost_report(item, session, **options):
             gateway._reports.pop(session)
-            return await original_reserve(item, session)
+            return await original_reserve(item, session, **options)
 
         consumer.reserve = lost_report
         claimed = store.claim_next("beta", consumer.instance)

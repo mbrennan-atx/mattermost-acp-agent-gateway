@@ -744,15 +744,14 @@ class CollaborationConsumer:
                 and broker.is_running
                 and is_loaded(record.session_id)
                 and caps.steering
-                and report is not None
-                and bool(report.get("execution_id"))
+                and self.steerable_report(report)
             )
             if can_hint and broker.backend == "codex":
                 can_hint = ((caps.raw.get("_meta") or {}).get("steering") or {}).get(
                     "idleBehavior"
                 ) == "promptRequired"
             if can_hint:
-                if not await self.reserve(item, record.session_id):
+                if not await self.reserve(item, record.session_id, steering=True):
                     return
                 try:
                     outcome = await self.gateway.sessions.hint(
@@ -763,7 +762,7 @@ class CollaborationConsumer:
                         guard=lambda: (
                             not self.inherited_thread_pending(thread)
                             and is_loaded(record.session_id)
-                            and report is not None
+                            and self.steerable_report(report)
                             and self.gateway._reports.get(record.session_id) is report
                             and self.ownership.get((item["id"], item.get("claim"))) is report
                             and report.get("execution_id")
@@ -979,12 +978,25 @@ class CollaborationConsumer:
             return await self.update(item, "queued")
         return receipt
 
-    async def reserve(self, item, session):
+    @staticmethod
+    def steerable_report(report):
+        return bool(
+            report is not None
+            and report.get("execution_id")
+            and report.get("native_dispatched") is True
+            and not report.get("preparing")
+        )
+
+    async def reserve(self, item, session, *, steering=False):
         if self.inherited_thread_pending(item["binding"]["thread_id"]):
             await self.update(item, "queued")
             return False
         report = self.gateway._reports.get(session)
-        if report is None or not report.get("execution_id"):
+        if (
+            report is None
+            or not report.get("execution_id")
+            or (steering and not self.steerable_report(report))
+        ):
             current = await self.hub.request("GET", "/messages/" + item["id"])
             if current.get("claim") == item.get("claim"):
                 if current.get("execution_pending") and current["state"] in {

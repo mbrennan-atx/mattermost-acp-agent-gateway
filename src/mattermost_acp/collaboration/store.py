@@ -823,16 +823,32 @@ class CollaborationStore:
             ):
                 raise PermissionError("Stale reply claim")
             result = text(result, "result")
-            evidence = {**item["evidence"], **(evidence or {})}
+            supplied_evidence = evidence or {}
+            evidence = {**item["evidence"], **supplied_evidence}
             if state not in {"done", "failed", "blocked"}:
                 raise ValueError("Invalid result state")
             if item["state"] in TERMINAL:
-                if item.get("result") == result and item["state"] == state:
+                if (
+                    item.get("result") == result
+                    and item["state"] == state
+                    and (
+                        "artifacts" not in supplied_evidence
+                        or item["evidence"].get("artifacts", []) == supplied_evidence["artifacts"]
+                    )
+                ):
                     return item
                 raise ValueError("Conflicting repeated result")
             if item["state"] == "cancelling":
                 if "late_state" in item:
-                    if item["late_result"] != result or item["late_state"] != state:
+                    if (
+                        item["late_result"] != result
+                        or item["late_state"] != state
+                        or (
+                            "artifacts" in supplied_evidence
+                            and item.get("late_evidence", {}).get("artifacts", [])
+                            != supplied_evidence["artifacts"]
+                        )
+                    ):
                         raise ValueError("Conflicting repeated result")
                     return item
                 item["late_result"] = result

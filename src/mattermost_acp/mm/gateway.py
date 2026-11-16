@@ -1036,6 +1036,7 @@ class MattermostGateway:
             "active": True,
             "foreground_complete": False,
             "preparing": before_native is not None or ordinary_collaboration,
+            "native_dispatched": False,
             "previous": previous
             if previous
             and (
@@ -1073,7 +1074,17 @@ class MattermostGateway:
         try:
             await _publish_status(status.render(), force=True)
             try:
-                turn_options = {"channel_id": channel_id, "on_update": on_update, "route": route}
+
+                def mark_native_dispatched(actual_session):
+                    report["native_dispatched"] = True
+                    report["preparing"] = False
+
+                turn_options = {
+                    "channel_id": channel_id,
+                    "on_update": on_update,
+                    "route": route,
+                    "on_dispatched": mark_native_dispatched,
+                }
                 if workspace:
                     turn_options["cwd"] = Path(workspace)
                 if before_native is not None:
@@ -1516,53 +1527,90 @@ class MattermostGateway:
         self, thread_id: str, channel_id: str, user_id: str, *, timeout_s: float = 900
     ) -> None:
         deadline = time.monotonic() + timeout_s
-        while True:
-            state = self.maintenance_state()
-            # This helper is the control deciding whether it may restart.
-            state["commands"] -= int(asyncio.current_task() in self._slash_tasks)
-            if state["native_boundary_unknown"]:
-                await self._post(
-                    channel_id,
-                    "The new harness is saved. Native goal/queue idle status is unknown; "
-                    "automatic restart is deferred.",
-                    root_id=thread_id,
-                )
-                return
-            if not any(
-                state[key]
-                for key in (
-                    "foreground",
-                    "responses",
-                    "inbound",
-                    "commands",
-                    "native_rpc",
-                    "background",
-                    "collaboration",
-                )
-            ):
-                break
-            if time.monotonic() >= deadline:
-                await self._post(
-                    channel_id,
-                    "The new harness is saved. Pending work prevents automatic restart.",
-                    root_id=thread_id,
-                )
-                return
-            await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
-        # No await separates the idle check from closing native admission.
         previous_flags = self.draining, self.sealed
-        self.draining = self.sealed = True
+        admission = getattr(self.collaboration, "set_admission", None)
+        restart_scheduled = False
+        hub_sealed = admission is None
+        self.draining = True
         try:
+            if admission is not None:
+                await admission("controls")
+            while True:
+                state = self.maintenance_state()
+                # This helper is the control deciding whether it may restart.
+                state["commands"] -= int(asyncio.current_task() in self._slash_tasks)
+                if state["native_boundary_unknown"]:
+                    await self._post(
+                        channel_id,
+                        "The new harness is saved. Native goal/queue idle status is unknown; "
+                        "automatic restart is deferred.",
+                        root_id=thread_id,
+                    )
+                    return
+                if not any(
+                    state[key]
+                    for key in (
+                        "foreground",
+                        "responses",
+                        "inbound",
+                        "commands",
+                        "native_rpc",
+                        "background",
+                        "collaboration",
+                    )
+                ):
+                    if not hub_sealed:
+                        self.sealed = True
+                        await admission("sealed")
+                        hub_sealed = True
+                        continue
+                    break
+                if time.monotonic() >= deadline:
+                    await self._post(
+                        channel_id,
+                        "The new harness is saved. Pending work prevents automatic restart.",
+                        root_id=thread_id,
+                    )
+                    return
+                await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+            # No await separates the final idle check from native admission.
+            self.draining = self.sealed = True
             msg = await self._request_restart(
                 thread_id=thread_id,
                 channel_id=channel_id,
                 user_id=user_id,
                 reason="harness_switch",
             )
-        except BaseException:
-            self.draining, self.sealed = previous_flags
-            raise
-        logger.info("harness switch restart: %s", msg)
+            restart_scheduled = True
+            logger.info("harness switch restart: %s", msg)
+        except Exception:
+            logger.exception("Automatic harness restart could not settle admission")
+            await self._post(
+                channel_id,
+                "The new harness is saved. Automatic restart could not settle admission.",
+                root_id=thread_id,
+            )
+        finally:
+            if not restart_scheduled:
+                self.draining = self.sealed = True
+                try:
+                    if admission is not None:
+                        if not any(previous_flags):
+                            # Reconcile a lost acknowledgement before normal
+                            # polling can reopen; its response alone cannot
+                            # resolve an outstanding mailbox claim.
+                            await admission("controls")
+                        await admission(
+                            "sealed"
+                            if previous_flags[1]
+                            else "controls"
+                            if previous_flags[0]
+                            else "normal"
+                        )
+                except Exception:
+                    logger.exception("Restart admission recovery remains unresolved")
+                else:
+                    self.draining, self.sealed = previous_flags
 
     def _format_status(self, st: dict[str, object]) -> str:
         reporter = TurnReporter()

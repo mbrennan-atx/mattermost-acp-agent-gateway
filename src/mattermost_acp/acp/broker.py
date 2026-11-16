@@ -403,6 +403,7 @@ class AcpBroker:
         *,
         timeout: float | None = None,
         guard: Callable[[], bool] | None = None,
+        on_write: Callable[[], None] | None = None,
     ) -> Any:
         if self._proc is None or self._proc.stdin is None:
             raise AcpError("agent process is not running")
@@ -418,10 +419,14 @@ class AcpBroker:
         # kill for prompts is owned by prompt_turn (resets on tool completion).
         wait_s = self.rpc_timeout_s if timeout is None else timeout
         try:
-            if guard is None:
+            if guard is None and on_write is None:
                 await self._write(msg)
             else:
-                await self._write(msg, guard=guard)
+                await self._write(
+                    msg,
+                    **({"guard": guard} if guard is not None else {}),
+                    **({"on_write": on_write} if on_write is not None else {}),
+                )
             return await asyncio.wait_for(fut, timeout=wait_s)
         except TimeoutError as exc:
             self._pending.pop(req_id, None)
@@ -639,6 +644,7 @@ class AcpBroker:
         *,
         on_update: Callable[[SessionUpdate], Awaitable[None]] | None = None,
         guard=None,
+        on_dispatched: Callable[[], None] | None = None,
     ) -> TurnResult:
         """Run one prompt turn; buffer answer text; invoke on_update for status.
 
@@ -684,6 +690,7 @@ class AcpBroker:
                     },
                     timeout=hard_max_s,
                     **({"guard": guard} if guard is not None else {}),
+                    **({"on_write": on_dispatched} if on_dispatched is not None else {}),
                 )
             )
 
@@ -798,7 +805,7 @@ class AcpBroker:
                 model_id=model_id,
             )
 
-    async def _write(self, msg: dict[str, Any], *, guard=None) -> None:
+    async def _write(self, msg: dict[str, Any], *, guard=None, on_write=None) -> None:
         if self._proc is None or self._proc.stdin is None:
             raise AcpError("agent process is not running")
         line = json.dumps(msg, separators=(",", ":")) + "\n"
@@ -806,6 +813,8 @@ class AcpBroker:
             if guard is not None and not guard():
                 raise NativeDispatchChanged("Native execution changed before control dispatch")
             self._proc.stdin.write(line.encode("utf-8"))
+            if on_write is not None:
+                on_write()
             await self._proc.stdin.drain()
 
     async def _read_loop(self) -> None:

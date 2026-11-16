@@ -257,6 +257,7 @@ def active_gateway(outcome="injected", *, steering=True, busy=True):
 
 def execution_report(project_id, execution_id="tracked-execution"):
     return {
+        "native_dispatched": True,
         "execution_id": execution_id,
         "collaboration_project": project_id,
         "thread_id": "discussion",

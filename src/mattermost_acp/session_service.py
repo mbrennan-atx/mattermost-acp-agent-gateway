@@ -312,6 +312,7 @@ class SessionService:
         route: RouteRequest | None = None,
         before_prompt=None,
         dispatch_guard=None,
+        on_dispatched=None,
         cwd: Path | None = None,
     ) -> TurnResult:
         if thread_id in self._busy:
@@ -342,6 +343,11 @@ class SessionService:
                     session_id,
                     prompt,
                     on_update=on_update,
+                    **(
+                        {"on_dispatched": lambda: on_dispatched(session_id)}
+                        if on_dispatched is not None
+                        else {}
+                    ),
                     **(
                         {
                             "guard": lambda: (
