@@ -8,6 +8,174 @@ from mattermost_acp.mm.gateway import MattermostGateway
 from mattermost_acp.mm.reporting import TurnReporter
 
 
+@pytest.mark.parametrize("terminal", ["completed", "failed", "stopped", "unknown", "running"])
+async def test_detached_card_remains_pending_until_matching_native_task_termination(terminal):
+    reporter = TurnReporter()
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "tool_call",
+            tool_call_id="bash",
+            raw={
+                "_meta": {"claudeCode": {"toolName": "Bash"}},
+                "rawInput": {"command": "synthetic work", "run_in_background": True},
+            },
+        )
+    )
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_spawned",
+            tool_call_id="bash",
+            raw={
+                "asyncTaskId": "task",
+                "toolCallId": "bash",
+                "canStop": True,
+            },
+        )
+    )
+    reporter.observe(
+        SessionUpdate("native", "tool_call_update", tool_call_id="bash", tool_status="completed")
+    )
+    assert reporter.has_pending_work() and reporter.owns_async_task("task")
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_state_update",
+            raw={
+                "asyncTaskId": "task",
+                "state": terminal,
+            },
+        )
+    )
+    assert reporter.has_pending_work() is (terminal not in {"completed", "failed", "stopped"})
+
+
+def test_retained_report_does_not_claim_new_execution_async_tasks():
+    retained, current = TurnReporter(), TurnReporter()
+    started = SessionUpdate("native", "tool_call", tool_call_id="new-bash")
+    current.observe(started)
+    retained.observe_retained(started)
+    spawned = SessionUpdate(
+        "native",
+        "async_task_spawned",
+        tool_call_id="new-bash",
+        raw={
+            "asyncTaskId": "new-task",
+            "toolCallId": "new-bash",
+            "canStop": True,
+        },
+    )
+    current.observe(spawned)
+    retained.observe_retained(spawned)
+    assert current.owns_async_task("new-task")
+    assert not retained.has_pending_work() and not retained.owns_async_task("new-task")
+
+
+def test_task_terminal_before_completed_background_card_is_not_revived():
+    reporter = TurnReporter()
+    reporter.observe(SessionUpdate("native", "tool_call", tool_call_id="bash"))
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_state_update",
+            raw={
+                "asyncTaskId": "task",
+                "toolCallId": "bash",
+                "state": "completed",
+            },
+        )
+    )
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_spawned",
+            tool_call_id="bash",
+            raw={
+                "asyncTaskId": "task",
+                "toolCallId": "bash",
+                "canStop": True,
+            },
+        )
+    )
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "tool_call_update",
+            tool_call_id="bash",
+            tool_status="completed",
+            raw={
+                "_meta": {"jetbrains": {"air": {"asyncTasks": {"backgrounded": True}}}},
+            },
+        )
+    )
+    assert not reporter.has_pending_work() and not reporter.owns_async_task("task")
+
+
+def test_foreground_command_output_cannot_claim_a_detached_task():
+    reporter = TurnReporter()
+    reporter.observe(SessionUpdate("native", "tool_call", tool_call_id="bash"))
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "tool_call_update",
+            tool_call_id="bash",
+            tool_status="completed",
+            raw={
+                "rawOutput": "Command running in backgroundTaskId task; run_in_background true",
+            },
+        )
+    )
+    assert not reporter.has_pending_work() and reporter.stoppable_async_tasks() == []
+
+
+def test_invalid_async_task_state_keeps_completion_unresolved():
+    reporter = TurnReporter()
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_spawned",
+            raw={
+                "asyncTaskId": "task",
+                "canStop": True,
+                "toolCallId": [],
+            },
+        )
+    )
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_state_update",
+            raw={
+                "asyncTaskId": "task",
+                "state": {"completed": True},
+            },
+        )
+    )
+    assert reporter.has_pending_work() and reporter.stoppable_async_tasks() == []
+
+
+def test_late_tool_result_alone_cannot_establish_async_task_stop_ownership():
+    reporter = TurnReporter()
+    reporter.observe(
+        SessionUpdate(
+            "native", "tool_call_update", tool_call_id="unknown-bash", tool_status="completed"
+        )
+    )
+    reporter.observe(
+        SessionUpdate(
+            "native",
+            "async_task_spawned",
+            raw={
+                "asyncTaskId": "unknown-task",
+                "toolCallId": "unknown-bash",
+                "canStop": True,
+            },
+        )
+    )
+    assert reporter.has_pending_work() and reporter.stoppable_async_tasks() == []
+
+
 def test_complete_parent_narration_periodic_age_and_sanitizing():
     now = [0.0]
     reporter = TurnReporter(clock=lambda: now[0])
@@ -167,7 +335,8 @@ async def test_child_progress_survives_parent_rpc_return_and_quiet_goal_continue
         assert all("private reasoning" not in message for message in messages)
         gateway._stop_reports("root")
         sessions.broker.update_observer(SessionUpdate(session_id="root-session", kind="tool_call"))
-        assert "root-session" not in gateway._reports
+        assert gateway._reports["root-session"]["suppressed"]
+        assert gateway._last_terminal["root"]["pending"]
     finally:
         await gateway.close()
         await asyncio.sleep(0)

@@ -55,7 +55,11 @@ class _Sessions:
     async def status(self, thread_id):
         return {"model": "hub-grok-4.6", "effort": "high"}
 
-    async def run_turn(self, thread_id, text, *, channel_id=None, on_update=None, route=None):
+    async def run_turn(
+        self, thread_id, text, *, channel_id=None, on_update=None, route=None, on_dispatched=None
+    ):
+        if on_dispatched is not None:
+            on_dispatched(self._result.session_id)
         for update in self._updates:
             await on_update(update)
         return self._result
@@ -63,9 +67,7 @@ class _Sessions:
 
 def _updates() -> list[SessionUpdate]:
     return [
-        SessionUpdate(
-            session_id="s", kind="agent_message_chunk", text="Checking the config."
-        ),
+        SessionUpdate(session_id="s", kind="agent_message_chunk", text="Checking the config."),
         SessionUpdate(
             session_id="s",
             kind="tool_call",
@@ -170,16 +172,25 @@ async def test_single_assistant_root_reply_and_new_root_without_persona(tmp_path
     store = ThreadStore(tmp_path / "external state" / "threads.db", harness=harness)
     await store.open()
     sessions = SessionService(
-        broker, store, default_cwd=tmp_path, grok_home=tmp_path / "native-home",
-        inject_channel_context=False
+        broker,
+        store,
+        default_cwd=tmp_path,
+        grok_home=tmp_path / "native-home",
+        inject_channel_context=False,
     )
     gateway = MattermostGateway(cfg, client, sessions)
     try:
+
         async def post(post_id, root_id, message):
-            await gateway.handle_posted(PostedEvent(
-                post_id=post_id, root_id=root_id, channel_id="example-channel",
-                user_id="example-owner", message=message,
-            ))
+            await gateway.handle_posted(
+                PostedEvent(
+                    post_id=post_id,
+                    root_id=root_id,
+                    channel_id="example-channel",
+                    user_id="example-owner",
+                    message=message,
+                )
+            )
 
         await post("first-root", "", "first question")
         first = await store.get("first-root")
@@ -195,9 +206,12 @@ async def test_single_assistant_root_reply_and_new_root_without_persona(tmp_path
         answers = [(text, root) for _, text, root in client.created if "Hello " in text]
         assert len(answers) == 3
         assert [root for _, root in answers] == ["first-root", "first-root", "second-root"]
-        assert all(word in answers[i][0] for i, word in enumerate(
-            ["first question", "follow-up question", "independent question"]
-        ))
+        assert all(
+            word in answers[i][0]
+            for i, word in enumerate(
+                ["first question", "follow-up question", "independent question"]
+            )
+        )
     finally:
         await broker.stop()
         await store.close()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,6 +61,21 @@ def _optional_path(value: str | None) -> Path | None:
     return selected
 
 
+def _collaboration_cli_command(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    selected = Path(raw)
+    if (
+        any(character in raw for character in "\x00\r\n`")
+        or not selected.is_absolute()
+        or not selected.is_file()
+        or not os.access(selected, os.X_OK)
+    ):
+        raise ValueError("MATTERMOST_COLLAB_CLI_COMMAND must select one absolute executable file")
+    return str(selected)
+
+
 def _read_token(path: Path) -> str:
     try:
         return path.expanduser().read_text(encoding="utf-8").strip()
@@ -106,6 +122,12 @@ class Config:
     log_file: Path | None
     attachments_dir: Path
     attachments_max_bytes: int
+    collab_sidecar: bool = False
+    collab_origin_actor: str = ""
+    collab_cli_command: str | None = None
+    workspace_guard_command: str | None = None
+    workspace_guard_timeout_s: float = 15
+    workspace_guard_source_sha256: str | None = None
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -132,8 +154,7 @@ class Config:
         token = os.environ.get("MATTERMOST_TOKEN", "").strip() or _read_token(token_file)
         if not token:
             raise ValueError(
-                "MATTERMOST_TOKEN is required (or MATTERMOST_TOKEN_FILE "
-                f"at {token_file})"
+                f"MATTERMOST_TOKEN is required (or MATTERMOST_TOKEN_FILE at {token_file})"
             )
 
         raw_channels = _csv(os.environ.get("MATTERMOST_CHANNEL_ID")) | _csv(
@@ -141,32 +162,28 @@ class Config:
         )
         # `all` / `*` / `any` — or an empty value — means every channel this
         # account can see, including channels created after startup.
-        all_channels = not raw_channels or any(
-            c.lower() in WILDCARD_CHANNELS for c in raw_channels
-        )
-        channel_ids = frozenset(
-            c for c in raw_channels if c.lower() not in WILDCARD_CHANNELS
-        )
-        auto_join = _truthy(
-            os.environ.get("MATTERMOST_AUTO_JOIN_CHANNELS"), default=all_channels
-        )
+        all_channels = not raw_channels or any(c.lower() in WILDCARD_CHANNELS for c in raw_channels)
+        channel_ids = frozenset(c for c in raw_channels if c.lower() not in WILDCARD_CHANNELS)
+        auto_join = _truthy(os.environ.get("MATTERMOST_AUTO_JOIN_CHANNELS"), default=all_channels)
         # Channels this account must never join or answer in, even in `all`
         # mode. Used to keep one harness out of another harness's channel.
-        exclude_channel_ids = _csv(
-            os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_ID")
-        ) | _csv(os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_IDS"))
+        exclude_channel_ids = _csv(os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_ID")) | _csv(
+            os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_IDS")
+        )
 
         team_raw = os.environ.get("MATTERMOST_TEAM_ID", "").strip()
         team_id = team_raw or None
         peer_channel_id = os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "").strip() or None
 
         harness = os.environ.get("HARNESS", "").strip()
-        if harness not in {"grok", "claude", "codex", "cursor"}:
-            raise ValueError("HARNESS must explicitly select grok, claude, codex or cursor")
+        if harness not in {"grok", "claude", "codex", "cursor", "gemini"}:
+            raise ValueError("HARNESS must explicitly select grok, claude, codex, cursor or gemini")
         command = _env("AGENT_COMMAND", "").strip()
         if not command:
             raise ValueError("AGENT_COMMAND is required")
         model = _env("AGENT_MODEL", "").strip() or None
+        if harness == "gemini" and model is None:
+            raise ValueError("AGENT_MODEL is required for the native Gemini harness")
         cwd = Path(_env("AGENT_CWD", ".")).expanduser()
         answer_mode = _env("AGENT_ANSWER_MODE", "finalize").strip().lower()
         if answer_mode not in {"finalize", "live"}:
@@ -191,9 +208,19 @@ class Config:
         status_done_tool_lines = max(
             0, int(os.environ.get("MATTERMOST_STATUS_DONE_TOOL_LINES", "0"))
         )
-        status_progress_lines = max(
-            0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3"))
-        )
+        status_progress_lines = max(0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3")))
+
+        guard_timeout = float(os.environ.get("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "15"))
+        if not math.isfinite(guard_timeout) or not 0 < guard_timeout <= 300:
+            raise ValueError("AGENT_WORKSPACE_GUARD_TIMEOUT_S must be positive and at most 300")
+        guard_command = os.environ.get("AGENT_WORKSPACE_GUARD_COMMAND", "").strip() or None
+        guard_source = os.environ.get("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", "").strip() or None
+        if guard_source is not None and (
+            guard_command is None
+            or len(guard_source) != 64
+            or any(char not in "0123456789abcdef" for char in guard_source)
+        ):
+            raise ValueError("Workspace guard source pin requires a command and lowercase SHA256")
 
         return cls(
             mattermost_url=url,
@@ -209,6 +236,9 @@ class Config:
             role_file=_optional_path(os.environ.get("MATTERMOST_ROLE_FILE")),
             harness=harness,
             grok_command=command,
+            workspace_guard_command=guard_command,
+            workspace_guard_timeout_s=guard_timeout,
+            workspace_guard_source_sha256=guard_source,
             grok_model=model,
             grok_cwd=cwd,
             always_approve=_truthy(_env("AGENT_ALWAYS_APPROVE"), default=True),
@@ -216,12 +246,8 @@ class Config:
             max_parallel_turns=max(1, max_parallel),
             show_thoughts=_truthy(_env("AGENT_SHOW_THOUGHTS"), default=False),
             text_slash=_truthy(_env("AGENT_TEXT_SLASH"), default=True),
-            auto_rename_threads=_truthy(
-                _env("AGENT_AUTO_RENAME_THREADS"), default=True
-            ),
-            inject_channel_context=_truthy(
-                _env("AGENT_INJECT_CHANNEL_CONTEXT"), default=True
-            ),
+            auto_rename_threads=_truthy(_env("AGENT_AUTO_RENAME_THREADS"), default=True),
+            inject_channel_context=_truthy(_env("AGENT_INJECT_CHANNEL_CONTEXT"), default=True),
             post_max_lines=post_max_lines,
             status_tool_lines=status_tool_lines,
             status_done_tool_lines=status_done_tool_lines,
@@ -229,11 +255,15 @@ class Config:
             slash_tokens=_csv(os.environ.get("MATTERMOST_SLASH_TOKEN"))
             | _csv(os.environ.get("MATTERMOST_SLASH_TOKENS"))
             | _token_file_csv(os.environ.get("MATTERMOST_SLASH_TOKEN_FILE")),
-            slash_host=os.environ.get("MATTERMOST_SLASH_HOST", "127.0.0.1").strip()
-            or "127.0.0.1",
+            slash_host=os.environ.get("MATTERMOST_SLASH_HOST", "127.0.0.1").strip() or "127.0.0.1",
             slash_port=slash_port,
             db_path=db,
             log_file=log_file,
             attachments_dir=attachments_dir,
             attachments_max_bytes=int(attachments_max_mb * 1024 * 1024),
+            collab_sidecar=_truthy(os.environ.get("MATTERMOST_COLLAB_SIDECAR")),
+            collab_origin_actor=os.environ.get("MATTERMOST_COLLAB_ORIGIN_ACTOR", "").strip(),
+            collab_cli_command=_collaboration_cli_command(
+                os.environ.get("MATTERMOST_COLLAB_CLI_COMMAND")
+            ),
         )

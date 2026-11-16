@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fake_agent import spawn_fake_agent_process
@@ -48,6 +50,59 @@ async def test_session_new_and_prompt(broker: AcpBroker) -> None:
     assert result.usage_used == 1200
     assert "tool_call" in updates
     assert "agent_message_chunk" in updates
+
+
+async def test_loaded_sessions_follow_successful_admission_and_broker_generation(broker):
+    session = await broker.session_new("/tmp")
+    assert broker.is_session_loaded(session)
+    await broker.stop()
+    assert not broker.is_session_loaded(session)
+    await broker.start()
+    assert broker._live_sessions == set()
+    await broker.session_new("/tmp/other")
+    historic = "historic-session"
+    assert not broker.is_session_loaded(historic)
+    await broker.session_resume(historic, "/tmp")
+    assert broker.is_session_loaded(historic)
+    await broker.cancel(historic)
+    assert broker.is_session_loaded(historic)
+    await broker.session_close(historic)
+    assert not broker.is_session_loaded(historic)
+    await broker.session_load(historic, "/tmp")
+    assert broker.is_session_loaded(historic)
+
+
+@pytest.mark.parametrize("operation", ["new", "resume", "load"])
+@pytest.mark.parametrize("failure", ["rpc", "generation"])
+@pytest.mark.parametrize("backend", ["grok", "cursor"])
+async def test_failed_or_superseded_admission_does_not_mark_session_loaded(
+    operation, failure, backend
+):
+    broker = AcpBroker(backend=backend)
+    process = SimpleNamespace(returncode=None)
+    broker._proc = process
+
+    async def request(*args, **kwargs):
+        if failure == "rpc":
+            raise AcpError("Session admission failed")
+        broker._proc = SimpleNamespace(returncode=None)
+        return {"sessionId": "historic-session"}
+
+    broker.request = AsyncMock(side_effect=request)
+    if operation == "new":
+        operation = broker.session_new("/tmp")
+    elif operation == "resume":
+        operation = broker.session_resume("historic-session", "/tmp")
+    else:
+        operation = broker.session_load("historic-session", "/tmp")
+    if failure == "rpc":
+        with pytest.raises(AcpError, match="admission failed"):
+            await operation
+    else:
+        await operation
+    assert not broker.is_session_loaded("historic-session")
+    assert broker._live_sessions == set()
+    assert broker._cursor_live_sessions == set()
 
 
 @pytest.mark.asyncio
@@ -145,6 +200,57 @@ def test_build_argv_claude_backend_has_no_grok_flags() -> None:
 def test_build_argv_codex_backend_has_no_grok_flags() -> None:
     b = AcpBroker(command="codex-acp", backend="codex", model="gpt-6-astra")
     assert b._build_argv() == ["codex-acp"]
+
+
+@pytest.mark.asyncio
+async def test_native_gemini_direct_adapter_session_keeps_unknown_idle_boundary(tmp_path) -> None:
+    launches = []
+    writes = []
+
+    async def spawn(argv):
+        launches.append(list(argv))
+        return await spawn_fake_agent_process(argv)
+
+    b = AcpBroker(
+        command="synthetic-gemini-adapter",
+        backend="gemini",
+        model="carbon-test",
+        always_approve=True,
+        extra_args=["--config", "/synthetic profile"],
+        process_factory=spawn,
+    )
+    actual_write = b._write
+
+    async def written(message, *, guard=None, on_write=None):
+        await actual_write(message, guard=guard, on_write=on_write)
+        writes.append(message)
+
+    b._write = written
+    assert b.native_boundary_idle
+    try:
+        capabilities = await b.start()
+        assert launches == [["synthetic-gemini-adapter", "--config", "/synthetic profile"]]
+        assert b.is_running and capabilities.load_session
+        assert not b.native_boundary_idle
+        sid = await b.session_new(str(tmp_path))
+        assert sid.startswith("sess-test-")
+        assert await b.set_model(sid, "carbon-test") == "carbon-test"
+        result = await b.prompt_turn(sid, "Verify native Gemini routing")
+        assert result.stop_reason == "end_turn"
+        assert "Verify native Gemini routing" in result.answer_text
+        assert result.tool_titles == ["read_file vault"]
+        assert not b._pending and not b.native_boundary_idle
+        await b.cancel(sid)
+        assert writes[-1] == {
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": sid},
+        }
+        await b.session_resume(sid, str(tmp_path))
+        assert not b._pending and not b.native_boundary_idle
+    finally:
+        await b.stop()
+    assert not b.is_running and not b.native_boundary_idle
 
 
 def test_pick_allow_prefers_always() -> None:
@@ -368,3 +474,52 @@ async def test_permission_policy_respects_explicit_denial():
     broker.always_approve = True
     await broker._handle_permission(2, request)
     assert writes[-1]["result"]["outcome"]["optionId"] == "allow"
+
+
+async def test_native_start_commits_warmth_before_spawn_and_survives_no_thread_creation(tmp_path):
+    from mattermost_acp.store import ThreadStore
+
+    path = tmp_path / "native.db"
+    store = ThreadStore(path, harness="claude")
+    await store.open()
+
+    async def checked_spawn(argv):
+        # A separately opened connection proves the marker was committed.
+        independent = ThreadStore(path, harness="claude")
+        await independent.open()
+        try:
+            assert await independent.native_boundary_unknown()
+            assert await independent.get("not-yet-created") is None
+        finally:
+            await independent.close()
+        return await spawn_fake_agent_process(argv)
+
+    broker = AcpBroker(
+        process_factory=checked_spawn,
+        initial_native_uncertainty=await store.native_boundary_unknown(),
+        on_native_start=store.mark_native_boundary_unknown,
+    )
+    try:
+        assert broker.native_boundary_idle
+        await broker.start()
+        await broker.stop()
+        assert not broker.native_boundary_idle
+        await store.close()
+        await store.open()
+        restarted = AcpBroker(initial_native_uncertainty=await store.native_boundary_unknown())
+        assert not restarted.is_running and not restarted.native_boundary_idle
+    finally:
+        await broker.stop()
+        await store.close()
+
+
+async def test_failed_native_boundary_persistence_prevents_process_launch():
+    async def failed_persistence():
+        raise OSError("Native state could not be committed")
+
+    factory = AsyncMock()
+    broker = AcpBroker(process_factory=factory, on_native_start=failed_persistence)
+    with pytest.raises(OSError, match="could not be committed"):
+        await broker.start()
+    factory.assert_not_awaited()
+    assert not broker.is_running and not broker.native_boundary_idle

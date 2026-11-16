@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import logging
+import secrets
 from collections.abc import Awaitable, Callable
 
 import aiohttp
 from aiohttp import web
 
+from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.commands.models_catalog import fetch_catalog
 from mattermost_acp.config import Config
 from mattermost_acp.mm.slash import (
@@ -46,6 +50,8 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
     app = web.Application()
 
     async def slash(request: web.Request) -> web.Response:
+        if getattr(config, "collab_sidecar", False):
+            raise web.HTTPNotFound()
         form = dict(await request.post())
         safe_keys = sorted(k for k in form if k != "token")
         logger.info(
@@ -73,6 +79,62 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
 
     app.router.add_post("/slash", slash)
     app.router.add_get("/healthz", lambda _r: web.Response(text="ok"))
+    maintenance_gateway = getattr(handler, "__self__", None)
+    maintenance_lock = getattr(maintenance_gateway, "_maintenance_lock", None) or asyncio.Lock()
+
+    async def maintenance(request):
+        gateway = getattr(handler, "__self__", None)
+        consumer = getattr(gateway, "collaboration", None)
+        if consumer is None:
+            raise web.HTTPNotFound()
+        token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+        if (
+            not request.remote
+            or not ipaddress.ip_address(request.remote).is_loopback
+            or not secrets.compare_digest(token.encode(), consumer.hub.settings.token.encode())
+        ):
+            raise web.HTTPUnauthorized()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError):
+            raise web.HTTPBadRequest() from None
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest()
+        action = body.get("action", "state")
+        if not isinstance(action, str) or action not in {"state", "drain", "resume", "seal"}:
+            raise web.HTTPBadRequest()
+        # Local flags and the hub fence are one transition, including overlapping
+        # operator requests. The consumer's lock covers only its hub operation.
+        async with maintenance_lock:
+            if action == "resume" and gateway.maintenance_state().get("restart_pending", False):
+                raise web.HTTPConflict(text="Gateway restart is already pending")
+            if action == "seal":
+                if not gateway.draining or not gateway.maintenance_state()["idle"]:
+                    raise web.HTTPConflict(text="Gateway must be drained and idle")
+                gateway._maintenance_generation = getattr(gateway, "_maintenance_generation", 0) + 1
+                try:
+                    await consumer.set_admission("sealed")
+                except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+                    raise web.HTTPConflict(text="Mailbox admission could not settle") from None
+                if not gateway.maintenance_state()["idle"]:
+                    await consumer.set_admission("controls")
+                    raise web.HTTPConflict(text="Gateway has pending work")
+                gateway.sealed = True
+            elif action != "state":
+                # Keep local admission closed throughout a hub fence transition.
+                gateway._maintenance_generation = getattr(gateway, "_maintenance_generation", 0) + 1
+                gateway.draining = True
+                try:
+                    await consumer.set_admission("controls" if action == "drain" else "normal")
+                except (RuntimeError, TimeoutError, HubError, aiohttp.ClientError):
+                    gateway.draining = True
+                    raise web.HTTPConflict(text="Mailbox admission could not settle") from None
+                if action == "resume":
+                    gateway.sealed = False
+                    gateway.draining = False
+            return web.json_response(gateway.maintenance_state())
+
+    app.router.add_post("/maintenance", maintenance)
 
     async def autocomplete_models(request: web.Request) -> web.Response:
         """Plugin dynamic-list lookup: ``[]AutocompleteListItem`` JSON.
@@ -94,22 +156,16 @@ def build_slash_app(config: Config, handler: SlashHandler) -> web.Application:
     return app
 
 
-async def start_slash_site(
-    config: Config, handler: SlashHandler
-) -> web.AppRunner | None:
+async def start_slash_site(config: Config, handler: SlashHandler) -> web.AppRunner | None:
     if config.slash_port <= 0:
         logger.info("Slash HTTP disabled (MATTERMOST_SLASH_PORT<=0)")
         return None
     if not config.slash_tokens:
-        logger.warning(
-            "Slash HTTP listening but MATTERMOST_SLASH_TOKEN is empty — all posts 401"
-        )
+        logger.warning("Slash HTTP listening but MATTERMOST_SLASH_TOKEN is empty — all posts 401")
     app = build_slash_app(config, handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, config.slash_host, config.slash_port)
     await site.start()
-    logger.info(
-        "Slash HTTP on http://%s:%s/slash", config.slash_host, config.slash_port
-    )
+    logger.info("Slash HTTP on http://%s:%s/slash", config.slash_host, config.slash_port)
     return runner

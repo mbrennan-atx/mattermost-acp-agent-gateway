@@ -130,3 +130,76 @@ def test_explicit_harness_and_command_required(monkeypatch):
     monkeypatch.delenv("GROK_COMMAND", raising=False)
     with pytest.raises(ValueError, match="AGENT_COMMAND"):
         Config.load("/dev/null")
+
+
+@pytest.mark.parametrize("model", [None, "", " \t "])
+def test_native_gemini_requires_selected_model(monkeypatch, model):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("HARNESS", "gemini")
+    monkeypatch.setenv("AGENT_COMMAND", "synthetic-gemini-adapter")
+    if model is not None:
+        monkeypatch.setenv("AGENT_MODEL", model)
+    with pytest.raises(ValueError, match="AGENT_MODEL"):
+        Config.load("/dev/null")
+
+
+def test_native_gemini_retains_explicit_adapter_model_and_directory(tmp_path, monkeypatch):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("HARNESS", "gemini")
+    monkeypatch.setenv("AGENT_COMMAND", "synthetic-gemini-adapter")
+    monkeypatch.setenv("AGENT_MODEL", "carbon-test")
+    monkeypatch.setenv("GROK_MODEL", "legacy-test")
+    monkeypatch.setenv("AGENT_CWD", str(tmp_path))
+    cfg = Config.load("/dev/null")
+    assert cfg.harness == "gemini"
+    assert cfg.grok_command == "synthetic-gemini-adapter"
+    assert cfg.grok_model == "carbon-test"
+    assert cfg.grok_cwd == tmp_path
+
+
+@pytest.mark.parametrize("timeout", ["0", "-1", "nan", "inf", "301"])
+def test_workspace_guard_timeout_refuses_unbounded_or_invalid_values(monkeypatch, timeout):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", timeout)
+    with pytest.raises(ValueError, match="AGENT_WORKSPACE_GUARD_TIMEOUT_S"):
+        Config.load("/dev/null")
+
+
+def test_workspace_guard_timeout_loads_bounded_override(monkeypatch):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.delenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", raising=False)
+    assert Config.load("/dev/null").workspace_guard_timeout_s == 15
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "60")
+    assert Config.load("/dev/null").workspace_guard_timeout_s == 60
+
+
+@pytest.mark.parametrize("pin", ["x" * 64, "A" * 64, "a" * 63, "a" * 65])
+def test_workspace_guard_rejects_invalid_source_pin(monkeypatch, pin):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_COMMAND", "/private/guard")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", pin)
+    with pytest.raises(ValueError, match="source pin"):
+        Config.load("/dev/null")
+
+
+def test_workspace_guard_source_pin_requires_a_selected_command(monkeypatch):
+    _clear_mm(monkeypatch)
+    monkeypatch.setenv("MATTERMOST_URL", "https://chat.example.com")
+    monkeypatch.setenv("MATTERMOST_TOKEN", "synthetic")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", "a" * 64)
+    monkeypatch.delenv("AGENT_WORKSPACE_GUARD_COMMAND", raising=False)
+    with pytest.raises(ValueError, match="source pin"):
+        Config.load("/dev/null")
+    monkeypatch.setenv("AGENT_WORKSPACE_GUARD_COMMAND", "/private/guard")
+    config = Config.load("/dev/null")
+    assert config.workspace_guard_source_sha256 == "a" * 64

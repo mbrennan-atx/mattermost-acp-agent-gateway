@@ -101,6 +101,21 @@ binds the remote loopback interface. Listener/forwarding ports are explicit opti
 
 ## Upgrade and rollback
 
+The standalone `scripts/set-harness` command saves the new selection and defers
+its default restart. A cleared foreground marker cannot verify native admission.
+Use the gateway maintenance workflow to drain and seal verified idle work.
+
+Prompt turns have no absolute deadline by default. Real agent output and tool
+completion reset the 15-minute inactivity budget. Synthetic heartbeats and
+usage notifications do not reset it. Control-plane RPCs retain their separate
+120-second timeout.
+
+`ACP_PROMPT_HARD_MAX_SEC=0` explicitly disables an absolute prompt deadline.
+Set a finite positive value only when a deployment needs a fixed ceiling.
+Negative, nonfinite and malformed values fail startup. Preserve this setting
+when updating gateway executables; increasing an old two-hour ceiling alone
+does not replace the new default.
+
 Record current service executable, environment and native profile paths, model
 and effort pins, allowlists, approval policy, instruction hashes, thread/session
 associations and external consumers before changing a deployment. Preserve

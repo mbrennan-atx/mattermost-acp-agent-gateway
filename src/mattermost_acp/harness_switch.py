@@ -3,9 +3,9 @@
 Shared by ``scripts/set-harness`` and the ``/harness`` chat command. Stdlib
 only so the script runs without the virtualenv.
 
-A switch rewrites the managed keys in the agent's env file, records the
-harness in the selected private roster, and restarts the unit once the agent has no
-turn in flight. systemd rereads ``EnvironmentFile`` on every start, and
+A switch rewrites the managed keys in the agent's env file and records the
+harness in the selected private roster. Activation requires a verified native
+maintenance boundary. systemd rereads ``EnvironmentFile`` on every start, and
 ``EnvironmentFile`` values override the unit's ``Environment=`` lines.
 """
 
@@ -304,7 +304,7 @@ def tag_legacy_rows(db_path: Path, harness: str) -> None:
 
 
 def wait_idle(db_path: Path, *, timeout_s: float, poll_s: float = 5.0) -> list[str]:
-    """Wait for the agent to finish in-flight turns. Returns threads still busy."""
+    """Inspect foreground turns only; this does not authorize a native restart."""
     marker = busy_path(db_path)
     deadline = time.monotonic() + timeout_s
     while True:
