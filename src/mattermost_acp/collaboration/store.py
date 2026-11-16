@@ -51,6 +51,9 @@ class CollaborationStore:
                 created REAL NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL,
                 UNIQUE(project, sender, key));
             CREATE INDEX IF NOT EXISTS mailbox ON messages(recipient,state,created);
+            CREATE INDEX IF NOT EXISTS mailbox_priority ON messages(
+                recipient,state,CASE kind WHEN 'cancel' THEN 0 WHEN 'result' THEN 1
+                ELSE 2 END,created,id);
             CREATE INDEX IF NOT EXISTS message_expiry ON messages(state);
             CREATE TABLE IF NOT EXISTS notes(id TEXT PRIMARY KEY, project TEXT, data TEXT);
             CREATE TABLE IF NOT EXISTS creations(actor TEXT, key TEXT, data TEXT,
@@ -582,18 +585,34 @@ class CollaborationStore:
             and (instance is None or item.get("instance") == instance)
         ]
 
+    def queued_candidates(self, actor, controls_only):
+        priority = "CASE kind WHEN 'cancel' THEN 0 WHEN 'result' THEN 1 ELSE 2 END"
+        after = None
+        while True:
+            rows = self.db.execute(
+                f"SELECT id,created,{priority} AS priority FROM messages "
+                "WHERE recipient=? AND state='queued' "
+                + ("AND kind='cancel' " if controls_only else "")
+                + (f"AND ({priority},created,id)>(?,?,?) " if after else "")
+                + "ORDER BY priority,created,id LIMIT 32",
+                (actor, *after) if after else (actor,),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                payload = self.db.execute(
+                    "SELECT data FROM messages WHERE id=? AND recipient=? AND state='queued'",
+                    (row["id"], actor),
+                ).fetchone()
+                if payload:
+                    yield json.loads(payload[0])
+            last = rows[-1]
+            after = last["priority"], last["created"], last["id"]
+
     def claim_next(self, actor, instance, *, controls_only=False):
         with self.transaction():
             self.expire()
-            rows = self.db.execute(
-                "SELECT data FROM messages WHERE recipient=? AND state='queued' "
-                + ("AND kind='cancel' " if controls_only else "")
-                + "ORDER BY CASE kind WHEN 'cancel' THEN 0 WHEN 'result' THEN 1 "
-                "ELSE 2 END,created,id",
-                (actor,),
-            ).fetchall()
-            for row in rows:
-                item = json.loads(row[0])
+            for item in self.queued_candidates(actor, controls_only):
                 project = self.get_project(item["project"], actor)
                 if item.get("not_before", 0) > self.clock():
                     continue
@@ -628,17 +647,16 @@ class CollaborationStore:
                             self.get_message(item["parent"], actor) if item.get("parent") else None
                         )
                         sibling = self.db.execute(
-                            "SELECT data FROM messages WHERE project=? AND kind IN ('ask','work') "
+                            "SELECT 1 FROM messages WHERE project=? AND kind IN ('ask','work') "
                             "AND (state IN ('running','unconfirmed','interrupted','cancelling') "
-                            "OR " + PENDING_EXECUTION + ")",
-                            (project["id"],),
-                        ).fetchall()
+                            "OR " + PENDING_EXECUTION + ") "
+                            "AND json_extract(data,'$.parent')=? LIMIT 1",
+                            (project["id"], parent["id"] if parent else None),
+                        ).fetchone()
                         if (
                             not parent
                             or parent["state"] != "running"
-                            or any(
-                                json.loads(row[0]).get("parent") == parent["id"] for row in sibling
-                            )
+                            or sibling
                             or active
                             >= project["limits"]["max_workers"]
                             * (project["limits"]["max_depth"] + 1)
@@ -726,7 +744,38 @@ class CollaborationStore:
                     if state == "execution_settled":
                         raise ValueError("Native settlement must match the reserved execution")
                     raise ValueError("Native execution changed before update")
-            if state in {"evidence", "execution_settled", "undispatched"}:
+            if state in {"evidence", "execution_settled", "execution_resumed", "undispatched"}:
+                if state == "execution_resumed":
+                    receipt = evidence or {}
+                    reserved = item.get("evidence", {})
+                    if (
+                        item["state"] not in TERMINAL
+                        or receipt.get("pending") is not True
+                        or receipt.get("native_dispatched") is not True
+                        or not reserved.get("session_id")
+                        or not reserved.get("execution_id")
+                        or reserved.get("not_dispatched") is True
+                        or reserved.get("native_dispatched") is False
+                        or receipt.get("session_id") != reserved.get("session_id")
+                        or receipt.get("execution_id") != reserved.get("execution_id")
+                        or receipt.get("native_epoch", reserved.get("native_epoch"))
+                        != reserved.get("native_epoch")
+                    ):
+                        raise ValueError("Resumed native work must match the reserved execution")
+                    item["execution_pending"] = True
+                    project = self.get_project(item["project"], actor)
+                    binding = item.get("binding", {})
+                    owner_origin = (
+                        item["recipient"] == project["owner"]
+                        and not project.get("owner_in_discussion")
+                        and binding.get("thread_id") == project["origin_thread_id"]
+                        and binding.get("channel_id") == project["origin_channel_id"]
+                    )
+                    if project["status"] in {"cancelling", "cancelled"} and not owner_origin:
+                        project["status"] = "cancelling"
+                        item["execution_cancelling"] = True
+                        self.save_project(project)
+                        self.queue_cancel_control(project, item)
                 if state == "undispatched":
                     receipt = evidence or {}
                     reserved = item.get("evidence", {})
@@ -1020,26 +1069,44 @@ class CollaborationStore:
                     if item["state"] not in TERMINAL:
                         item["state"] = "cancelling"
                     self.save_message(item)
-                    control = {
-                        "id": identifier(),
-                        "project": pid,
-                        "sender": actor,
-                        "recipient": item["recipient"],
-                        "kind": "cancel",
-                        "text": "Cancel project work",
-                        "parent": item["id"],
-                        "parent_claim": item.get("claim"),
-                        "dependencies": [],
-                        "depth": 0,
-                        "key": "cancel:" + item["id"],
-                        "state": "queued",
-                        "created": self.clock(),
-                        "attempt": 0,
-                        "evidence": {},
-                    }
-                    self.save_message(control)
+                    self.queue_cancel_control(project, item)
             self.finish_cancellation(pid, actor)
             return self.get_project(pid, actor)
+
+    def queue_cancel_control(self, project, item):
+        if self.db.execute(
+            "SELECT 1 FROM messages WHERE project=? AND kind='cancel' "
+            "AND json_extract(data,'$.parent')=? "
+            "AND json_extract(data,'$.parent_claim') IS ? "
+            "AND state NOT IN ('done','failed','blocked','cancelled') LIMIT 1",
+            (project["id"], item["id"], item.get("claim")),
+        ).fetchone():
+            return
+        key = "cancel:" + item["id"]
+        if self.db.execute(
+            "SELECT 1 FROM messages WHERE project=? AND sender=? AND key=?",
+            (project["id"], project["owner"], key),
+        ).fetchone():
+            key += ":" + identifier()
+        self.save_message(
+            {
+                "id": identifier(),
+                "project": project["id"],
+                "sender": project["owner"],
+                "recipient": item["recipient"],
+                "kind": "cancel",
+                "text": "Cancel project work",
+                "parent": item["id"],
+                "parent_claim": item.get("claim"),
+                "dependencies": [],
+                "depth": 0,
+                "key": key,
+                "state": "queued",
+                "created": self.clock(),
+                "attempt": 0,
+                "evidence": {},
+            }
+        )
 
     def finish_cancellation(self, pid, actor):
         project = self.get_project(pid, actor)

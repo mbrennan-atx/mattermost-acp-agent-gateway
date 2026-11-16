@@ -335,6 +335,7 @@ class AcpBroker:
                 return self._capabilities
 
             if not self.is_running:
+                self._started = False
                 self._initialized = False
                 self._initialization_pending = False
                 self._cursor_live_sessions.clear()

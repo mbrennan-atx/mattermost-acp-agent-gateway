@@ -34,6 +34,7 @@ class CollaborationConsumer:
         self.ownership = {}
         self.ownership_threads = {}
         self.rejected_reservations = {}
+        self.pending_execution_restores = {}
         self.reserving = set()
         self.cancelled_claims = set()
         self.claiming = False
@@ -287,6 +288,7 @@ class CollaborationConsumer:
 
     def release_ownership(self, key):
         self.rejected_reservations.pop(key, None)
+        self.pending_execution_restores.pop(key, None)
         report = self.ownership.pop(key, None)
         thread = self.ownership_threads.pop(key, None) or (report or {}).get("thread_id")
         self.gateway.prune_reports()
@@ -327,6 +329,15 @@ class CollaborationConsumer:
         if self.settle_rejected_reservation(key, state):
             return
         report = self.ownership.get(key)
+        if key in self.pending_execution_restores:
+            proof = self.pending_execution_restores[key]
+            self.reserving.add(key)
+            try:
+                await self.update(state, "execution_resumed", evidence=proof)
+                if self.pending_execution_restores.get(key) is proof:
+                    self.pending_execution_restores.pop(key, None)
+            finally:
+                self.reserving.discard(key)
         thread = self.ownership_threads.get(key) or (report or {}).get("thread_id")
         terminal = self.gateway._last_terminal.get(thread)
         evidence = state.get("evidence", {})
@@ -357,10 +368,35 @@ class CollaborationConsumer:
             and terminal.get("native_dispatched", True)
         ):
             if not cancelled_retry:
-                await self.update(
-                    state, "execution_settled", evidence=self.foreground(state, terminal)
-                )
-            if self.ownership.get(key) is report and key not in self.reserving:
+                self.reserving.add(key)
+                try:
+                    try:
+                        await self.update(
+                            state, "execution_settled", evidence=self.foreground(state, terminal)
+                        )
+                    finally:
+                        if (
+                            self.ownership.get(key) is report
+                            and report.get("execution_id") == evidence.get("execution_id")
+                            and self.ownership_pending(key, self.gateway._last_terminal.get(thread))
+                        ):
+                            proof = {
+                                "session_id": evidence["session_id"],
+                                "execution_id": evidence["execution_id"],
+                                "native_dispatched": True,
+                                "pending": True,
+                            }
+                            self.pending_execution_restores[key] = proof
+                            await self.update(state, "execution_resumed", evidence=proof)
+                            if self.pending_execution_restores.get(key) is proof:
+                                self.pending_execution_restores.pop(key, None)
+                finally:
+                    self.reserving.discard(key)
+            if (
+                self.ownership.get(key) is report
+                and key not in self.reserving
+                and not self.ownership_pending(key, self.gateway._last_terminal.get(thread))
+            ):
                 self.release_ownership(key)
 
     def settle_rejected_reservation(self, key, state):
@@ -478,6 +514,7 @@ class CollaborationConsumer:
             and all(
                 self.ownership.get((parent["id"], parent.get("claim"))) is report
                 and (reserved or (parent["id"], parent.get("claim")) not in self.reserving)
+                and (parent["id"], parent.get("claim")) not in self.pending_execution_restores
                 and (parent["id"], parent.get("claim")) not in self.cancelled_claims
                 for parent in info["parents"]
             )

@@ -1089,3 +1089,94 @@ async def test_refused_dispatch_finalizes_its_status_without_cancelling_predeces
             assert previous["reporter"].active_tools == {"retained-background-tool"}
     finally:
         await close_reports(gateway)
+
+
+@pytest.mark.parametrize("pending", ["ownership", "recovery", "background"])
+async def test_model_directive_refuses_catalog_preparation_before_native_effects(native, pending):
+    gateway = native.gateway
+    gateway.config.harness = "claude"
+    if pending == "ownership":
+        gateway.collaboration = ownership(owned=True)
+    elif pending == "recovery":
+        gateway.collaboration_recovery_pending = True
+    else:
+        gateway._reports["native"] = {
+            "thread_id": "discussion",
+            "collaboration_project": "project",
+            "active": False,
+            "reporter": SimpleNamespace(has_pending_work=lambda: True),
+        }
+    native.sessions.ensure_session = AsyncMock(wraps=native.sessions.ensure_session)
+    with pytest.raises(NativeDispatchChanged):
+        await gateway._apply_model_directive("discussion", "floor", "model", "high", "thread")
+    native.sessions.ensure_session.assert_not_awaited()
+    assert native.writes == []
+
+
+async def test_model_directive_catalog_wait_rechecks_project_admission(native):
+    gateway, svc = native.gateway, native.sessions
+    gateway.config.harness = "claude"
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def guard(*_args):
+        entered.set()
+        await release.wait()
+
+    svc.workspace_guard = guard
+    epoch = svc.native_epoch("discussion")
+    task = asyncio.create_task(
+        gateway._apply_model_directive("discussion", "floor", "model", "high", "thread")
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        gateway.collaboration = ownership(owned=True)
+        release.set()
+        with pytest.raises(NativeDispatchChanged):
+            await asyncio.wait_for(task, 2)
+        assert native.writes == [] and svc.native_epoch("discussion") == epoch
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_respawn_refused_initialization_cannot_reuse_previous_started_capabilities(tmp_path):
+    admitted = True
+    processes, writes = [], []
+
+    async def factory(argv):
+        nonlocal admitted
+        process = await spawn_fake_agent_process(argv)
+        processes.append(process)
+        original = process.stdin.write
+
+        def write(payload):
+            writes.append((process.pid, json.loads(payload)))
+            original(payload)
+
+        process.stdin.write = write
+        if len(processes) == 2:
+            admitted = False
+        return process
+
+    broker = AcpBroker(process_factory=factory)
+    try:
+        await broker.start()
+        assert broker._started
+        old_reader = broker._reader_task
+        processes[0].terminate()
+        await asyncio.wait_for(processes[0].wait(), 2)
+        await asyncio.wait_for(old_reader, 2)
+        with native_command_admission(lambda: admitted):
+            with pytest.raises(NativeDispatchChanged):
+                await broker.start()
+        assert broker.is_running and not broker._started and not broker._initialized
+        replacement = broker._proc
+        assert not any(pid == replacement.pid for pid, _msg in writes)
+        admitted = True
+        await broker.start()
+        assert broker._proc is replacement and broker._started and len(processes) == 2
+        assert [msg["method"] for pid, msg in writes if pid == replacement.pid] == ["initialize"]
+        session = await broker.session_new(tmp_path)
+        assert session
+    finally:
+        await broker.stop()

@@ -27,6 +27,7 @@ from mattermost_acp.collaboration.client import HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import MattermostClient, PostedEvent
+from mattermost_acp.mm.reporting import TurnReporter
 from mattermost_acp.session_service import SessionService
 
 
@@ -71,6 +72,385 @@ def test_result_retry_at_full_work_budget_preserves_result_and_requires_reconcil
         assert store.get_message(requested["id"], "beta")["state"] == "done"
         with pytest.raises(ValueError, match="dispatch limit"):
             ask(store, p["id"], key="another-request")
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("scenario", ["tool", "worker", "cancel-await", "repair-outage"])
+async def test_late_native_activity_during_settlement_restores_debt_and_cancellation(
+    tmp_path, scenario
+):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, report):
+        broker, writer = memory_broker()
+        sessions = SessionService(broker, gateway.sessions.store, default_cwd=tmp_path)
+        sessions._native_epochs["discussion"] = 7
+        gateway.sessions = sessions
+        report["reporter"] = TurnReporter()
+        store.reply(parent["id"], "beta", "Early result", claim=parent["claim"])
+        state = store.get_message(parent["id"], "beta")
+        accepted, release = asyncio.Event(), asyncio.Event()
+        actual = consumer.hub.request
+        repair_fails = scenario == "repair-outage"
+
+        async def delayed(method, path, body=None):
+            if body and body.get("state") == "execution_resumed" and repair_fails:
+                raise HubError("Synthetic debt repair outage", status=503)
+            result = await actual(method, path, body)
+            if body and body.get("state") == "execution_settled" and not accepted.is_set():
+                accepted.set()
+                await release.wait()
+            return result
+
+        consumer.hub.request = delayed
+        key = parent["id"], parent["claim"]
+        task = asyncio.create_task(consumer.settle_ownership(key, state))
+
+        def activity(completed=False):
+            if scenario == "worker":
+                return SessionUpdate(
+                    "existing-native",
+                    "subagent_activity",
+                    raw={
+                        "worker_id": "late-child",
+                        "state": "completed" if completed else "running",
+                    },
+                )
+            return SessionUpdate(
+                "existing-native",
+                "tool_call_update" if completed else "tool_call",
+                tool_call_id="late-tool",
+                tool_status="completed" if completed else "in_progress",
+            )
+
+        try:
+            await asyncio.wait_for(accepted.wait(), 2)
+            assert store.get_message(parent["id"], "beta")["execution_pending"] is False
+            gateway._observe_background_update(activity())
+            if scenario != "tool":
+                assert store.cancel(p["id"], "alpha")["status"] == "cancelled"
+            if scenario == "cancel-await":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                release.set()
+                if repair_fails:
+                    with pytest.raises(HubError, match="repair outage"):
+                        await asyncio.wait_for(task, 2)
+                    assert key in consumer.pending_execution_restores
+                    assert consumer.ownership[key] is report
+                    repair_fails = False
+                    await consumer.reconcile_ownership()
+                else:
+                    await asyncio.wait_for(task, 2)
+            restored = store.get_message(parent["id"], "beta")
+            assert restored["state"] == "done" and restored["execution_pending"] is True
+            assert restored["evidence"]["pending"] is True
+            assert restored["evidence"]["session_id"] == "existing-native"
+            assert restored["evidence"]["execution_id"] == report["execution_id"]
+            assert consumer.ownership[key] is report and not consumer.pending_execution_restores
+            assert key not in consumer.reserving
+            if scenario == "tool":
+                store.cancel(p["id"], "alpha")
+            assert store.get_project(p["id"], "alpha")["status"] == "cancelling"
+            assert store.get_message(parent["id"], "beta")["execution_cancelling"] is True
+            control = store.claim_next("beta", consumer.instance, controls_only=True)
+            assert control and control["parent"] == parent["id"]
+            original_write = writer.write
+
+            def cancelled(payload):
+                original_write(payload)
+                if json.loads(payload).get("method") == "session/cancel":
+                    gateway._observe_background_update(activity(completed=True))
+                    gateway._last_terminal["discussion"].update(
+                        stop_reason="cancelled",
+                        pending=False,
+                        completed_at=store.clock() + 1,
+                    )
+
+            writer.write = cancelled
+            await asyncio.wait_for(consumer.handle(control), 3)
+            assert [msg["method"] for msg in writer.messages] == ["session/cancel"]
+            assert writer.messages[0]["params"]["sessionId"] == "existing-native"
+            assert store.get_project(p["id"], "alpha")["status"] == "cancelled"
+            assert store.get_message(parent["id"], "beta")["execution_pending"] is False
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await close_reports(gateway)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "session_id",
+        "execution_id",
+        "native_epoch",
+        "pending",
+        "native_dispatched",
+        "reserved_undispatched",
+        "reserved_dispatch_false",
+    ],
+)
+def test_resumed_execution_proof_cannot_replace_another_reservation(tmp_path, change):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    try:
+        p = project(store)
+        work = ask(store, p["id"])
+        claimed = store.claim_next("beta", "worker")
+        store.update(
+            work["id"],
+            "beta",
+            "worker",
+            "dispatch",
+            evidence={
+                "session_id": "native",
+                "execution_id": "execution",
+                "native_epoch": 7,
+            },
+            claim=claimed["claim"],
+        )
+        store.reply(work["id"], "beta", "Early result", claim=claimed["claim"])
+        before = store.get_message(work["id"], "beta")
+        if change.startswith("reserved_"):
+            field = "not_dispatched" if change == "reserved_undispatched" else "native_dispatched"
+            before["evidence"][field] = field == "not_dispatched"
+            store.save_message(before)
+        proof = {
+            "session_id": "native",
+            "execution_id": "execution",
+            "native_epoch": 7,
+            "pending": True,
+            "native_dispatched": True,
+        }
+        if not change.startswith("reserved_"):
+            proof[change] = False if change in {"pending", "native_dispatched"} else "different"
+        with pytest.raises(ValueError, match="reserved execution"):
+            store.update(
+                work["id"],
+                "beta",
+                "worker",
+                "execution_resumed",
+                evidence=proof,
+                claim=claimed["claim"],
+                expected_execution_id="execution",
+            )
+        assert store.get_message(work["id"], "beta") == before
+    finally:
+        store.close()
+
+
+def test_resumed_execution_requeues_cancel_without_overwriting_control_history(tmp_path):
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"})
+    try:
+        p = project(store)
+        work = ask(store, p["id"])
+        claimed = store.claim_next("beta", "worker")
+        store.update(
+            work["id"],
+            "beta",
+            "worker",
+            "dispatch",
+            evidence={"session_id": "native", "execution_id": "execution"},
+            claim=claimed["claim"],
+        )
+        store.reply(work["id"], "beta", "Early result", claim=claimed["claim"])
+        store.cancel(p["id"], "alpha")
+        control = store.claim_next("beta", "worker", controls_only=True)
+        settled = store.update(
+            work["id"],
+            "beta",
+            "worker",
+            "execution_settled",
+            evidence={
+                "session_id": "native",
+                "execution_id": "execution",
+                "native_dispatched": True,
+                "stop_reason": "cancelled",
+                "pending": False,
+                "completed_at": store.clock(),
+            },
+            claim=claimed["claim"],
+        )
+        history = store.update(
+            control["id"], "beta", "worker", "done", "Cancelled", claim=control["claim"]
+        )
+        assert store.get_project(p["id"], "alpha")["status"] == "cancelled"
+        for _ in range(2):
+            store.update(
+                work["id"],
+                "beta",
+                "worker",
+                "execution_resumed",
+                evidence={
+                    "session_id": "native",
+                    "execution_id": "execution",
+                    "native_dispatched": True,
+                    "pending": True,
+                },
+                claim=claimed["claim"],
+            )
+        assert store.get_message(control["id"], "beta") == history
+        assert store.get_project(p["id"], "alpha")["status"] == "cancelling"
+        replacement = store.claim_next("beta", "worker", controls_only=True)
+        assert replacement["id"] != control["id"]
+        assert replacement["parent_claim"] == claimed["claim"]
+        assert replacement["key"].startswith(control["key"] + ":")
+        assert store.claim_next("beta", "worker", controls_only=True) is None
+        assert settled["execution_pending"] is False
+    finally:
+        store.close()
+
+
+async def test_idle_execution_repair_keeps_continuation_and_cancellation_fenced(tmp_path):
+    async with retained_parent(tmp_path) as (store, _clients, gateway, consumer, p, parent, report):
+        store.reply(parent["id"], "beta", "Early result", claim=parent["claim"])
+        state = store.get_message(parent["id"], "beta")
+        state = await consumer.update(
+            state, "execution_settled", evidence=consumer.foreground(state, terminal())
+        )
+        key = parent["id"], parent["claim"]
+        consumer.pending_execution_restores[key] = {
+            "session_id": "existing-native",
+            "execution_id": report["execution_id"],
+            "native_dispatched": True,
+            "pending": True,
+        }
+        assert not consumer.continuation_idle(
+            {"report": report, "thread": "discussion", "parents": [state]}
+        )
+        accepted, release = asyncio.Event(), asyncio.Event()
+        actual = consumer.hub.request
+
+        async def delayed(method, path, body=None):
+            if body and body.get("state") == "execution_resumed":
+                accepted.set()
+                await release.wait()
+            return await actual(method, path, body)
+
+        consumer.hub.request = delayed
+        task = asyncio.create_task(consumer.settle_ownership(key, state))
+        try:
+            await asyncio.wait_for(accepted.wait(), 2)
+            assert key in consumer.reserving and consumer.ownership[key] is report
+            await consumer.settle_ownership(key, state)
+            assert key in consumer.pending_execution_restores
+            release.set()
+            await asyncio.wait_for(task, 2)
+            assert not consumer.pending_execution_restores and key not in consumer.ownership
+            assert not store.get_message(parent["id"], "beta")["execution_pending"]
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+class MailboxReadLedger:
+    def __init__(self, database):
+        self.database = database
+        self.payload_reads = 0
+        self.largest_payload_batch = 0
+
+    def __getattr__(self, name):
+        return getattr(self.database, name)
+
+    def execute(self, *args, **kwargs):
+        cursor = self.database.execute(*args, **kwargs)
+        ledger = self
+
+        class Cursor:
+            def record(self, rows):
+                count = sum(
+                    any(isinstance(value, str) and "queued-payload-proof" in value for value in row)
+                    for row in rows
+                )
+                ledger.payload_reads += count
+                ledger.largest_payload_batch = max(ledger.largest_payload_batch, count)
+                return rows
+
+            def fetchall(self):
+                return self.record(cursor.fetchall())
+
+            def fetchone(self):
+                row = cursor.fetchone()
+                self.record([row] if row else [])
+                return row
+
+            def __iter__(self):
+                for row in cursor:
+                    self.record([row])
+                    yield row
+
+            def __getattr__(self, name):
+                return getattr(cursor, name)
+
+        return Cursor()
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_mailbox_claim_bounds_payload_reads_and_crosses_ineligible_batches(tmp_path, blocked):
+    now = [1000.0]
+    store = CollaborationStore(
+        tmp_path / "hub.db", {"alpha", "beta", "gamma"}, clock=lambda: now[0]
+    )
+    try:
+        p = project(store, max_turns=200, max_workers=1)
+        work = []
+        for i in range(130):
+            now[0] += 1
+            item = ask(
+                store, p["id"], key="queued-" + str(i), text="queued-payload-proof" + "x" * 4000
+            )
+            if blocked and i < 129:
+                item["not_before"] = now[0] + 1000
+                store.save_message(item)
+            work.append(item)
+        ledger = MailboxReadLedger(store.db)
+        store.db = ledger
+        claimed = store.claim_next("beta", "worker")
+        assert claimed["id"] == work[-1 if blocked else 0]["id"]
+        assert ledger.largest_payload_batch <= 32
+        if not blocked:
+            assert ledger.payload_reads <= 2
+        else:
+            assert ledger.payload_reads == len(work)
+            store.reply(claimed["id"], "beta", "Completed eligible request", claim=claimed["claim"])
+            now[0] += 2000
+            assert store.claim_next("beta", "worker")["id"] == work[0]["id"]
+    finally:
+        store.close()
+
+
+def test_mailbox_batches_preserve_priority_creation_and_id_ties(tmp_path):
+    now = 1000.0
+    store = CollaborationStore(tmp_path / "hub.db", {"alpha", "beta", "gamma"}, clock=lambda: now)
+    try:
+        p = project(store, max_turns=200)
+        template = ask(store, p["id"])
+        template["not_before"] = now + 100
+        store.save_message(template)
+        expected = []
+        for kind in ("ask", "result", "cancel"):
+            for i in reversed(range(42)):
+                item = {
+                    **template,
+                    "id": f"{kind}-{i:03}",
+                    "key": f"{kind}-{i:03}",
+                    "kind": kind,
+                    "created": now - 2 if i == 40 else now - 1,
+                    "not_before": now + 100 if i < 40 else now - 1,
+                }
+                store.save_message(item)
+            expected[0:0] = [f"{kind}-040", f"{kind}-041"]
+        observed = []
+        for _ in expected:
+            item = store.claim_next("beta", "worker")
+            observed.append(item["id"])
+            store.update(item["id"], "beta", "worker", "done", "Handled", claim=item["claim"])
+        assert observed == expected
+        assert store.claim_next("beta", "worker") is None
+        now += 200
+        tied = store.claim_next("beta", "worker", controls_only=True)
+        assert tied["id"] == "cancel-000"
     finally:
         store.close()
 

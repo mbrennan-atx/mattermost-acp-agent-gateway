@@ -1515,12 +1515,12 @@ class MattermostGateway:
         effort: str | None,
         scope: str,
     ) -> None:
-        catalog = await self._model_catalog(thread_id, channel_id)
-        mid, _ = resolve_model_id(catalog, query)
-        if not mid:
-            logger.warning("MATTERMOST_MODEL_SET unknown query=%s", query)
-            return
         with native_command_admission(lambda: self.native_command_admitted(thread_id)):
+            catalog = await self._model_catalog(thread_id, channel_id)
+            mid, _ = resolve_model_id(catalog, query)
+            if not mid:
+                logger.warning("MATTERMOST_MODEL_SET unknown query=%s", query)
+                return
             await self.sessions.switch_model(
                 thread_id, mid, effort=effort, scope=scope, channel_id=channel_id
             )
