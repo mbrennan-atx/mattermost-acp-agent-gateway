@@ -173,3 +173,5 @@ tests/test_broker_long_turn_timeouts.py
 tests/test_collaboration_final_review.py
 tests/test_collaboration_independent_cancellation.py
 tests/test_collaboration_settlement_retry_clocks.py
+tests/test_collaboration_inactivity_cancellation.py
+tests/test_subagent_activity_history.py
