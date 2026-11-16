@@ -23,7 +23,7 @@ from test_collaboration_regressions import (
 )
 
 from mattermost_acp.acp import AcpBroker, SessionUpdate, TurnResult
-from mattermost_acp.collaboration.client import HubError
+from mattermost_acp.collaboration.client import HubError, Settings
 from mattermost_acp.collaboration.consumer import CollaborationConsumer
 from mattermost_acp.collaboration.store import CollaborationStore
 from mattermost_acp.mm.client import MattermostClient, PostedEvent
@@ -413,6 +413,129 @@ async def test_posted_result_has_no_native_debt_and_cold_sidecar_can_seal(tmp_pa
     finally:
         if maintenance:
             await maintenance.close()
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+@pytest.mark.parametrize("retained", ["post-started", "post-receipt", "receipt-only"])
+async def test_orphaned_post_attempt_cannot_requeue_or_duplicate_before_lease_expiry(
+    tmp_path, retained
+):
+    store, server, clients = await api_fixture(tmp_path, sidecar_actors={"alpha"})
+    now = [1000.0]
+    store.clock = lambda: now[0]
+    gateway = active_gateway(steering=False, busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.collab_sidecar = True
+    gateway.config.collab_origin_actor = "alpha"
+    gateway.client.user_id = "alpha-user"
+    consumer = CollaborationConsumer(gateway, clients["alpha"].settings)
+    gateway.collaboration = consumer
+    posts = []
+
+    async def publish(channel, message, *, root_id):
+        post = {
+            "id": "accepted-notification",
+            "channel_id": channel,
+            "root_id": root_id,
+            "message": message,
+        }
+        posts.append(post)
+        return post
+
+    async def read(post):
+        return (
+            {"id": "origin", "channel_id": "home", "root_id": ""} if post == "origin" else posts[0]
+        )
+
+    gateway.client.create_post = AsyncMock(side_effect=publish)
+    gateway.client.get_post = AsyncMock(side_effect=read)
+    actual_update = consumer.update
+
+    async def storage_outage(item, state, *args, **kwargs):
+        if state in {"done", "interrupted"} or (
+            state == "heartbeat" and retained == "post-started"
+        ):
+            raise OSError("Synthetic short hub storage outage")
+        return await actual_update(item, state, *args, **kwargs)
+
+    consumer.update = storage_outage
+    try:
+        p = sidecar_project(store)
+        work = ask(store, p["id"])
+        peer = store.claim_next("beta", "peer-worker")
+        store.reply(work["id"], "beta", "Verified result", claim=peer["claim"])
+        delivery = store.claim_next("alpha", consumer.instance)
+        await consumer.handle(delivery)
+        orphan = store.get_message(delivery["id"], "alpha")
+        assert orphan["state"] == "running" and orphan["lease_until"] > now[0]
+        assert len(posts) == 1 and not consumer.workers and not consumer.ownership
+        assert "post_started" in orphan["evidence"] and not orphan["execution_pending"]
+        if retained != "post-started":
+            assert orphan["evidence"]["result_post_id"] == posts[0]["id"]
+        else:
+            assert "result_post_id" not in orphan["evidence"]
+        if retained == "receipt-only":
+            orphan["evidence"].pop("post_started")
+            store.save_message(orphan)
+        consumer.update = actual_update
+        consumer.claim_uncertain = True
+        with pytest.raises(RuntimeError, match="external-post reconciliation"):
+            await consumer.set_admission("controls")
+        assert consumer.claim_uncertain
+        assert store.get_message(delivery["id"], "alpha") == orphan
+        assert store.claim_next("alpha", "replacement-worker") is None
+        assert len(posts) == 1
+        now[0] += 46
+        assert store.claim_next("alpha", "replacement-worker") is None
+        interrupted = store.get_message(delivery["id"], "alpha")
+        assert interrupted["state"] == "interrupted"
+        assert interrupted["evidence"] == orphan["evidence"]
+        verified = await gateway.client.get_post(posts[0]["id"])
+        assert verified == posts[0]
+        assert consumer.claim_uncertain and len(posts) == 1
+        gateway.run_prompt.assert_not_awaited()
+        gateway.sessions.cancel.assert_not_awaited()
+    finally:
+        await consumer.close()
+        await close_api(store, server, clients)
+
+
+async def test_plain_text_unauthorized_hub_response_is_definite_rejection_without_native_fallback(
+    tmp_path,
+):
+    store, server, clients = await api_fixture(tmp_path)
+    gateway = active_gateway(busy=False)
+    gateway.config.db_path = tmp_path / "project.db"
+    gateway.config.allow_user_ids = frozenset({"alpha-user"})
+    gateway.config.all_channels = False
+    gateway.config.exclude_channel_ids = frozenset()
+    gateway.config.text_slash = False
+    invalid = Settings(clients["beta"].settings.url, "invalid-actor-credential" * 3)
+    consumer = CollaborationConsumer(gateway, invalid)
+    gateway.collaboration = consumer
+    try:
+        p = project(store)
+        before = store.show(p["id"], "alpha")["messages"]
+        with pytest.raises(HubError, match="HTTP 401: Actor credential required") as failure:
+            await consumer.hub.request("GET", "/identity")
+        assert failure.value.status == 401
+        await gateway.handle_posted(
+            PostedEvent(
+                post_id="rejected-post",
+                channel_id="floor",
+                user_id="alpha-user",
+                message="@beta ASK: Verify the result",
+                root_id="discussion",
+            )
+        )
+        gateway.run_prompt.assert_not_awaited()
+        gateway.sessions.store.get.assert_not_awaited()
+        assert store.show(p["id"], "alpha")["messages"] == before
+        assert len(gateway.client.posts) == 1
+        notice = gateway.client.posts[0][1]
+        assert "rejected" in notice and "unconfirmed" not in notice
+    finally:
         await consumer.close()
         await close_api(store, server, clients)
 

@@ -216,6 +216,13 @@ class CollaborationConsumer:
                                 "evidence", {}
                             ).get("session_id"):
                                 raise RuntimeError("Mailbox claim requires native reconciliation")
+                            if any(
+                                field in current.get("evidence", {})
+                                for field in ("post_started", "result_post_id")
+                            ):
+                                raise RuntimeError(
+                                    "Mailbox claim requires external-post reconciliation"
+                                )
                             await self.update(current, "queued")
                         self.claim_uncertain = False
         except BaseException:

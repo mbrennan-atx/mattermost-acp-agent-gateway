@@ -63,14 +63,24 @@ class HubClient:
 
     async def request(self, method, path, body=None):
         async with self.session.request(method, self.settings.url + path, json=body) as response:
-            result = await response.json()
             if response.status >= 400:
+                detail = "request failed"
+                try:
+                    raw = await response.text()
+                    try:
+                        result = json.loads(raw)
+                    except ValueError:
+                        detail = raw.strip() or detail
+                    else:
+                        if isinstance(result, dict):
+                            detail = str(result.get("error") or detail)
+                except (aiohttp.ClientError, TimeoutError, ValueError):
+                    pass  # Preserve the status even when its error body is unreadable.
                 raise HubError(
-                    f"Collaboration HTTP {response.status}: "
-                    f"{result.get('error', 'request rejected')}",
+                    f"Collaboration HTTP {response.status}: {detail[:1000]}",
                     status=response.status,
                 )
-            return result
+            return await response.json()
 
     async def close(self):
         await self.session.close()
