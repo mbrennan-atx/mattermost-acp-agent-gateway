@@ -46,7 +46,7 @@ Multiple messages arrive for one busy native thread; the global turn semaphore i
 
 - SC-001: A live two-assistant exchange completes with a durable request, result and native session provenance.
 - SC-002: Restart, busy-delivery, duplicate-result, task-claim and cancellation scenarios pass without silent request loss or unrelated cancellation.
-- SC-003: The deployed pilot preserves all existing persona pins and connectors; final-source CI and local review pass.
+- SC-003: The deployed pilot preserves all existing persona pins and connectors; final-source CI and any review required by the owner's current policy pass.
 
 ## Assumptions and scope
 

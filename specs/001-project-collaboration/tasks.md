@@ -31,9 +31,9 @@
 ## Phase 6: Verification and deployment
 
 - [x] T014 Document capability limits and operation in docs/collaboration.md; include packaged commands and export inputs.
-- [ ] T015 Run full suite, Ruff, build/export checks and full-branch local review; record evidence in specs/001-project-collaboration/validation.md.
-- [ ] T016 Verify final-source CI and immutable release installation; wire private fleet configuration outside public source.
-- [ ] T017 Verify live peer exchange, busy delivery, restart/cancellation and persona preservation; promote private operation notes and session log.
+- [x] T015 Run full suite, Ruff and build/export checks; apply the owner's current review policy and record evidence in specs/001-project-collaboration/validation.md.
+- [x] T016 Verify final-source CI and immutable release installation; wire private fleet configuration outside public source.
+- [x] T017 Verify live peer exchange, busy delivery, restart/cancellation and persona preservation; promote private operation notes and session log.
 
 ## Dependencies and implementation strategy
 

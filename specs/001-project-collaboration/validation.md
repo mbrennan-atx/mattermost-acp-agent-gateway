@@ -1,5 +1,25 @@
 # Acceptance evidence
 
+## Completed acceptance, November 16
+
+Final runtime source `e8fca39fa239257e488b567a9e46920fc69efbf6` passes [final-source CI](https://github.com/mbrennan-atx/mattermost-acp-agent-gateway/actions/runs/43890518442): 1,424 tests pass, with one optional adapter skip. Ruff and immutable export/archive/wheel checks pass. All 46 installed Python files match the reviewed source, and all seven actual persona profiles import successfully.
+
+The private deployment has an active hub and seven project sidecars. Native Claude, Codex, Cursor and Gemini shell requests completed with correlated replies and verified Mattermost read-backs. Task claims, duplicate replies, CLI waits, floor mentions, busy follow-ups, queued-request recovery through hub restart, native shell cancellation and unrelated-project preservation passed. Seven original identities, process/start identities, model pins, connector selectors and Gemini's bridge were independently preserved. Both repository root AGENTS.md files are present.
+
+The permanent project release selection is `e8fca39`. Existing sidecars retain their `d773cbb` launch generation and received the final two cancellation methods through verified main-loop callbacks. The shared private runtime is tested `b213838`. Static startup-environment audit reports the earlier process argv and guard hash; actual live Config and consumer corrections have separate verified receipts. Warmed adapters correctly refuse sealing and refresh without authoritative native goal/queue idle evidence. They remain running. Existing databases and conversations were preserved.
+
+The default absolute two-hour prompt ceiling is removed in all seven original live gateways and their future-start settings, which select tested `d773cbb` with `ACP_PROMPT_HARD_MAX_SEC=0`. Explicit finite caps and inactivity/control RPC deadlines retain their behavior. No original gateway was restarted.
+
+Private acceptance receipts, including native delivery, cancellation, warm-boundary and final-selection proofs, remain outside the public repository. Deployment details and usage are recorded in the private operating note. Earlier checkpoints below are historical and do not describe the completed deployment.
+
+## Final runtime candidate, November 16
+
+Runtime source d773cbb9b13087f84c42200c74d9de5a47be4726 passes 1,416 tests with one optional adapter skip on Python 3.12. Ruff, immutable source/archive/wheel checks, parity for all 46 installed Python files and seven configured profile imports pass. [Hosted CI](https://github.com/mbrennan-atx/mattermost-acp-agent-gateway/actions/runs/43873697014) passes at that exact source.
+
+A fresh 45-second worker lease at elapsed time 51.78335005859267 could reject itself because deadline subtraction rounded to 45.00000000000001. Lease and retry validation now compare their absolute bounds, preserving expiry and rejecting an extended lease. The affected 44-case run passes. Workspace-guard process cleanup also accepts an exited procfs process during observation.
+
+Matthew's November 16 policy exempts GitHub-only code from automatic BugShark. Supported findings from completed earlier reviews remain fixed and tested; further broad reviews are unnecessary. Live deployment acceptance remains separate from these source checks.
+
 ## Current completion candidate
 
 The complete Python 3.12 suite passes 1,321 tests with one optional adapter skip in 260.43 seconds. Ruff and diff checks pass. The latest changes preserve retryable pre-dispatch cancellation, reject queued effort after session replacement, separate retained delivery history from routine status traffic, reject expired open-task claims, refresh list expiry and align harness-switch documentation. Workspace guards retain launch/process-group ownership and can pin Python source in captured configuration before checking and compiling the same bounded buffer on every invocation.
