@@ -95,3 +95,9 @@ The native/model/session/creation regression batch passes 168 tests, the broker/
 Explicit restart uses the shared maintenance fence and verifies all sessions before scheduling shutdown. Ordinary preparation and prompt dispatch carry admission through native writes. Process launch rechecks admission after persisting its startup marker. Refused initialization retains its process and reader; accepted uncertain initialization refuses replay. An undispatched prompt restores a predecessor epoch only when the session association and generation remain unchanged. Execution settlement requires explicit `pending: false` evidence.
 
 The final broker and native-creation cases pass 119 checks. Two affected collaboration modules pass 104 tests after supplying the existing synthetic stores and dispatch callbacks. Production source and those fixtures are frozen for the complete parent run, immutable build and full-branch review. Live acceptance remains pending.
+
+## Restart warming and refused status
+
+The complete parent suite at 422e9c0 passes 1,006 tests with one optional adapter skipped. Full-branch review found two further paths: post-restart warming lacked recovery admission, and refused dispatch left its initial status running. Warming now carries live thread admission through preparation and defers on refusal. Refused or busy attempts publish queued/cancelled status on their existing post while preserving predecessor ownership and native work.
+
+The focused batch passes 134 checks; related recovery, continuation and dispatch regressions pass 177. Nine integration cases cover blocked and admitted warming, refusal after a workspace wait, existing status edits and preserved native predecessor tools. Ruff, formatting and diff checks pass. The final parent suite, immutable build and full-branch review run against the resulting source before hosted CI and live acceptance.

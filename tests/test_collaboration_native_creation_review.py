@@ -17,6 +17,7 @@ from test_collaboration_regressions import (
     creation_body,
     maintenance_gateway,
 )
+from test_gateway_turn import _Client
 
 from mattermost_acp.acp.broker import (
     AcpBroker,
@@ -27,8 +28,10 @@ from mattermost_acp.acp.broker import (
 from mattermost_acp.collaboration.client import HubClient, HubError, Settings
 from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
+from mattermost_acp.commands.pending_restart import now_pending, pending_path, write_pending
 from mattermost_acp.mm.gateway import MattermostGateway
-from mattermost_acp.session_service import SessionService
+from mattermost_acp.mm.reporting import TurnReporter
+from mattermost_acp.session_service import SessionService, ThreadBusy
 from mattermost_acp.store import ThreadStore
 
 
@@ -952,3 +955,137 @@ def test_execution_settlement_requires_explicit_false_pending_proof(tmp_path, pe
         assert settled["execution_pending"] is False
     finally:
         store.close()
+
+
+def restart_marker(native):
+    gateway = native.gateway
+    gateway.config.db_path = native.sessions.default_cwd / "native.db"
+    gateway.config.grok_model = "synthetic-pinned-model"
+    path = pending_path(gateway.config.db_path)
+    write_pending(
+        path,
+        now_pending(
+            thread_id="discussion",
+            session_id="prior-native",
+            user_id="human-user",
+            parent_channel_id="floor",
+        ),
+    )
+    return path
+
+
+@pytest.mark.parametrize("blocked", ["recovery", "inherited", "ownership", "draining"])
+async def test_restart_warming_defers_without_native_changes_until_thread_is_admitted(
+    native, blocked
+):
+    gateway, svc = native.gateway, native.sessions
+    path = restart_marker(native)
+    if blocked == "recovery":
+        gateway.collaboration_recovery_pending = True
+    elif blocked == "draining":
+        gateway.draining = True
+    else:
+        gateway.collaboration = ownership(
+            owned=blocked == "ownership", inherited=blocked == "inherited"
+        )
+    original = svc.ensure_session
+    svc.ensure_session = AsyncMock(wraps=original)
+    epoch = svc.native_epoch("discussion")
+    record = await svc.store.get("discussion")
+    await gateway._handle_pending_restart_bump()
+    svc.ensure_session.assert_not_awaited()
+    assert native.writes == [] and svc.native_epoch("discussion") == epoch
+    assert await svc.store.get("discussion") == record
+    assert "session preparation deferred" in gateway.client.posts[-1][1]
+    assert not path.exists()
+
+
+async def test_restart_warming_carries_admission_through_workspace_wait(native):
+    gateway, svc = native.gateway, native.sessions
+    restart_marker(native)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def guard(*_args):
+        entered.set()
+        await release.wait()
+
+    svc.workspace_guard = guard
+    epoch = svc.native_epoch("discussion")
+    task = asyncio.create_task(gateway._handle_pending_restart_bump())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        gateway.collaboration_recovery_pending = True
+        release.set()
+        await asyncio.wait_for(task, 2)
+        assert native.writes == [] and svc.native_epoch("discussion") == epoch
+        assert "session preparation deferred" in gateway.client.posts[-1][1]
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_admitted_restart_warming_preserves_existing_session_and_no_prompt(native):
+    gateway, svc = native.gateway, native.sessions
+    restart_marker(native)
+    gateway.collaboration = ownership()
+    record = await svc.store.get("discussion")
+    await gateway._handle_pending_restart_bump()
+    assert [item["method"] for item in native.writes] == ["session/resume"]
+    assert (await svc.store.get("discussion")).session_id == record.session_id
+    assert f"session `{record.session_id}` resumed" in gateway.client.posts[-1][1]
+
+
+@pytest.mark.parametrize("refusal", ["cancelled", "admission", "busy"])
+async def test_refused_dispatch_finalizes_its_status_without_cancelling_predecessor(
+    native, refusal
+):
+    gateway, svc = native.gateway, native.sessions
+    client = _Client()
+    gateway.client = client
+    record = await svc.store.get("discussion")
+    previous = {
+        "execution_id": "prior-execution",
+        "collaboration_project": "prior-project",
+        "thread_id": "discussion",
+        "channel_id": "floor",
+        "active": False,
+        "foreground_complete": True,
+        "native_dispatched": True,
+        "reporter": TurnReporter(),
+        "task": None,
+    }
+    gateway._reports[record.session_id] = previous
+
+    async def before_native(_session):
+        if refusal == "admission":
+            previous["reporter"].active_tools.add("retained-background-tool")
+            raise NativeDispatchChanged("Synthetic native admission change")
+        return False
+
+    if refusal == "busy":
+        svc.run_turn = AsyncMock(side_effect=ThreadBusy("Synthetic preparation race"))
+    try:
+        result = await gateway.run_prompt(
+            thread_id="discussion",
+            channel_id="floor",
+            prompt="Check the result",
+            author_id="human-user",
+            author_name="human",
+            before_native=before_native,
+            collaboration_project="new-project",
+        )
+        assert result["queued"] is True
+        assert "Working" in client.created[0][1]
+        assert client.updated[-1][0] == "post1"
+        final_status = client.updated[-1][1]
+        assert ("Cancelled" if refusal == "cancelled" else "Queued") in final_status
+        assert "Working" not in final_status
+        assert gateway._reports[record.session_id] is previous
+        assert not previous.get("cancel_requested")
+        assert not any(
+            item["method"] in {"session/cancel", "session/prompt"} for item in native.writes
+        )
+        if refusal == "admission":
+            assert previous["reporter"].active_tools == {"retained-background-tool"}
+    finally:
+        await close_reports(gateway)

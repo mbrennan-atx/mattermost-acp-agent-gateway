@@ -1211,6 +1211,9 @@ class MattermostGateway:
                         pass
         except NativeDispatchChanged:
             await restore_undispatched()
+            await _publish_status(
+                status.render(phase="queued", extra="Native work did not start"), force=True
+            )
             if ordinary_collaboration:
                 await self._post(
                     channel_id,
@@ -1225,6 +1228,9 @@ class MattermostGateway:
             await self._post(channel_id, f"❌ ACP error: {exc}", root_id=thread_id)
             return
         except ThreadBusy as exc:
+            await _publish_status(
+                status.render(phase="queued", extra="Native work did not start"), force=True
+            )
             if before_native is not None:
                 await restore_undispatched()
                 return {"queued": True, "native_dispatched": False}
@@ -1247,6 +1253,9 @@ class MattermostGateway:
 
         if before_native is not None and not result.native_dispatched:
             await restore_undispatched()
+            await _publish_status(
+                status.render(phase="cancelled", extra="Before native dispatch"), force=True
+            )
             return {"queued": True, "native_dispatched": False}
 
         # Progress already has its own live post. Keep it out of the answer.
@@ -1768,8 +1777,11 @@ class MattermostGateway:
         sid = pending.session_id
         resume_note = "no prior session map"
         try:
-            sid = await self.sessions.ensure_session(pending.thread_id)
+            with native_command_admission(lambda: self.native_command_admitted(pending.thread_id)):
+                sid = await self.sessions.ensure_session(pending.thread_id)
             resume_note = f"session `{sid}` resumed"
+        except NativeDispatchChanged:
+            resume_note = "session preparation deferred until this thread is admitted"
         except Exception as exc:
             logger.exception("Post-restart ensure_session failed")
             resume_note = f"session warm failed: {exc}"
