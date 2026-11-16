@@ -184,6 +184,7 @@ async def test_message_wait_applies_lease_expiry_without_online_consumer(tmp_pat
     store, server, clients = await api_fixture(tmp_path)
     now = [1000.0]
     store.clock = lambda: now[0]
+    store.elapsed = lambda: now[0]
     try:
         p = project(store)
         request = ask(store, p["id"])

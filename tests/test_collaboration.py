@@ -389,7 +389,8 @@ def test_open_task_is_claimed_once_and_project_keys_bind_payload(tmp_path):
 def test_expired_project_queues_cancel_control_and_stale_lease_is_fenced(tmp_path):
     now = [1000.0]
     store = CollaborationStore(
-        tmp_path / "hub.db", {"alpha", "beta", "gamma"}, clock=lambda: now[0]
+        tmp_path / "hub.db", {"alpha", "beta", "gamma"},
+        clock=lambda: now[0], elapsed=lambda: now[0],
     )
     p = project(store, max_seconds=100)
     m = ask(store, p["id"])

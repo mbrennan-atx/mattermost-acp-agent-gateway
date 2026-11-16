@@ -128,16 +128,17 @@ async def test_transient_heartbeat_failure_retries_before_lease_expiry(
     consumer = CollaborationConsumer(gateway, clients["beta"].settings)
     now = [store.clock()]
     store.clock = lambda: now[0]
+    store.elapsed = lambda: now[0]
     real_sleep = asyncio.sleep
     renewed = asyncio.Event()
     real_update = consumer.update
     attempts = []
 
     async def sleep(delay):
-        if delay == 10:
+        if delay in {10, 2}:
             if renewed.is_set():
                 await asyncio.Event().wait()
-            now[0] += 10
+            now[0] += delay
             await real_sleep(0)
         else:
             await real_sleep(delay)

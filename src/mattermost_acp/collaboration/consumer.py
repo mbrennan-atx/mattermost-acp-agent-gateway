@@ -25,6 +25,9 @@ from mattermost_acp.mm.client import MattermostError
 
 logger = logging.getLogger(__name__)
 DEADLINE_RECHECK_SECONDS = 1.0
+HEARTBEAT_INTERVAL_SECONDS = 10.0
+HEARTBEAT_RETRY_SECONDS = 2.0
+HEARTBEAT_REQUEST_TIMEOUT_SECONDS = 5.0
 
 
 def elapsed_clock():
@@ -285,11 +288,16 @@ class CollaborationConsumer:
         }
         if expected_execution_id is not None:
             body["expected_execution_id"] = expected_execution_id
-        receipt = await self.hub.request(
-            "POST",
-            f"/messages/{item['id']}/update",
-            body,
-        )
+        # The general hub timeout is too long for worker leases. Bound every
+        # heartbeat request, including evidence updates, to leave retry margin.
+        async with asyncio.timeout(
+            HEARTBEAT_REQUEST_TIMEOUT_SECONDS if state == "heartbeat" else None
+        ):
+            receipt = await self.hub.request(
+                "POST",
+                f"/messages/{item['id']}/update",
+                body,
+            )
         self.observe_deadline(receipt)
         return receipt
 
@@ -945,16 +953,22 @@ class CollaborationConsumer:
         self.gateway.prune_reports()
 
     async def heartbeat(self, item):
+        delay = HEARTBEAT_INTERVAL_SECONDS
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(delay)
             try:
-                await self.update(item, "heartbeat")
+                receipt = await self.update(item, "heartbeat")
+                if receipt["state"] not in {"running", "cancelling", "unconfirmed"}:
+                    return
+                delay = HEARTBEAT_INTERVAL_SECONDS
             except HubError as exc:
                 if exc.status in {400, 401, 403, 404, 409, 410, 422}:
                     return
                 logger.warning("Collaboration lease renewal unavailable")
+                delay = HEARTBEAT_RETRY_SECONDS
             except Exception:
                 logger.warning("Collaboration lease renewal unavailable")
+                delay = HEARTBEAT_RETRY_SECONDS
 
     async def injected_wait(self, item):
         while True:

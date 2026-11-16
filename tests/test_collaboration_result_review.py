@@ -1053,6 +1053,7 @@ async def test_orphaned_post_attempt_cannot_requeue_or_duplicate_before_lease_ex
     store, server, clients = await api_fixture(tmp_path, sidecar_actors={"alpha"})
     now = [1000.0]
     store.clock = lambda: now[0]
+    store.elapsed = lambda: now[0]
     gateway = active_gateway(steering=False, busy=False)
     gateway.config.db_path = tmp_path / "project.db"
     gateway.config.collab_sidecar = True
@@ -1598,7 +1599,7 @@ def test_message_expiry_index_upgrades_history_and_preserves_stale_lease_expiry(
     now = [1000.0]
     path = tmp_path / "hub.db"
     actors = {"alpha", "beta", "gamma"}
-    store = CollaborationStore(path, actors, clock=lambda: now[0])
+    store = CollaborationStore(path, actors, clock=lambda: now[0], elapsed=lambda: now[0])
     try:
         p = project(store)
         completed = ask(store, p["id"])
@@ -1614,7 +1615,7 @@ def test_message_expiry_index_upgrades_history_and_preserves_stale_lease_expiry(
     finally:
         store.close()
 
-    reopened = CollaborationStore(path, actors, clock=lambda: now[0])
+    reopened = CollaborationStore(path, actors, clock=lambda: now[0], elapsed=lambda: now[0])
     try:
         plan = reopened.db.execute(
             "EXPLAIN QUERY PLAN SELECT data FROM messages WHERE state='running'"

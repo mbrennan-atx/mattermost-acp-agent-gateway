@@ -14,6 +14,7 @@ from pathlib import Path
 ACTIVE = {"running", "unconfirmed", "cancelling"}
 TERMINAL = {"done", "failed", "blocked", "cancelled"}
 WORK = {"ask", "work"}
+WORKER_LEASE_SECONDS = 45
 LEGACY_PENDING_EXECUTION = (
     "COALESCE(json_extract(data,'$.execution_pending'),"
     "(json_extract(data,'$.evidence.session_id') IS NOT NULL "
@@ -975,7 +976,7 @@ class CollaborationStore:
                 self.cancel(project["id"], project["owner"])
             for row in self.db.execute("SELECT data FROM messages WHERE state='running'"):
                 item = json.loads(row[0])
-                if item.get("lease_until", 0) <= self.clock():
+                if not self.worker_lease_live(item):
                     item["state"] = "queued" if item["kind"] == "cancel" else "interrupted"
                     item["recovery"] = "Worker lease expired; reconcile before retry"
                     self.save_message(item)
@@ -1018,6 +1019,32 @@ class CollaborationStore:
                     yield json.loads(payload[0])
             last = rows[-1]
             after = last["priority"], last["created"], last["id"]
+
+    def renew_worker_lease(self, item):
+        now = self.elapsed()
+        # Keep the wall timestamp for presentation, never for ownership checks.
+        item["lease_until"] = self.clock() + WORKER_LEASE_SECONDS
+        item["worker_lease"] = {
+            "epoch": self.elapsed_epoch,
+            "started": now,
+            "deadline": now + WORKER_LEASE_SECONDS,
+        }
+
+    def worker_lease_live(self, item):
+        lease = item.get("worker_lease")
+        now = self.elapsed()
+        # Missing, malformed or foreign-boot/process receipts cannot establish
+        # ownership. Fence them for reconciliation, preserving execution debt.
+        return (
+            isinstance(lease, dict)
+            and lease.get("epoch") == self.elapsed_epoch
+            and all(
+                type(lease.get(field)) in {int, float} and math.isfinite(lease[field])
+                for field in ("started", "deadline")
+            )
+            and lease["started"] <= now < lease["deadline"]
+            and 0 < lease["deadline"] - lease["started"] <= WORKER_LEASE_SECONDS
+        )
 
     def defer_retry(self, item):
         now = self.elapsed()
@@ -1122,10 +1149,10 @@ class CollaborationStore:
                 item.update(
                     state="running",
                     instance=instance,
-                    lease_until=self.clock() + 45,
                     attempt=item["attempt"] + 1,
                     claim=identifier(),
                 )
+                self.renew_worker_lease(item)
                 item["binding"] = project["bindings"][actor]
                 self.save_message(item)
                 continuation = {}
@@ -1354,9 +1381,13 @@ class CollaborationStore:
                     self.clock()
                 )
                 item["execution_pending"] = state == "dispatch"
-                item["lease_until"] = self.clock() + 45
+                self.renew_worker_lease(item)
             elif state == "heartbeat":
-                item["lease_until"] = self.clock() + 45
+                self.expire()
+                item = self.message_record(mid, actor)
+                if item["state"] not in ACTIVE:
+                    return item
+                self.renew_worker_lease(item)
                 if evidence:
                     item["evidence"].update(evidence)
             elif state == "queued" and item["state"] == "cancelling":
