@@ -10,6 +10,8 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +70,27 @@ class AcpError(RuntimeError):
 
 class NativeDispatchChanged(AcpError):
     """A guarded control was rejected before any bytes reached the adapter."""
+
+
+_command_admission = ContextVar("native_command_admission", default=None)
+
+
+@contextmanager
+def native_command_admission(guard):
+    previous = _command_admission.get()
+    combined = (lambda: previous() and guard()) if previous and guard else guard
+    token = _command_admission.set(combined)
+    try:
+        check_native_command_admission()
+        yield
+    finally:
+        _command_admission.reset(token)
+
+
+def check_native_command_admission():
+    guard = _command_admission.get()
+    if guard is not None and not guard():
+        raise NativeDispatchChanged("Native command admission changed before dispatch")
 
 
 def _format_rpc_error(err: Any) -> str:
@@ -305,6 +328,7 @@ class AcpBroker:
 
     async def start(self) -> AcpCapabilities:
         async with self._lock:
+            check_native_command_admission()
             if self.is_running and self._started:
                 return self._capabilities
 
@@ -331,7 +355,10 @@ class AcpBroker:
                 )
 
             assert self._proc.stdout is not None
-            self._reader_task = asyncio.create_task(self._read_loop(), name="acp-broker-reader")
+            # Persistent I/O tasks must not inherit one command's transient
+            # admission guard and apply it to unrelated later sessions.
+            with native_command_admission(None):
+                self._reader_task = asyncio.create_task(self._read_loop(), name="acp-broker-reader")
             # Drain stderr in background so the pipe cannot fill
             if self._proc.stderr is not None:
                 asyncio.create_task(self._drain_stderr(self._proc.stderr), name="acp-stderr")
@@ -470,7 +497,9 @@ class AcpBroker:
             raise AcpError(f"Hint was not confirmed by the adapter (outcome: {outcome!r}).")
         return outcome
 
-    async def session_new(self, cwd: str | Path, *, meta: dict[str, Any] | None = None) -> str:
+    async def session_new(
+        self, cwd: str | Path, *, meta: dict[str, Any] | None = None, on_dispatched=None
+    ) -> str:
         process = self._proc
         params: dict[str, Any] = {
             "cwd": str(cwd),
@@ -478,7 +507,11 @@ class AcpBroker:
         }
         if meta:
             params["_meta"] = meta
-        result = await self.request("session/new", params)
+        result = await self.request(
+            "session/new",
+            params,
+            **({"on_write": on_dispatched} if on_dispatched is not None else {}),
+        )
         if not isinstance(result, dict) or "sessionId" not in result:
             raise AcpError("session/new missing sessionId", data=result)
         self._remember_config(str(result["sessionId"]), result)
@@ -628,13 +661,14 @@ class AcpBroker:
         except AcpError as exc:
             logger.warning("session/close failed for %s: %s", session_id, exc)
 
-    async def cancel(self, session_id: str, *, guard=None) -> None:
-        if guard is None:
+    async def cancel(self, session_id: str, *, guard=None, on_dispatched=None) -> None:
+        if guard is None and on_dispatched is None:
             await self.notify("session/cancel", {"sessionId": session_id})
         else:
             await self._write(
                 {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}},
                 guard=guard,
+                on_write=on_dispatched,
             )
 
     async def prompt_turn(
@@ -810,6 +844,7 @@ class AcpBroker:
             raise AcpError("agent process is not running")
         line = json.dumps(msg, separators=(",", ":")) + "\n"
         async with self._write_lock:
+            check_native_command_admission()
             if guard is not None and not guard():
                 raise NativeDispatchChanged("Native execution changed before control dispatch")
             self._proc.stdin.write(line.encode("utf-8"))

@@ -51,10 +51,11 @@ async def test_compaction_fences_previous_project_cancellation(service):
     entered, release = asyncio.Event(), asyncio.Event()
     original_prompt = service.broker.prompt_turn
 
-    async def compact(session, prompt):
+    async def compact(session, prompt, **kwargs):
+        result = await original_prompt(session, prompt, **kwargs)
         entered.set()
         await release.wait()
-        return await original_prompt(session, prompt)
+        return result
 
     service.broker.prompt_turn = compact
     task = asyncio.create_task(service._compact_history("compact-thread", sid))
@@ -161,8 +162,9 @@ async def test_replacement_can_cancel_running_turn_without_waiting_for_its_lock(
             session_id=session, stop_reason="cancelled", answer_text="", thought_text=""
         )
 
-    async def cancel(session):
+    async def cancel(session, **kwargs):
         assert session == sid
+        kwargs["on_dispatched"]()
         cancelled.set()
 
     service.broker.prompt_turn = prompt
@@ -174,7 +176,8 @@ async def test_replacement_can_cancel_running_turn_without_waiting_for_its_lock(
         replacement = await asyncio.wait_for(service.new_session("active"), 2)
         assert replacement != sid and service.native_epoch("active") > old_epoch
         assert (await asyncio.wait_for(turn, 2)).stop_reason == "cancelled"
-        service.broker.cancel.assert_awaited_once_with(sid)
+        assert service.broker.cancel.await_count == 1
+        assert service.broker.cancel.call_args.args == (sid,)
     finally:
         cancelled.set()
         await asyncio.gather(turn, return_exceptions=True)

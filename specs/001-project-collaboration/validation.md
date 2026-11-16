@@ -83,3 +83,9 @@ The preceding immutable package's private compatibility suite passed 974 tests p
 ## Checked commands and maintenance transition regressions
 
 The preceding complete suite passed 895 tests with one optional adapter skipped. Parent independently passed 26 new command-selection and final-dispatch checks. They exercise literal shell arguments through one selected executable, automatic no-POST failure without poisoned creation state, same-root recipient membership, delayed-restart resume refusal and deferred cleanup preserving newer maintenance transitions. The four dispatch source files and configured-command files pass Ruff. Both new suites enter the source archive and export allowlist. The updated complete suite is running; final review, immutable packaging, hosted CI and live acceptance remain required.
+
+## Native command and creation review fixes
+
+Five further full-branch review findings have fixes. Native-mutating commands carry an admission guard through service and broker lock waits to the actual write. Creation and cancellation epochs advance only after dispatch. Model switches and effort changes serialize with turns and conditionally persist against the selected session. Confirmed discussion-post authorization rejection permits a same-key retry without unresolved floor debt; successful automatic roots require creator/correlation proof. Collaboration URL validation rejects malformed and out-of-range TCP ports.
+
+The native/model/session/creation regression batch passes 168 tests, the broker/effort/store/model/gateway/config batch passes 89 tests, and the persistent-reader guard-isolation case passes separately. Ruff, formatting for all twelve changed Python files and diff checks pass. The parent complete-suite run is active. The new regression suite is included in both export and source-archive manifests. Fresh full-branch review, immutable packaging, exact-source CI and live acceptance remain required.

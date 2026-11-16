@@ -858,9 +858,24 @@ def creation_body():
 async def creation_api(path, post_hook, verify_hook=None):
     store = CollaborationStore(path, {"alpha", "beta"})
     actors = {name: {"token": name * 32, "user_id": name + "-user"} for name in store.actors}
-    server = TestServer(
-        build_app(store, actors, create_post=post_hook, verify_creation=verify_hook)
-    )
+    roots = {}
+
+    async def post(actor, body):
+        root = await post_hook(actor, body)
+        roots[root["id"]] = {
+            **root,
+            "user_id": actors[actor]["user_id"],
+            "props": dict(body["props"]),
+        }
+        return root
+
+    async def verify(actor, thread):
+        proof = roots.get(thread, {})
+        if verify_hook is not None:
+            return {**proof, **await verify_hook(actor, thread)}
+        return dict(proof)
+
+    server = TestServer(build_app(store, actors, create_post=post, verify_creation=verify))
     await server.start_server()
     client = HubClient(Settings(str(server.make_url("/")).rstrip("/"), actors["alpha"]["token"]))
     return store, server, client

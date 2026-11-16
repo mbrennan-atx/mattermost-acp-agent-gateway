@@ -176,6 +176,12 @@ class CollaborationStore:
                 intent["body"].setdefault("owner_in_discussion", False)
                 if intent["body"] != canonical:
                     raise ValueError("Conflicting project creation key")
+                if intent["status"] == "rejected" and not intent.get("thread_id"):
+                    intent["thread_id"] = body.get("thread_id")
+                    intent["creation_id"] = identifier() if not body.get("thread_id") else None
+                    intent["status"] = "reserved"
+                    self.save_creation(actor, key, intent)
+                    return intent, True
                 return intent, False
             # Validate project input and binding rules without retaining a
             # placeholder project or triggering any native work.
@@ -212,6 +218,7 @@ class CollaborationStore:
             (actor, key, intent)
             for actor, key, raw in self.db.execute("SELECT actor,key,data FROM creations")
             if (intent := json.loads(raw)).get("creation_id")
+            and intent["status"] != "rejected"
             and not intent.get("thread_id")
             and intent["body"]["channel_id"] == channel
         ]
@@ -241,6 +248,16 @@ class CollaborationStore:
                 intent["status"] = "posted"
             self.save_creation(actor, key, intent)
             return intent
+
+    def reject_creation(self, actor, key, creation_id):
+        """A confirmed authorization rejection permits retry, without erasing a root."""
+        with self.transaction():
+            intent = self.get_creation(actor, key)
+            if intent.get("creation_id") != creation_id:
+                raise PermissionError("Discussion creation correlation changed")
+            if not intent.get("thread_id") and intent["status"] == "reserved":
+                intent["status"] = "rejected"
+                self.save_creation(actor, key, intent)
 
     def save_creation(self, actor, key, intent):
         key = text(key, "project idempotency key", 200)

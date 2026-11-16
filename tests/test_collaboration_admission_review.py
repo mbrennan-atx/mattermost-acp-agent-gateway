@@ -329,7 +329,7 @@ async def test_creation_bounds_rendered_post_and_preserves_full_objective(tmp_pa
         body = await request.json()
         if len(body["message"]) > 16383:
             return web.json_response({"error": "Message exceeds Mattermost limit"}, status=400)
-        post = {**body, "id": "created-root", "root_id": ""}
+        post = {**body, "id": "created-root", "root_id": "", "user_id": "alpha-user"}
         posts.append(post)
         return web.json_response(post)
 

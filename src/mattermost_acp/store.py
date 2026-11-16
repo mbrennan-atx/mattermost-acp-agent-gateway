@@ -176,6 +176,60 @@ class ThreadStore:
         await self._conn().commit()
         return cursor.rowcount > 0
 
+    async def save_switch_if_session(
+        self,
+        thread_id,
+        session_id,
+        model,
+        effort,
+        *,
+        channel_id=None,
+        scope=None,
+        requested_model=None,
+        requested_effort=None,
+    ) -> bool:
+        """Persist settings only on the selected session, without restoring its mapping."""
+        cursor = await self._conn().execute(
+            "UPDATE threads SET model=?, effort=COALESCE(?,effort), "
+            "channel_id=COALESCE(?,channel_id), "
+            "model_override=CASE WHEN ?='thread' THEN ? ELSE model_override END, "
+            "effort_override=CASE WHEN ?='thread' THEN ? ELSE effort_override END, "
+            "updated_at=datetime('now') WHERE thread_id=? AND session_id=? AND harness=?",
+            (
+                model,
+                effort,
+                channel_id,
+                scope,
+                requested_model,
+                scope,
+                requested_effort,
+                thread_id,
+                session_id,
+                self.harness,
+            ),
+        )
+        changed = cursor.rowcount > 0
+        if changed and scope in {"channel", "harness"}:
+            cursor = await self._conn().execute(
+                "INSERT INTO model_settings(scope,model,effort,harness) "
+                "SELECT ?,?,?,? WHERE EXISTS(SELECT 1 FROM threads "
+                "WHERE thread_id=? AND session_id=? AND harness=?) "
+                "ON CONFLICT(scope) DO UPDATE SET model=excluded.model, effort=excluded.effort, "
+                "harness=excluded.harness, updated_at=datetime('now')",
+                (
+                    "harness" if scope == "harness" else f"channel:{channel_id}",
+                    requested_model,
+                    requested_effort,
+                    self.harness,
+                    thread_id,
+                    session_id,
+                    self.harness,
+                ),
+            )
+            changed = cursor.rowcount > 0
+        await self._conn().commit()
+        return changed
+
     async def save(
         self,
         thread_id: str,

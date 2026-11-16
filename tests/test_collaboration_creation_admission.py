@@ -14,19 +14,32 @@ from mattermost_acp.collaboration.store import CollaborationStore
 
 @pytest.fixture
 async def admission_api(tmp_path):
-    state = {"now": 1000.0, "posts": {}, "readback": None}
+    state = {"now": 1000.0, "posts": {}, "roots": {}, "readback": None}
     store = CollaborationStore(
         tmp_path / "hub.db", {"alpha", "beta", "gamma"}, clock=lambda: state["now"]
     )
     actors = {name: {"token": name * 32, "user_id": name + "-user"} for name in store.actors}
 
-    async def post(_actor, body):
-        return {"id": "discussion", "channel_id": body["channel_id"]}
+    async def post(actor, body):
+        root = {
+            "id": "discussion",
+            "channel_id": body["channel_id"],
+            "user_id": actors[actor]["user_id"],
+            "props": dict(body["props"]),
+        }
+        state["roots"]["discussion"] = root
+        return root
 
     async def readback(actor, thread):
         if state["readback"] is not None:
-            return await state["readback"](actor, thread)
-        return {"id": thread, "channel_id": "floor", "root_id": "", "create_at": 1}
+            return {**state["roots"].get(thread, {}), **await state["readback"](actor, thread)}
+        return {
+            "id": thread,
+            "channel_id": "floor",
+            "root_id": "",
+            "create_at": 1,
+            **state["roots"].get(thread, {}),
+        }
 
     async def verify_post(post_id, _actor):
         return dict(state["posts"][post_id])

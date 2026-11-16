@@ -237,6 +237,8 @@ def build_app(
                                     "props": props,
                                 },
                             ) as response:
+                                if response.status in {401, 403}:
+                                    store.reject_creation(actor, body["key"], intent["creation_id"])
                                 if response.status >= 400:
                                     raise ValueError("Discussion creation was not confirmed")
                                 post = await response.json()
@@ -256,6 +258,8 @@ def build_app(
                 or verified.get("root_id")
             ):
                 raise ValueError("Discussion read-back did not match its root binding")
+            if intent.get("creation_id"):
+                verify_correlated_root(verified, actor, intent, intent["thread_id"])
             return web.json_response(store.finish_creation(actor, intent))
 
     async def show(request):

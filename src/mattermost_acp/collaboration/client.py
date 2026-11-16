@@ -28,8 +28,13 @@ class Settings:
         if not url:
             return None
         parsed = urlparse(url)
+        try:
+            port = parsed.port
+        except ValueError:
+            raise ValueError("Collaboration URL must use a valid TCP port") from None
         if (
             parsed.scheme != "http"
+            or (port is not None and not 0 < port <= 65535)
             or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
             or parsed.username
             or parsed.password

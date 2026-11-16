@@ -15,7 +15,7 @@ import aiohttp
 
 from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpError, SessionUpdate
-from mattermost_acp.acp.broker import NativeDispatchChanged
+from mattermost_acp.acp.broker import NativeDispatchChanged, native_command_admission
 from mattermost_acp.attachments import (
     RemoteFile,
     format_attachment_note,
@@ -554,7 +554,19 @@ class MattermostGateway:
             return
         self._active_controls += 1
         try:
-            await self._dispatch_command(**kwargs)
+            if kwargs["cmd"] in {"new", "clear", "restart", "model", "models", "effort", "harness"}:
+                with native_command_admission(
+                    lambda: self.native_command_admitted(kwargs["thread_id"])
+                ):
+                    await self._dispatch_command(**kwargs)
+            else:
+                await self._dispatch_command(**kwargs)
+        except NativeDispatchChanged:
+            await self._post(
+                kwargs["channel_id"],
+                "Project work is pending. Retry the command after it settles.",
+                root_id=kwargs["thread_id"],
+            )
         finally:
             self._active_controls -= 1
 
@@ -696,6 +708,19 @@ class MattermostGateway:
             return False
         return not self.collaboration.owns_thread(thread_id) or bool(
             ownership_guard and ownership_guard()
+        )
+
+    def native_command_admitted(self, thread_id):
+        return (
+            not self.draining
+            and not self.sealed
+            and self.ordinary_admitted(thread_id)
+            and not any(
+                report.get("collaboration_project")
+                and report["thread_id"] == thread_id
+                and (report.get("active") or report["reporter"].has_pending_work())
+                for report in self.live_reports()
+            )
         )
 
     async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
@@ -1465,9 +1490,10 @@ class MattermostGateway:
         if not mid:
             logger.warning("MATTERMOST_MODEL_SET unknown query=%s", query)
             return
-        await self.sessions.switch_model(
-            thread_id, mid, effort=effort, scope=scope, channel_id=channel_id
-        )
+        with native_command_admission(lambda: self.native_command_admitted(thread_id)):
+            await self.sessions.switch_model(
+                thread_id, mid, effort=effort, scope=scope, channel_id=channel_id
+            )
 
     async def _model_catalog(self, thread_id: str, channel_id: str) -> ModelCatalog:
         if self.config.harness == "grok":
