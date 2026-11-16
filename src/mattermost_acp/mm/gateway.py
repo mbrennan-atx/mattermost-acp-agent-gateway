@@ -15,7 +15,11 @@ import aiohttp
 
 from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpError, SessionUpdate
-from mattermost_acp.acp.broker import NativeDispatchChanged, native_command_admission
+from mattermost_acp.acp.broker import (
+    NativeDispatchChanged,
+    native_command_admission,
+    native_inactivity_cancellation,
+)
 from mattermost_acp.attachments import (
     RemoteFile,
     format_attachment_note,
@@ -1136,10 +1140,41 @@ class MattermostGateway:
         try:
             await _publish_status(status.render(), force=True)
             try:
+                idle_owner = None
 
                 def mark_native_dispatched(actual_session):
+                    nonlocal idle_owner
                     report["native_dispatched"] = True
                     report["preparing"] = False
+                    if ordinary_collaboration:
+                        broker = self.sessions.broker
+                        idle_owner = (
+                            actual_session,
+                            getattr(self.sessions, "native_epoch", lambda _thread: None)(thread_id),
+                            broker,
+                            getattr(broker, "_proc", None),
+                        )
+
+                async def cancel_ordinary_idle(actual_session):
+                    if (
+                        idle_owner is None
+                        or idle_owner[0] != actual_session
+                        or idle_owner[1] is None
+                    ):
+                        raise NativeDispatchChanged(
+                            "Inactivity cancellation lacks native ownership"
+                        )
+                    _session, epoch, broker, process = idle_owner
+                    await self.sessions.cancel(
+                        thread_id,
+                        expected_session=actual_session,
+                        expected_epoch=epoch,
+                        guard=lambda: (
+                            self._reports.get(actual_session) is report
+                            and self.sessions.broker is broker
+                            and getattr(broker, "_proc", None) is process
+                        ),
+                    )
 
                 turn_options = {
                     "channel_id": channel_id,
@@ -1209,13 +1244,16 @@ class MattermostGateway:
                         and not report.get("cancel_requested")
                     )
                 if ordinary_collaboration:
-                    with native_command_admission(
-                        lambda: (
-                            self.ordinary_admitted(thread_id, ownership_guard)
-                            and not self.draining
-                            and not self.sealed
-                            and not report.get("cancel_requested")
-                        )
+                    with (
+                        native_command_admission(
+                            lambda: (
+                                self.ordinary_admitted(thread_id, ownership_guard)
+                                and not self.draining
+                                and not self.sealed
+                                and not report.get("cancel_requested")
+                            )
+                        ),
+                        native_inactivity_cancellation(cancel_ordinary_idle),
                     ):
                         result = await self.sessions.run_turn(thread_id, text, **turn_options)
                 else:
