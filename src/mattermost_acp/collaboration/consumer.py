@@ -1520,6 +1520,28 @@ class CollaborationConsumer:
         finally:
             self.reserving.discard(key)
 
+    def stopped_owned_async_work(self, key, reserved):
+        report = self.ownership.get(key)
+        if (
+            not report
+            or self.gateway._reports.get(reserved.get("session_id")) is not report
+            or report.get("execution_id") != reserved.get("execution_id")
+            or not report.get("cancel_requested")
+            or report.get("active")
+            or not report.get("foreground_complete")
+        ):
+            return []
+        reporter = report["reporter"]
+        if reporter.has_pending_work():
+            return []
+        return sorted(
+            task_id
+            for task_id, task in reporter.async_tasks.items()
+            if task.get("state") == "stopped"
+            and task.get("owned") is True
+            and task.get("toolCallId") in reporter.observed_tools
+        )
+
     async def handle_cancel(self, item):
         for _ in range(20):
             target = await self.hub.request("GET", f"/messages/{item['parent']}")
@@ -1577,6 +1599,15 @@ class CollaborationConsumer:
                 )
                 continue
             terminal = self.gateway._last_terminal.get(binding["thread_id"])
+            if terminal and terminal.get("stop_reason") == "end_turn":
+                stopped = self.stopped_owned_async_work(key, reserved)
+                if stopped and self.terminal_matches(key, reserved, terminal):
+                    terminal = {
+                        **terminal,
+                        "stop_reason": "cancelled",
+                        "foreground_stop_reason": "end_turn",
+                        "async_tasks_stopped": stopped,
+                    }
             if (
                 expected
                 and terminal
@@ -1767,9 +1798,7 @@ class CollaborationConsumer:
 
     def save_stops(self):
         self.stops_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        directory = os.open(
-            self.stops_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-        )
+        directory = os.open(self.stops_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         temporary = f".{self.stops_path.name}.{uuid.uuid4().hex}.tmp"
         identity = None
         fd = None
@@ -1804,9 +1833,7 @@ class CollaborationConsumer:
             named = os.stat(temporary, dir_fd=directory, follow_symlinks=False)
             if (named.st_dev, named.st_ino) != identity:
                 raise OSError("Project stop temporary file changed during persistence")
-            os.replace(
-                temporary, self.stops_path.name, src_dir_fd=directory, dst_dir_fd=directory
-            )
+            os.replace(temporary, self.stops_path.name, src_dir_fd=directory, dst_dir_fd=directory)
             os.fsync(directory)
             check_directory()
         finally:
