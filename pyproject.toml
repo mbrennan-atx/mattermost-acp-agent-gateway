@@ -76,6 +76,7 @@ include = [
     "/tests/test_collaboration_cancellation_recovery_followup.py",
     "/tests/test_collaboration_elapsed_deadlines.py",
     "/tests/test_collaboration_worker_leases.py",
+    "/tests/test_subagent_sibling_collisions.py",
     "/tests/test_collaboration_stop_report_final.py",
     "/tests/test_subagent_activity_history.py",
     "/tests/test_collaboration_inactivity_cancellation.py",
