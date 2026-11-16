@@ -369,6 +369,7 @@ def build_app(
                 request["actor"],
                 body["text"],
                 "post:" + body["post_id"],
+                post_created_at=verified.get("create_at"),
             )
         )
 

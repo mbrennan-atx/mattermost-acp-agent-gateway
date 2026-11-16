@@ -998,26 +998,41 @@ class CollaborationStore:
             ).fetchall()
             return [self.cancel(row[0], actor) for row in rows]
 
-    def mention(self, actor, channel, thread, recipient, body, key):
-        projects = [
-            project
-            for (raw,) in self.db.execute("SELECT data FROM projects")
-            if (project := json.loads(raw))
-            if project["channel_id"] == channel and project["thread_id"] == thread
-        ]
-        if not projects:
-            return None
-        projects = [project for project in projects if actor in project["members"]]
-        if not projects:
-            raise PermissionError("Actor is not a project participant")
-        request = {"recipient": recipient, "kind": "ask", "text": body, "key": key}
-        for project in projects:
-            if self.db.execute(
-                "SELECT 1 FROM messages WHERE project=? AND sender=? AND key=?",
-                (project["id"], actor, key),
-            ).fetchone():
-                return self.send(project["id"], actor, request)
-        if projects:
+    def mention(self, actor, channel, thread, recipient, body, key, *, post_created_at=None):
+        with self.transaction():
+            projects = [
+                project
+                for (raw,) in self.db.execute("SELECT data FROM projects")
+                if (project := json.loads(raw))
+                if project["channel_id"] == channel and project["thread_id"] == thread
+            ]
+            if not projects:
+                # Posting and read-back are separate external operations. Once
+                # a root receipt exists, it remains project-owned even when
+                # finalization fails or an origin stop awaits reconciliation.
+                for (raw,) in self.db.execute("SELECT data FROM creations"):
+                    intent = json.loads(raw)
+                    if (
+                        intent.get("thread_id") == thread
+                        and intent["body"]["channel_id"] == channel
+                    ):
+                        raise PermissionError("Project discussion creation requires reconciliation")
+                return None
+            projects = [project for project in projects if actor in project["members"]]
+            if not projects:
+                raise PermissionError("Actor is not a project participant")
+            request = {"recipient": recipient, "kind": "ask", "text": body, "key": key}
+            for project in projects:
+                if self.db.execute(
+                    "SELECT 1 FROM messages WHERE project=? AND sender=? AND key=?",
+                    (project["id"], actor, key),
+                ).fetchone():
+                    return self.send(project["id"], actor, request)
             selected = next((p for p in projects if p["status"] == "active"), projects[0])
+            # Mattermost timestamps are integer milliseconds. Compare at that
+            # precision to the durable intent admission, never finalization time.
+            if type(post_created_at) is not int or post_created_at <= 0:
+                raise PermissionError("Mention source creation time could not be verified")
+            if post_created_at < math.floor(selected["created"] * 1000):
+                raise PermissionError("Mention source predates this project discussion generation")
             return self.send(selected["id"], actor, request)
-        return None

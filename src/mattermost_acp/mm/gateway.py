@@ -678,6 +678,23 @@ class MattermostGateway:
             return
         await reply(f"Unknown command `/{cmd}`. Try `/help`.")
 
+    def collaboration_recovering(self):
+        return self.collaboration_recovery_pending or bool(
+            getattr(self.collaboration, "recovery_pending", False)
+        )
+
+    def ordinary_admitted(self, thread_id, ownership_guard=None):
+        if self.collaboration_recovering():
+            return False
+        if self.collaboration is None:
+            return True
+        inherited = getattr(self.collaboration, "inherited_thread_pending", lambda _thread: False)
+        if inherited(thread_id):
+            return False
+        return not self.collaboration.owns_thread(thread_id) or bool(
+            ownership_guard and ownership_guard()
+        )
+
     async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
         if self.draining or self.sealed:
             if kwargs.get("before_native") is not None:
@@ -685,6 +702,13 @@ class MattermostGateway:
             await self._post(
                 kwargs["channel_id"],
                 "Gateway updating. Retry this message shortly.",
+                root_id=thread_id,
+            )
+            return None
+        if kwargs.get("before_native") is None and self.collaboration_recovering():
+            await self._post(
+                kwargs["channel_id"],
+                "Project recovery is pending. Retry this message shortly.",
                 root_id=thread_id,
             )
             return None
@@ -703,6 +727,13 @@ class MattermostGateway:
                 await self._post(
                     kwargs["channel_id"],
                     "Gateway updating. Retry this message shortly.",
+                    root_id=thread_id,
+                )
+                return None
+            if kwargs.get("before_native") is None and self.collaboration_recovering():
+                await self._post(
+                    kwargs["channel_id"],
+                    "Project recovery is pending. Retry this message shortly.",
                     root_id=thread_id,
                 )
                 return None
@@ -838,6 +869,9 @@ class MattermostGateway:
         before_native=None,
         ownership_guard=None,
     ) -> dict | None:
+        ordinary_collaboration = before_native is None and (
+            self.collaboration is not None or self.collaboration_recovery_pending
+        )
         if before_native is not None and self.background_pending(thread_id):
             return {"queued": True}
         if self.sessions.is_busy(thread_id):
@@ -884,6 +918,13 @@ class MattermostGateway:
             if passthrough
             else RouteRequest(prompt, channel_id=channel_id, has_attachments=has_attachments)
         )
+        if ordinary_collaboration and not self.ordinary_admitted(thread_id, ownership_guard):
+            await self._post(
+                channel_id,
+                "Project work is pending. Retry when the thread is ready.",
+                root_id=thread_id,
+            )
+            return None
         try:
             options = {"channel_id": channel_id, "route": route}
             if workspace:
@@ -994,9 +1035,14 @@ class MattermostGateway:
             "channel_id": channel_id,
             "active": True,
             "foreground_complete": False,
-            "preparing": before_native is not None,
+            "preparing": before_native is not None or ordinary_collaboration,
             "previous": previous
-            if previous and (before_native is not None or self.background_pending(thread_id))
+            if previous
+            and (
+                before_native is not None
+                or ordinary_collaboration
+                or self.background_pending(thread_id)
+            )
             else None,
             "task": None,
         }
@@ -1063,6 +1109,32 @@ class MattermostGateway:
                         and not reporter.has_pending_work()
                         and not report.get("cancel_requested")
                     )
+                elif ordinary_collaboration:
+
+                    async def bind_ordinary(actual_session):
+                        if (
+                            not self.ordinary_admitted(thread_id, ownership_guard)
+                            or self.draining
+                            or self.sealed
+                        ):
+                            raise NativeDispatchChanged("Project recovery changed native admission")
+                        old_session = str(session_status.get("session_id") or "")
+                        if (
+                            self._reports.get(old_session) is report
+                            and old_session != actual_session
+                        ):
+                            self._reports.pop(old_session, None)
+                        self._reports[actual_session] = report
+                        session_status["session_id"] = actual_session
+                        return True
+
+                    turn_options["before_prompt"] = bind_ordinary
+                    turn_options["dispatch_guard"] = lambda: (
+                        self.ordinary_admitted(thread_id, ownership_guard)
+                        and not self.draining
+                        and not self.sealed
+                        and not report.get("cancel_requested")
+                    )
                 result = await self.sessions.run_turn(thread_id, text, **turn_options)
             finally:
                 report["active"] = False
@@ -1074,6 +1146,13 @@ class MattermostGateway:
                         pass
         except NativeDispatchChanged:
             await restore_undispatched()
+            if ordinary_collaboration:
+                await self._post(
+                    channel_id,
+                    "This message did not start. Retry when the thread is ready.",
+                    root_id=thread_id,
+                )
+                return None
             return {"queued": True}
         except AcpError as exc:
             logger.warning("ACP error thread=%s: %s", thread_id, exc)

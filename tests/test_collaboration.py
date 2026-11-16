@@ -84,6 +84,7 @@ async def api_fixture(tmp_path, *, sidecar_actors=()):
 
     async def verify_post(post_id, _actor):
         return {
+            "create_at": int(store.clock() * 1000),
             "user_id": "alpha-user",
             "channel_id": "floor",
             "root_id": "unregistered" if post_id == "post-2" else "discussion",
@@ -837,6 +838,7 @@ async def test_hub_rejects_real_post_without_addressed_request_intent(tmp_path):
 
     async def verify(_post, _actor):
         return {
+            "create_at": int(store.clock() * 1000),
             "user_id": body["author_id"],
             "channel_id": body["channel_id"],
             "root_id": body["thread_id"],

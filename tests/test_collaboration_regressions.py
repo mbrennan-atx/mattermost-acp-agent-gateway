@@ -352,6 +352,20 @@ async def test_owned_terminal_preview_is_bounded_and_full_evidence_survives_rele
     )
     consumer = CollaborationConsumer(gateway, Settings("http://127.0.0.1:18781", "x" * 32))
     gateway.collaboration = consumer
+    consumer.hub.request = AsyncMock(
+        side_effect=lambda _method, path: (
+            {"actor": "beta", "sidecar": False} if path == "/identity" else []
+        )
+    )
+    await consumer.reconcile_inherited_claims()
+    run_turn = gateway.sessions.run_turn
+
+    async def native(thread, text, **options):
+        assert await options.pop("before_prompt")("native")
+        assert options.pop("dispatch_guard")()
+        return await run_turn(thread, text, **options)
+
+    gateway.sessions.run_turn = native
     consumer.ownership[("request", "claim")] = None
     consumer.ownership_threads[("request", "claim")] = "root"
     try:

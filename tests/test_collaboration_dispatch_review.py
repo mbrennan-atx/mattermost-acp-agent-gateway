@@ -256,6 +256,7 @@ async def test_stop_retains_predecessor_until_native_background_completion(tmp_p
     consumer = CollaborationConsumer(gateway, clients["beta"].settings)
     gateway.collaboration = consumer
     try:
+        await consumer.reconcile_inherited_claims()
         await gateway.run_prompt(
             thread_id="discussion",
             channel_id="floor",
@@ -577,6 +578,7 @@ async def test_addressed_floor_prefix_matches_hub_with_extra_question_mentions(
 
     async def verify_post(_post_id, _actor):
         return {
+            "create_at": int(store.clock() * 1000),
             "user_id": "alpha-user",
             "channel_id": "floor",
             "root_id": "discussion",
