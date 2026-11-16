@@ -191,11 +191,56 @@ class CollaborationStore:
             intent = {
                 "body": canonical,
                 "thread_id": body.get("thread_id"),
+                "creation_id": identifier() if not body.get("thread_id") else None,
                 "status": "reserved",
                 "created": self.clock(),
             }
             self.save_creation(actor, key, intent)
             return intent, True
+
+    def get_creation(self, actor, key):
+        key = text(key, "project idempotency key", 200)
+        row = self.db.execute(
+            "SELECT data FROM creations WHERE actor=? AND key=?", (actor, key)
+        ).fetchone()
+        if row is None:
+            raise KeyError("Unknown project creation")
+        return json.loads(row[0])
+
+    def unresolved_creations(self, channel):
+        return [
+            (actor, key, intent)
+            for actor, key, raw in self.db.execute("SELECT actor,key,data FROM creations")
+            if (intent := json.loads(raw)).get("creation_id")
+            and not intent.get("thread_id")
+            and intent["body"]["channel_id"] == channel
+        ]
+
+    def known_discussion(self, channel, thread):
+        for (raw,) in self.db.execute("SELECT data FROM projects"):
+            project = json.loads(raw)
+            if project["channel_id"] == channel and project["thread_id"] == thread:
+                return True
+        for (raw,) in self.db.execute("SELECT data FROM creations"):
+            intent = json.loads(raw)
+            if intent["body"]["channel_id"] == channel and intent.get("thread_id") == thread:
+                return True
+        return False
+
+    def record_creation_root(self, actor, key, thread, *, creation_id=None):
+        """Keep one root binding even when posting and verification finish out of order."""
+        thread = text(thread, "discussion root", 128)
+        with self.transaction():
+            intent = self.get_creation(actor, key)
+            if creation_id is not None and intent.get("creation_id") != creation_id:
+                raise PermissionError("Discussion creation correlation changed")
+            if intent.get("thread_id") and intent["thread_id"] != thread:
+                raise ValueError("Conflicting project discussion for creation key")
+            intent["thread_id"] = thread
+            if intent["status"] != "complete":
+                intent["status"] = "posted"
+            self.save_creation(actor, key, intent)
+            return intent
 
     def save_creation(self, actor, key, intent):
         key = text(key, "project idempotency key", 200)

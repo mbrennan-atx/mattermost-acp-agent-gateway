@@ -40,7 +40,7 @@ async def execute(args, hub):
                 for name in ("max_workers", "max_turns", "max_depth", "max_seconds")
             },
             "key": text(args.key, "project idempotency key", 200),
-            "channel_id": os.environ.get("MATTERMOST_PEER_CHANNEL_ID", ""),
+            "channel_id": os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "").strip() or None,
         }
         # A retry with the same key reuses the first discussion and project.
         for existing in await hub.request("GET", "/projects"):

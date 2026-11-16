@@ -112,6 +112,7 @@ tests/test_collaboration_dispatch_review.py
 tests/test_collaboration_dispatch_regressions.py
 tests/test_collaboration_ordinary_recovery.py
 tests/test_collaboration_creation_admission.py
+tests/test_collaboration_creation_correlation.py
 tests/test_collaboration_provisional_steering.py
 tests/test_collaboration_reply_artifacts.py
 tests/test_collaboration_cold_restart.py

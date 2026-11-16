@@ -895,9 +895,17 @@ async def test_concurrent_creation_retries_reuse_one_durable_discussion(tmp_path
 
 async def test_uncertain_creation_survives_restart_requires_explicit_reconciliation(tmp_path):
     posted = []
+    root = {}
 
     async def post(actor, body):
         posted.append("unconfirmed-root")
+        root.update(
+            id="unconfirmed-root",
+            channel_id=body["channel_id"],
+            root_id="",
+            user_id=actor + "-user",
+            props=dict(body["props"]),
+        )
         raise ValueError("Post may have been accepted before connection loss")
 
     path = tmp_path / "hub.db"
@@ -912,7 +920,8 @@ async def test_uncertain_creation_survives_restart_requires_explicit_reconciliat
         await close_creation(store, server, client)
 
     async def verify(actor, thread):
-        return {"id": thread, "channel_id": "floor", "root_id": ""}
+        assert actor == "alpha" and thread == root["id"]
+        return dict(root)
 
     store, server, client = await creation_api(path, post, verify)
     try:

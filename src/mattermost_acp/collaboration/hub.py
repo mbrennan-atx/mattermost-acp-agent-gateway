@@ -95,6 +95,71 @@ def build_app(
         body["owner_in_discussion"] = bool(actors[actor].get("sidecar"))
         return web.json_response(store.create_project(actor, body))
 
+    async def read_creation_root(actor, thread, *, fallback_channel=None):
+        if verify_creation is not None:
+            return await verify_creation(actor, thread)
+        settings = actors[actor]
+        if settings.get("mattermost_url") and settings.get("mattermost_token_file"):
+            token = Path(settings["mattermost_token_file"]).expanduser().read_text().strip()
+            async with aiohttp.ClientSession(
+                headers={"Authorization": "Bearer " + token},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as session:
+                async with session.get(
+                    settings["mattermost_url"].rstrip("/") + "/api/v4/posts/" + thread
+                ) as response:
+                    if response.status != 200:
+                        raise PermissionError("Discussion root could not be independently verified")
+                    return await response.json()
+        if fallback_channel is not None:
+            return {"id": thread, "channel_id": fallback_channel}
+        raise PermissionError("Discussion root identity verifier is required")
+
+    def verify_correlated_root(root, actor, intent, thread):
+        if not isinstance(root, dict):
+            raise PermissionError("Discussion root identity could not be verified")
+        props = root.get("props") or {}
+        if (
+            root.get("id") != thread
+            or root.get("channel_id") != intent["body"]["channel_id"]
+            or root.get("root_id")
+            or not actors[actor].get("user_id")
+            or root.get("user_id") != actors[actor]["user_id"]
+            or not isinstance(props, dict)
+            or props.get("mattermost_acp_creation_id") != intent.get("creation_id")
+            or props.get("mattermost_acp_creation_actor") != actor
+        ):
+            raise PermissionError("Discussion root does not match its creation identity")
+
+    async def guard_unconfirmed_root(actor, body):
+        if store.known_discussion(body["channel_id"], body["thread_id"]):
+            return  # Existing project admission retains this discussion's ownership.
+        candidates = store.unresolved_creations(body["channel_id"])
+        if not candidates:
+            return
+        root = await read_creation_root(actor, body["thread_id"])
+        if (
+            not isinstance(root, dict)
+            or root.get("id") != body["thread_id"]
+            or root.get("channel_id") != body["channel_id"]
+            or root.get("root_id")
+        ):
+            raise PermissionError("Discussion root does not match the real root binding")
+        props = root.get("props") or {}
+        if not isinstance(props, dict):
+            raise PermissionError("Discussion root metadata could not be verified")
+        if not {"mattermost_acp_creation_id", "mattermost_acp_creation_actor"} & props.keys():
+            return  # Independently verified unrelated roots keep ordinary admission.
+        for owner, key, intent in candidates:
+            if props.get("mattermost_acp_creation_id") != intent["creation_id"]:
+                continue
+            verify_correlated_root(root, owner, intent, body["thread_id"])
+            store.record_creation_root(
+                owner, key, body["thread_id"], creation_id=intent["creation_id"]
+            )
+            raise PermissionError("Project discussion creation requires reconciliation")
+        raise PermissionError("Discussion root has unknown creation correlation")
+
     async def creations(request):
         actor = request["actor"]
         body = await request.json()
@@ -103,18 +168,24 @@ def build_app(
             intent, fresh = store.prepare_creation(actor, body)
             explicit = body.get("thread_id")
             if explicit:
+                if not intent.get("thread_id") and intent.get("creation_id"):
+                    root = await read_creation_root(actor, explicit)
+                    verify_correlated_root(root, actor, intent, explicit)
                 if intent.get("thread_id") and intent["thread_id"] != explicit:
                     raise ValueError("Conflicting project discussion for creation key")
-                intent["thread_id"] = explicit
-                store.save_creation(actor, body["key"], intent)
+                intent = store.record_creation_root(actor, body["key"], explicit)
             if not intent.get("thread_id"):
                 if not fresh:
                     raise ValueError(
                         "Discussion posting is unconfirmed; reconcile with --discussion-thread"
                     )
                 settings = actors[actor]
+                props = {
+                    "mattermost_acp_creation_id": intent["creation_id"],
+                    "mattermost_acp_creation_actor": actor,
+                }
                 if create_post is not None:
-                    post = await create_post(actor, body)
+                    post = await create_post(actor, {**body, "props": props})
                 else:
                     base = settings.get("mattermost_url")
                     path = settings.get("mattermost_token_file")
@@ -132,37 +203,28 @@ def build_app(
                             suffix = "\n\nFull objective is saved in the project record."
                             message = message[: DEFAULT_LIMIT - len(suffix)].removesuffix("@")
                             message += suffix
-                        async with session.post(
-                            base.rstrip("/") + "/api/v4/posts",
-                            json={"channel_id": body["channel_id"], "message": message},
-                        ) as response:
-                            if response.status >= 400:
-                                raise ValueError("Discussion creation was not confirmed")
-                            post = await response.json()
+                        try:
+                            async with session.post(
+                                base.rstrip("/") + "/api/v4/posts",
+                                json={
+                                    "channel_id": body["channel_id"],
+                                    "message": message,
+                                    "props": props,
+                                },
+                            ) as response:
+                                if response.status >= 400:
+                                    raise ValueError("Discussion creation was not confirmed")
+                                post = await response.json()
+                        except (TimeoutError, aiohttp.ClientError) as exc:
+                            raise ValueError("Discussion creation was not confirmed") from exc
                 if post.get("channel_id") != body["channel_id"] or not post.get("id"):
                     raise ValueError("Discussion creation was not confirmed")
-                intent["thread_id"] = post["id"]
-                intent["status"] = "posted"
-                store.save_creation(actor, body["key"], intent)
-            settings = actors[actor]
-            if verify_creation is not None:
-                verified = await verify_creation(actor, intent["thread_id"])
-            elif settings.get("mattermost_url") and settings.get("mattermost_token_file"):
-                token = Path(settings["mattermost_token_file"]).expanduser().read_text().strip()
-                async with aiohttp.ClientSession(
-                    headers={"Authorization": "Bearer " + token},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as session:
-                    async with session.get(
-                        settings["mattermost_url"].rstrip("/")
-                        + "/api/v4/posts/"
-                        + intent["thread_id"]
-                    ) as response:
-                        if response.status != 200:
-                            raise ValueError("Discussion read-back failed")
-                        verified = await response.json()
-            else:
-                verified = {"id": intent["thread_id"], "channel_id": body["channel_id"]}
+                intent = store.record_creation_root(
+                    actor, body["key"], post["id"], creation_id=intent["creation_id"]
+                )
+            verified = await read_creation_root(
+                actor, intent["thread_id"], fallback_channel=body["channel_id"]
+            )
             if (
                 verified.get("id") != intent["thread_id"]
                 or verified.get("channel_id") != body["channel_id"]
@@ -301,6 +363,7 @@ def build_app(
 
     async def mention(request):
         body = await request.json()
+        await guard_unconfirmed_root(request["actor"], body)
         sender = next(
             (
                 name
