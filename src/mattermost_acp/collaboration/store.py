@@ -889,7 +889,7 @@ class CollaborationStore:
             if item["sender"] == actor:
                 raise ValueError("Claim a peer's task, not your own")
             project = self.get_project(item["project"], actor)
-            if project["status"] != "active":
+            if project["status"] != "active" or self.remaining_seconds(project) <= 0:
                 raise ValueError("Project is inactive")
             self.check_ancestor_recipient(item["project"], actor, actor, item.get("parent"))
             item.update(recipient=actor, state="queued")

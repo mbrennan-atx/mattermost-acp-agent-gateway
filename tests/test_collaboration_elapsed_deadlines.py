@@ -3,9 +3,12 @@
 import json
 
 import pytest
+from aiohttp.test_utils import TestServer
 from test_collaboration import ask, project
 from test_collaboration_stop_order import creation_body
 
+from mattermost_acp.collaboration.client import HubClient, Settings
+from mattermost_acp.collaboration.hub import build_app
 from mattermost_acp.collaboration.store import CollaborationStore
 
 
@@ -17,6 +20,42 @@ def open_store(path, wall, elapsed, epoch="boot-one"):
         elapsed=lambda: elapsed[0],
         epoch=epoch,
     )
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_expired_open_task_claim_preserves_unassigned_work(tmp_path, rollback):
+    wall, elapsed = [100.0], [50.0]
+    store = open_store(tmp_path / "hub.db", wall, elapsed)
+    try:
+        p = project(store, max_seconds=10)
+        task = store.send(p["id"], "alpha", {"kind": "work", "text": "Review", "key": "open"})
+        wall[0], elapsed[0] = (80.0 if rollback else 111.0), 61.0
+        with pytest.raises(ValueError, match="inactive"):
+            store.claim_open(task["id"], "beta")
+        saved = store.get_message(task["id"], "beta")
+        assert saved["recipient"] is None and saved["state"] == "open"
+    finally:
+        store.close()
+
+
+async def test_list_refreshes_elapsed_expiry_without_consumers(tmp_path):
+    wall, elapsed = [100.0], [50.0]
+    store = open_store(tmp_path / "hub.db", wall, elapsed)
+    p = project(store, max_seconds=10)
+    task = store.send(p["id"], "alpha", {"kind": "work", "text": "Review", "key": "open"})
+    actors = {name: {"token": name * 32} for name in ("alpha", "beta", "gamma")}
+    server = TestServer(build_app(store, actors))
+    await server.start_server()
+    client = HubClient(Settings(str(server.make_url("/")).rstrip("/"), actors["alpha"]["token"]))
+    try:
+        wall[0], elapsed[0] = 80.0, 61.0
+        result = await client.request("GET", "/projects")
+        assert result[0]["status"] == "cancelled"
+        assert store.get_message(task["id"], "alpha")["state"] == "cancelled"
+    finally:
+        await client.close()
+        await server.close()
+        store.close()
 
 
 def test_elapsed_expiry_precedes_first_recipient_deadline_receipt(tmp_path):

@@ -91,6 +91,7 @@ def build_app(
     async def projects(request):
         actor = request["actor"]
         if request.method == "GET":
+            store.expire()
             return web.json_response(store.list_projects(actor))
         body = await request.json()
         body["owner_in_discussion"] = bool(actors[actor].get("sidecar"))

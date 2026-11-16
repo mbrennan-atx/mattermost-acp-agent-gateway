@@ -46,7 +46,7 @@ def main() -> int:
     parser.add_argument("--no-restart", action="store_true", help="only rewrite files")
     parser.add_argument("--force", action="store_true", help="restart even if turns are running")
     parser.add_argument(
-        "--wait", type=float, default=900, help="seconds to wait for idle (default 900)"
+        "--wait", type=float, default=900, help="compatibility option; no waiting or restart"
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
