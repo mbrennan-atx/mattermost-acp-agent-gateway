@@ -16,6 +16,35 @@ from mattermost_acp.collaboration.store import CollaborationStore
 pytest_plugins = ["test_session_service"]
 
 
+@pytest.mark.parametrize("started", [51.78335005859267, 0.111468858163])
+def test_fresh_elapsed_receipts_survive_float_rounding(tmp_path, started):
+    now = [started]
+    store = CollaborationStore(
+        tmp_path / "hub.db", {"alpha"}, elapsed=lambda: now[0], epoch="synthetic"
+    )
+    try:
+        item = {}
+        store.renew_worker_lease(item)
+        assert store.worker_lease_live(item)
+        lease = item["worker_lease"]
+        original_deadline = lease["deadline"]
+        lease["deadline"] = original_deadline + 0.001
+        assert not store.worker_lease_live(item)
+        lease["deadline"] = original_deadline
+        now[0] = original_deadline
+        assert not store.worker_lease_live(item)
+        now[0] = started
+        store.defer_retry(item)
+        retry = dict(item["retry_delay"])
+        store.save_message = lambda _item: pytest.fail("A valid backoff must not be reset")
+        assert not store.retry_ready(item)
+        assert item["retry_delay"] == retry
+        now[0] = retry["deadline"]
+        assert store.retry_ready(item)
+    finally:
+        store.close()
+
+
 @pytest.fixture
 def short_stop_bound(monkeypatch):
     original = asyncio.timeout

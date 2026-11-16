@@ -345,7 +345,7 @@ async def test_interrupted_workspace_guard_stops_its_owned_process_group(tmp_pat
             state = Path(f"/proc/{pid}/stat")
             try:
                 status = state.read_text().split()[2]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 break  # The child can exit between procfs checks.
             if status == "Z":
                 break

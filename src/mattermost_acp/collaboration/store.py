@@ -1043,7 +1043,7 @@ class CollaborationStore:
                 for field in ("started", "deadline")
             )
             and lease["started"] <= now < lease["deadline"]
-            and 0 < lease["deadline"] - lease["started"] <= WORKER_LEASE_SECONDS
+            and lease["started"] < lease["deadline"] <= lease["started"] + WORKER_LEASE_SECONDS
         )
 
     def defer_retry(self, item):
@@ -1066,7 +1066,7 @@ class CollaborationStore:
                 for field in ("started", "deadline")
             )
             and delay["started"] <= now
-            and 0 <= delay["deadline"] - delay["started"] <= 2
+            and delay["started"] <= delay["deadline"] <= delay["started"] + 2
         ):
             return now >= delay["deadline"]
         if delay is None and item.get("not_before", 0) <= self.clock():
