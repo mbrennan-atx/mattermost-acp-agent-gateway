@@ -85,6 +85,7 @@ class NativeDispatchChanged(AcpError):
 
 
 _command_admission = ContextVar("native_command_admission", default=None)
+_inactivity_cancellation = ContextVar("native_inactivity_cancellation", default=None)
 
 
 @contextmanager
@@ -103,6 +104,16 @@ def check_native_command_admission():
     guard = _command_admission.get()
     if guard is not None and not guard():
         raise NativeDispatchChanged("Native command admission changed before dispatch")
+
+
+@contextmanager
+def native_inactivity_cancellation(cancel):
+    """Bind cancellation of dispatched work to its independent native owner."""
+    token = _inactivity_cancellation.set(cancel)
+    try:
+        yield
+    finally:
+        _inactivity_cancellation.reset(token)
 
 
 def _format_rpc_error(err: Any) -> str:
@@ -376,12 +387,14 @@ class AcpBroker:
                 assert self._proc.stdout is not None
                 # Persistent I/O tasks must not inherit one command's transient
                 # admission guard and apply it to unrelated later sessions.
-                with native_command_admission(None):
+                with native_command_admission(None), native_inactivity_cancellation(None):
                     self._reader_task = asyncio.create_task(
                         self._read_loop(), name="acp-broker-reader"
                     )
-                if self._proc.stderr is not None:
-                    asyncio.create_task(self._drain_stderr(self._proc.stderr), name="acp-stderr")
+                    if self._proc.stderr is not None:
+                        asyncio.create_task(
+                            self._drain_stderr(self._proc.stderr), name="acp-stderr"
+                        )
             elif self._reader_task is None or self._reader_task.done():
                 raise AcpError(
                     "Native process is running without a working reader; recovery required"
@@ -753,6 +766,7 @@ class AcpBroker:
         Operators can opt into a finite hard maximum.
         """
         async with self._turn_lock(session_id):
+            inactivity_cancel = _inactivity_cancellation.get()
             q: asyncio.Queue[SessionUpdate | None] = asyncio.Queue()
             self._session_queues.setdefault(session_id, []).append(q)
             self.prompt_subscriptions.add(session_id)
@@ -802,7 +816,13 @@ class AcpBroker:
                         idle_s,
                     )
                     try:
-                        await self.cancel(session_id)
+                        if inactivity_cancel is None:
+                            await self.cancel(session_id)
+                        else:
+                            # Closing work admission cannot authorize or prevent
+                            # this independently guarded stop of dispatched work.
+                            with native_command_admission(None):
+                                await inactivity_cancel(session_id)
                     except Exception:
                         logger.debug(
                             "session/cancel after idle timeout failed",
@@ -864,7 +884,8 @@ class AcpBroker:
                             last_progress = loop.time()
                     elif item.kind == "subagent_activity":
                         # Real worker output is progress; synthetic heartbeats are not.
-                        last_progress = loop.time()
+                        if not item.raw.get("ownership_snapshot"):
+                            last_progress = loop.time()
                     elif item.kind == "usage_update":
                         usage_used = item.usage_used
                         usage_size = item.usage_size
