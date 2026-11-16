@@ -334,6 +334,8 @@ async def test_ordinary_turn_does_not_retain_full_terminal_answers():
 async def test_owned_terminal_preview_is_bounded_and_full_evidence_survives_release(
     tmp_path, monkeypatch
 ):
+    from types import SimpleNamespace
+
     from test_gateway_turn import _Cfg, _Client, _Sessions
 
     from mattermost_acp.mm.gateway import MattermostGateway
@@ -351,6 +353,8 @@ async def test_owned_terminal_preview_is_bounded_and_full_evidence_survives_rele
         ),
     )
     consumer = CollaborationConsumer(gateway, Settings("http://127.0.0.1:18781", "x" * 32))
+    gateway.sessions.broker = SimpleNamespace(_proc=None)
+    gateway.sessions.native_epoch = lambda _thread: "fixture-native-epoch"
     gateway.collaboration = consumer
     consumer.hub.request = AsyncMock(
         side_effect=lambda _method, path: (
