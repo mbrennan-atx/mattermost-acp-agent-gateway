@@ -460,9 +460,12 @@ async def test_saved_stop_cutoff_survives_reconstruction_and_preserves_new_proje
     try:
         old = project(store)
         now[0] = 1001.0
+        # A saved pre-upgrade timestamp remains readable and retryable.
+        consumer.pending_stops["origin"] = 1001.0
+        consumer.save_stops()
         consumer.hub.request = AsyncMock(side_effect=TimeoutError("Hub unavailable"))
         with pytest.raises(TimeoutError):
-            await consumer.cancel_thread("origin")
+            await consumer.cancel_thread("origin", retry=True)
         assert json.loads(consumer.stops_path.read_text()) == {"origin": 1001.0}
         await consumer.close()
         now[0] = 1002.0
@@ -494,8 +497,10 @@ async def test_older_stop_retry_cannot_erase_newer_pending_stop(tmp_path, monkey
     entered = {1000.0: asyncio.Event(), 2000.0: asyncio.Event()}
     release = {1000.0: asyncio.Event(), 2000.0: asyncio.Event()}
 
-    async def request(_method, _path, body):
-        cutoff = body["cutoff"]
+    async def request(_method, path, body):
+        if path == "/stop-boundaries":
+            return {"key": body["key"], "thread_id": "origin", "admission_order": 2000}
+        cutoff = body["cutoff"] if "cutoff" in body else body["boundary"]["admission_order"]
         entered[cutoff].set()
         await release[cutoff].wait()
         return {"cancelled": []}
@@ -512,8 +517,9 @@ async def test_older_stop_retry_cannot_erase_newer_pending_stop(tmp_path, monkey
         release[1000.0].set()
         await asyncio.wait_for(older, 1)
         assert not newer.done()
-        assert consumer.pending_stops == {"origin": 2000.0}
-        assert json.loads(consumer.stops_path.read_text()) == {"origin": 2000.0}
+        assert consumer.pending_stops["origin"]["phase"] == "captured"
+        assert consumer.pending_stops["origin"]["boundary"]["admission_order"] == 2000
+        assert json.loads(consumer.stops_path.read_text()) == consumer.pending_stops
         release[2000.0].set()
         await asyncio.wait_for(newer, 1)
         assert consumer.pending_stops == {} and json.loads(consumer.stops_path.read_text()) == {}

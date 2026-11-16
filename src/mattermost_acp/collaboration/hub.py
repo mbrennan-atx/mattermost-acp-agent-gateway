@@ -381,12 +381,29 @@ def build_app(
             )
         )
 
+    async def stop_boundaries(request):
+        if request.method == "GET":
+            return web.json_response(
+                store.get_stop_boundary(request["actor"], request.match_info["key"])
+            )
+        body = await request.json()
+        return web.json_response(
+            store.capture_stop_boundary(request["actor"], body["thread_id"], body["key"])
+        )
+
     async def cancel_thread(request):
         body = await request.json()
         if "cutoff" in body and type(body["cutoff"]) not in {int, float}:
             raise ValueError("Cancellation cutoff must be a finite timestamp")
+        if "boundary" in body and not isinstance(body["boundary"], dict):
+            raise ValueError("Cancellation boundary must be a captured receipt")
         return web.json_response(
-            store.cancel_thread(request["actor"], body["thread_id"], cutoff=body.get("cutoff"))
+            store.cancel_thread(
+                request["actor"],
+                body["thread_id"],
+                cutoff=body.get("cutoff"),
+                boundary=body.get("boundary"),
+            )
         )
 
     def ordinary_mention_fallback(actor, body):
@@ -503,6 +520,8 @@ def build_app(
     app.router.add_get("/mailbox", mailbox)
     app.router.add_post("/mailbox/admission", mailbox_admission)
     app.router.add_get("/claims", claims)
+    app.router.add_post("/stop-boundaries", stop_boundaries)
+    app.router.add_get("/stop-boundaries/{key}", stop_boundaries)
     app.router.add_post("/cancel-thread", cancel_thread)
     app.router.add_post("/mentions", mention)
     return app

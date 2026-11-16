@@ -1134,10 +1134,17 @@ async def test_origin_stop_retries_persistently_even_when_local_cancel_fails(tmp
         restarted = CollaborationConsumer(gateway, consumer.hub.settings)
         try:
             assert restarted.pending_stops == {"origin": cutoff}
-            restarted.hub.request = AsyncMock(return_value={"cancelled": 1})
+            boundary = {"key": cutoff["key"], "thread_id": "origin", "admission_order": 1}
+            restarted.hub.request = AsyncMock(side_effect=[boundary, []])
             await restarted.cancel_thread("origin", retry=True)
-            restarted.hub.request.assert_awaited_once_with(
-                "POST", "/cancel-thread", {"thread_id": "origin", "cutoff": cutoff}
+            assert restarted.hub.request.await_args_list[0].args == (
+                "GET",
+                "/stop-boundaries/" + cutoff["key"],
+            )
+            assert restarted.hub.request.await_args_list[1].args == (
+                "POST",
+                "/cancel-thread",
+                {"thread_id": "origin", "boundary": boundary},
             )
             assert restarted.pending_stops == {}
             assert json.loads(restarted.stops_path.read_text()) == {}

@@ -63,6 +63,7 @@ class CollaborationStore:
             CREATE TABLE IF NOT EXISTS origin_stops(actor TEXT, thread TEXT, cutoff REAL NOT NULL,
                 PRIMARY KEY(actor,thread));
         """)
+        self.migrate_admission_order()
         # Backfill queryable metadata once for hubs created with the JSON-only
         # project schema. Frequent expiry polls must not decode cancelled history.
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(projects)")}
@@ -91,6 +92,10 @@ class CollaborationStore:
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS origin_projects "
                 "ON projects(owner,origin_thread,status,created)"
+            )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS origin_project_admission "
+                "ON projects(owner,origin_thread,status,admission_order)"
             )
         # Persist routing and execution metadata once. Runtime admission and
         # recovery read only matching rows, regardless of retained JSON history.
@@ -146,23 +151,131 @@ class CollaborationStore:
             self.db.rollback()
             raise
 
-    def save_project(self, item):
-        self.db.execute(
-            "INSERT OR REPLACE INTO projects"
-            "(id,data,status,deadline,created,owner,origin_thread,channel,thread) "
-            "VALUES(?,?,?,?,?,?,?,?,?)",
-            (
-                item["id"],
-                json.dumps(item),
-                item["status"],
-                item["deadline"],
-                item["created"],
-                item["owner"],
-                item["origin_thread_id"],
-                item["channel_id"],
-                item["thread_id"],
-            ),
-        )
+    def next_admission_order(self):
+        self.db.execute("UPDATE admission_sequence SET value=value+1 WHERE id=1")
+        return self.db.execute("SELECT value FROM admission_sequence WHERE id=1").fetchone()[0]
+
+    def migrate_admission_order(self):
+        """Freeze historical ordering once; new admissions use transaction order."""
+        with self.transaction():
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS admission_sequence("
+                "id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL)"
+            )
+            self.db.execute("INSERT OR IGNORE INTO admission_sequence VALUES(1,0)")
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS stop_boundaries("
+                "actor TEXT NOT NULL,key TEXT NOT NULL,thread TEXT NOT NULL,"
+                "admission_order INTEGER NOT NULL,PRIMARY KEY(actor,key))"
+            )
+            for table, fields in (
+                ("projects", (("admission_order", "INTEGER"),)),
+                (
+                    "creations",
+                    (
+                        ("admission_order", "INTEGER"),
+                        ("origin_thread", "TEXT"),
+                        ("created", "REAL"),
+                    ),
+                ),
+                ("origin_stops", (("admission_order", "INTEGER"),)),
+            ):
+                columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+                for name, kind in fields:
+                    if name not in columns:
+                        self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
+            # Existing clocks cannot prove true historical order. Preserve the
+            # legacy timestamp convention only for the one-time backfill.
+            missing = []
+            for table in ("projects", "creations"):
+                for row in self.db.execute(
+                    f"SELECT rowid,data FROM {table} WHERE admission_order IS NULL"
+                ):
+                    item = json.loads(row[1])
+                    missing.append((item.get("created", 0), table, row[0], item))
+            correlated = (
+                {
+                    (actor, key): order
+                    for actor, key, order in self.db.execute(
+                        "SELECT actor,key,admission_order FROM creations "
+                        "WHERE admission_order IS NOT NULL"
+                    )
+                }
+                if missing
+                else {}
+            )
+            for _created, table, rowid, item in sorted(missing, key=lambda row: row[:3]):
+                if table == "creations":
+                    actor, key = self.db.execute(
+                        "SELECT actor,key FROM creations WHERE rowid=?", (rowid,)
+                    ).fetchone()
+                    correlation = (actor, key)
+                else:
+                    correlation = (item["owner"], item.get("key"))
+                order = correlated.get(correlation)
+                if order is None:
+                    order = self.next_admission_order()
+                    if correlation[1]:
+                        correlated[correlation] = order
+                self.db.execute(
+                    f"UPDATE {table} SET admission_order=? WHERE rowid=?", (order, rowid)
+                )
+            for rowid, raw in self.db.execute(
+                "SELECT rowid,data FROM creations WHERE origin_thread IS NULL OR created IS NULL"
+            ).fetchall():
+                item = json.loads(raw)
+                body = item["body"]
+                self.db.execute(
+                    "UPDATE creations SET origin_thread=?,created=? WHERE rowid=?",
+                    (
+                        body.get("origin_thread_id") or item.get("thread_id"),
+                        item.get("created", 0),
+                        rowid,
+                    ),
+                )
+            # Old stops are frozen at upgrade. Their MAX clock must never apply
+            # to an admission allocated after this migration.
+            for actor, thread, cutoff in self.db.execute(
+                "SELECT actor,thread,cutoff FROM origin_stops WHERE admission_order IS NULL"
+            ).fetchall():
+                order = self.legacy_stop_boundary(actor, thread, cutoff, migrating=True)[
+                    "admission_order"
+                ]
+                self.db.execute(
+                    "UPDATE origin_stops SET admission_order=? WHERE actor=? AND thread=?",
+                    (order, actor, thread),
+                )
+            self.db.execute(
+                "CREATE INDEX IF NOT EXISTS origin_creation_admission "
+                "ON creations(actor,origin_thread,admission_order)"
+            )
+
+    def save_project(self, item, *, admission_order=None):
+        with self.transaction():
+            existing = self.db.execute(
+                "SELECT admission_order FROM projects WHERE id=?", (item["id"],)
+            ).fetchone()
+            order = existing[0] if existing else admission_order
+            if order is None:
+                order = self.next_admission_order()
+            self.db.execute(
+                "INSERT OR REPLACE INTO projects"
+                "(id,data,status,deadline,created,owner,origin_thread,channel,thread,"
+                "admission_order) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    item["id"],
+                    json.dumps(item),
+                    item["status"],
+                    item["deadline"],
+                    item["created"],
+                    item["owner"],
+                    item["origin_thread_id"],
+                    item["channel_id"],
+                    item["thread_id"],
+                    order,
+                ),
+            )
 
     def save_message(self, item):
         debt = item.get("execution_pending")
@@ -230,7 +343,7 @@ class CollaborationStore:
                 "SELECT data FROM creations WHERE actor=? AND key=?", (actor, key)
             ).fetchone()
             if row:
-                intent = json.loads(row[0])
+                intent = self.get_creation(actor, key)
                 intent["body"]["key"] = key
                 intent["body"].setdefault("owner_in_discussion", False)
                 if intent["body"] != canonical:
@@ -259,6 +372,7 @@ class CollaborationStore:
                 "creation_id": identifier() if not body.get("thread_id") else None,
                 "status": "reserved",
                 "created": self.clock(),
+                "admission_order": self.next_admission_order(),
             }
             self.save_creation(actor, key, intent)
             return intent, True
@@ -319,9 +433,16 @@ class CollaborationStore:
     def save_creation(self, actor, key, intent):
         key = text(key, "project idempotency key", 200)
         with self.transaction():
+            existing = self.db.execute(
+                "SELECT admission_order FROM creations WHERE actor=? AND key=?", (actor, key)
+            ).fetchone()
+            order = existing[0] if existing else intent.get("admission_order")
+            if order is None:
+                order = self.next_admission_order()
             self.db.execute(
-                "INSERT OR REPLACE INTO creations(actor,key,data,channel,thread,unresolved) "
-                "VALUES(?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO creations"
+                "(actor,key,data,channel,thread,unresolved,admission_order,origin_thread,created) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (
                     actor,
                     key,
@@ -333,6 +454,9 @@ class CollaborationStore:
                         and intent["status"] != "rejected"
                         and not intent.get("thread_id")
                     ),
+                    order,
+                    intent["body"].get("origin_thread_id") or intent.get("thread_id"),
+                    intent.get("created", 0),
                 ),
             )
 
@@ -342,18 +466,25 @@ class CollaborationStore:
                 actor,
                 {**intent["body"], "thread_id": intent["thread_id"]},
                 created=intent.get("created"),
+                admission_order=self.db.execute(
+                    "SELECT admission_order FROM creations WHERE actor=? AND key=?",
+                    (actor, intent["body"]["key"]),
+                ).fetchone()[0],
             )
             stop = self.db.execute(
-                "SELECT cutoff FROM origin_stops WHERE actor=? AND thread=?",
+                "SELECT admission_order FROM origin_stops WHERE actor=? AND thread=?",
                 (actor, project["origin_thread_id"]),
             ).fetchone()
-            if stop and project["created"] <= stop[0]:
+            order = self.db.execute(
+                "SELECT admission_order FROM projects WHERE id=?", (project["id"],)
+            ).fetchone()[0]
+            if stop and order <= stop[0]:
                 project = self.cancel(project["id"], actor)
             intent["status"] = "complete"
             self.save_creation(actor, intent["body"]["key"], intent)
             return project
 
-    def create_project(self, actor, body, *, created=None):
+    def create_project(self, actor, body, *, created=None, admission_order=None):
         body = {"owner_in_discussion": False, **body}
         key = body.get("key")
         fingerprint = hashlib.sha256(
@@ -416,7 +547,7 @@ class CollaborationStore:
         with self.transaction():
             for member, binding in item["bindings"].items():
                 self.check_binding(item, member, binding)
-            self.save_project(item)
+            self.save_project(item, admission_order=admission_order)
         return item
 
     def check_binding(self, project, actor, binding):
@@ -1192,25 +1323,115 @@ class CollaborationStore:
             project["status"] = "cancelled"
             self.save_project(project)
 
-    def cancel_thread(self, actor, thread, *, cutoff=None):
-        if cutoff is not None:
-            try:
-                if type(cutoff) not in {int, float} or not math.isfinite(float(cutoff)):
-                    raise ValueError("Cancellation cutoff must be a finite timestamp")
-                cutoff = float(cutoff)
-            except OverflowError:
-                raise ValueError("Cancellation cutoff must be a finite timestamp") from None
+    def get_stop_boundary(self, actor, key):
+        key = text(key, "stop idempotency key", 200)
+        row = self.db.execute(
+            "SELECT thread,admission_order FROM stop_boundaries WHERE actor=? AND key=?",
+            (actor, key),
+        ).fetchone()
+        if row is None:
+            raise KeyError("Stop boundary was not captured")
+        return {"key": key, "thread_id": row[0], "admission_order": row[1]}
+
+    def _record_stop_boundary(self, actor, thread, key):
+        thread = text(thread, "origin thread", 128)
+        key = text(key, "stop idempotency key", 200)
         with self.transaction():
-            boundary = self.clock() if cutoff is None else cutoff
+            row = self.db.execute(
+                "SELECT thread FROM stop_boundaries WHERE actor=? AND key=?", (actor, key)
+            ).fetchone()
+            if row:
+                if row[0] != thread:
+                    raise ValueError("Conflicting stop idempotency key")
+            else:
+                order = self.db.execute(
+                    "SELECT value FROM admission_sequence WHERE id=1"
+                ).fetchone()[0]
+                self.db.execute(
+                    "INSERT INTO stop_boundaries VALUES(?,?,?,?)", (actor, key, thread, order)
+                )
+            return self.get_stop_boundary(actor, key)
+
+    def capture_stop_boundary(self, actor, thread, key):
+        """Commit the boundary and its cancellation intent together."""
+        with self.transaction():
+            receipt = self._record_stop_boundary(actor, thread, key)
+            self.cancel_thread(actor, thread, boundary=receipt)
+            return receipt
+
+    def legacy_stop_boundary(self, actor, thread, cutoff, *, migrating=False):
+        try:
+            if type(cutoff) not in {int, float} or not math.isfinite(float(cutoff)):
+                raise ValueError("Cancellation cutoff must be a finite timestamp")
+            cutoff = float(cutoff)
+        except OverflowError:
+            raise ValueError("Cancellation cutoff must be a finite timestamp") from None
+        key = "legacy-cutoff:" + cutoff.hex()
+        receipt_key = hashlib.sha256((thread + ":" + key).encode()).hexdigest()
+        with self.transaction():
+            try:
+                receipt = self.get_stop_boundary(actor, receipt_key)
+            except KeyError:
+                # Legacy bodies lack an admission receipt. Freeze their old
+                # timestamp selection once, so repeated delivery cannot widen it.
+                # Metadata is complete after startup. Only the one-time
+                # pre-metadata upgrade needs SQLite to inspect legacy JSON.
+                predicate = (
+                    "json_extract(data,'$.owner')=? "
+                    "AND json_extract(data,'$.origin_thread_id')=? "
+                    "AND json_extract(data,'$.created')<=?"
+                    if migrating
+                    else "owner=? AND origin_thread=? AND created<=?"
+                )
+                project_order = self.db.execute(
+                    "SELECT COALESCE(MAX(admission_order),0) FROM projects WHERE " + predicate,
+                    (actor, thread, cutoff),
+                ).fetchone()[0]
+                creation_order = self.db.execute(
+                    "SELECT COALESCE(MAX(admission_order),0) FROM creations "
+                    "WHERE actor=? AND origin_thread=? AND created<=?",
+                    (actor, thread, cutoff),
+                ).fetchone()[0]
+                # Bound length independently of the allowed origin identifier.
+                self.db.execute(
+                    "INSERT OR IGNORE INTO stop_boundaries VALUES(?,?,?,?)",
+                    (actor, receipt_key, thread, max(project_order, creation_order)),
+                )
+                receipt = self.get_stop_boundary(actor, receipt_key)
+            return receipt
+
+    def cancel_thread(self, actor, thread, *, cutoff=None, boundary=None):
+        thread = text(thread, "origin thread", 128)
+        if boundary is not None and cutoff is not None:
+            raise ValueError("Cancellation requires one recorded boundary")
+        with self.transaction():
+            if boundary is not None:
+                if (
+                    not isinstance(boundary, dict)
+                    or set(boundary) != {"key", "thread_id", "admission_order"}
+                    or type(boundary.get("admission_order")) is not int
+                    or boundary["admission_order"] < 0
+                ):
+                    raise ValueError("Cancellation boundary must be a captured receipt")
+                receipt = self.get_stop_boundary(actor, boundary.get("key"))
+                if receipt != boundary or receipt["thread_id"] != thread:
+                    raise ValueError("Cancellation boundary receipt changed")
+            elif cutoff is not None:
+                receipt = self.legacy_stop_boundary(actor, thread, cutoff)
+            else:
+                receipt = self._record_stop_boundary(actor, thread, identifier())
+            order = receipt["admission_order"]
             self.db.execute(
-                "INSERT INTO origin_stops VALUES(?,?,?) "
-                "ON CONFLICT(actor,thread) DO UPDATE SET cutoff=MAX(cutoff,excluded.cutoff)",
-                (actor, thread, boundary),
+                "INSERT INTO origin_stops(actor,thread,cutoff,admission_order) VALUES(?,?,?,?) "
+                "ON CONFLICT(actor,thread) DO UPDATE SET "
+                "cutoff=MAX(cutoff,excluded.cutoff),"
+                "admission_order=MAX(admission_order,excluded.admission_order)",
+                (actor, thread, float(cutoff) if cutoff is not None else 0.0, order),
             )
             rows = self.db.execute(
-                "SELECT id FROM projects WHERE owner=? AND origin_thread=? AND status='active'"
-                + (" AND created<=?" if cutoff is not None else ""),
-                (actor, thread, cutoff) if cutoff is not None else (actor, thread),
+                "SELECT id FROM projects WHERE owner=? AND origin_thread=? AND status='active' "
+                "AND admission_order<=?",
+                (actor, thread, order),
             ).fetchall()
             return [self.cancel(row[0], actor) for row in rows]
 

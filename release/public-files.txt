@@ -159,3 +159,4 @@ tests/test_thread_title.py
 tests/test_validate.py
 tests/test_wake.py
 uv.lock
+tests/test_collaboration_stop_order.py

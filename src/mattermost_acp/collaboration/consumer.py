@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import re
 import shlex
 import sys
 import time
@@ -68,10 +69,8 @@ class CollaborationConsumer:
         if self.pending_stops == []:
             self.pending_stops = {}
         if not isinstance(self.pending_stops, dict) or any(
-            not isinstance(thread, str)
-            or type(cutoff) not in {int, float}
-            or not math.isfinite(cutoff)
-            for thread, cutoff in self.pending_stops.items()
+            not isinstance(thread, str) or not self.valid_stop_intent(stop)
+            for thread, stop in self.pending_stops.items()
         ):
             raise ValueError("Pending project stops require explicit recorded boundaries")
         self.hub = HubClient(settings)
@@ -1451,24 +1450,94 @@ class CollaborationConsumer:
         # Cancellation remains visible and receives another deterministic delivery attempt.
         await self.update(item, "queued")
 
+    @staticmethod
+    def valid_stop_intent(stop):
+        if type(stop) in {int, float}:
+            try:
+                return math.isfinite(stop)
+            except OverflowError:
+                return False
+        return (
+            isinstance(stop, dict)
+            and set(stop) <= {"key", "phase", "boundary"}
+            and isinstance(stop.get("key"), str)
+            and re.fullmatch(r"[a-f0-9]{32}", stop["key"]) is not None
+            and stop.get("phase") in {"new", "uncertain", "captured"}
+            and (
+                stop["phase"] != "captured"
+                or (
+                    isinstance(stop.get("boundary"), dict)
+                    and stop["boundary"].get("key") == stop["key"]
+                    and isinstance(stop["boundary"].get("thread_id"), str)
+                    and type(stop["boundary"].get("admission_order")) is int
+                    and stop["boundary"]["admission_order"] >= 0
+                )
+            )
+        )
+
     def record_stop(self, thread):
-        cutoff = time.time()
-        self.pending_stops[thread] = cutoff
+        stop = {"key": uuid.uuid4().hex, "phase": "new"}
+        self.pending_stops[thread] = stop
         try:
             self.save_stops()
         except OSError:
             logger.warning("Project stop intent retained in memory; persistence unavailable")
-        return cutoff
+        return stop
+
+    def retain_stop(self, thread, previous, updated):
+        if self.pending_stops.get(thread) == previous:
+            self.pending_stops[thread] = updated
+            try:
+                self.save_stops()
+            except OSError:
+                logger.warning("Project stop boundary retained in memory; persistence unavailable")
 
     async def cancel_thread(self, thread, *, retry=False, cutoff=None):
+        # Retain the argument name for callers with saved legacy timestamps.
+        # New intents carry a key and a hub-issued admission-order receipt.
+        fresh_capture = not retry or cutoff is not None
         if not retry:
             cutoff = self.record_stop(thread)
         elif cutoff is None:
             cutoff = self.pending_stops[thread]
-        result = await self.hub.request(
-            "POST", "/cancel-thread", {"thread_id": thread, "cutoff": cutoff}
-        )
-        if self.pending_stops.get(thread) == cutoff:
+        if type(cutoff) in {int, float}:
+            result = await self.hub.request(
+                "POST", "/cancel-thread", {"thread_id": thread, "cutoff": cutoff}
+            )
+            confirmed = cutoff
+        else:
+            if not self.valid_stop_intent(cutoff):
+                raise ValueError("Invalid pending project stop")
+            stop = dict(cutoff)
+            current = self.pending_stops.get(thread)
+            if isinstance(current, dict) and current.get("key") == stop["key"]:
+                stop = dict(current)
+            elif stop["phase"] == "new":
+                raise ValueError("Uncaptured project stop was superseded")
+            if stop["phase"] == "new" and fresh_capture:
+                uncertain = {**stop, "phase": "uncertain"}
+                # Persist uncertainty before transport. A lost response must
+                # never cause a fresh capture to include newer admissions.
+                self.retain_stop(thread, stop, uncertain)
+                stop = uncertain
+                boundary = await self.hub.request(
+                    "POST", "/stop-boundaries", {"thread_id": thread, "key": stop["key"]}
+                )
+            elif stop["phase"] in {"new", "uncertain"}:
+                # 404 remains visible. Another process may have admitted newer
+                # work during the outage, so POST cannot be retried safely.
+                boundary = await self.hub.request("GET", "/stop-boundaries/" + stop["key"])
+            else:
+                boundary = stop["boundary"]
+            captured = {"key": stop["key"], "phase": "captured", "boundary": boundary}
+            if not self.valid_stop_intent(captured) or boundary["thread_id"] != thread:
+                raise ValueError("Hub stop boundary did not match its intent")
+            self.retain_stop(thread, stop, captured)
+            confirmed = captured
+            result = await self.hub.request(
+                "POST", "/cancel-thread", {"thread_id": thread, "boundary": boundary}
+            )
+        if self.pending_stops.get(thread) == confirmed:
             self.pending_stops.pop(thread)
         try:
             self.save_stops()

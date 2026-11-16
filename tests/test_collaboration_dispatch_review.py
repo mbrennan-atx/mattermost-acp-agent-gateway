@@ -490,7 +490,8 @@ async def test_stop_persists_boundary_and_cancels_projects_before_stalled_native
     async def hub_request(method, path, body=None):
         result = await actual_request(method, path, body)
         if path == "/cancel-thread":
-            assert body["cutoff"] == 1001.0
+            assert body["boundary"] == store.get_stop_boundary("alpha", body["boundary"]["key"])
+            assert body["boundary"]["thread_id"] == "origin"
             hub_finished.set()
         return result
 
@@ -518,9 +519,12 @@ async def test_stop_persists_boundary_and_cancels_projects_before_stalled_native
             )
         )
         await asyncio.wait_for(native_entered.wait(), 2)
-        newer = project(store)
         await asyncio.wait_for(hub_finished.wait(), 2)
-        assert recorded == [{"origin": 1001.0}]
+        newer = project(store)
+        assert len(recorded) == 1 and recorded[0]["origin"]["phase"] == "new"
+        assert (
+            store.get_stop_boundary("alpha", recorded[0]["origin"]["key"])["thread_id"] == "origin"
+        )
         assert not command.done()
         assert store.show(old["id"], "alpha")["status"] == "cancelled"
         assert store.show(newer["id"], "alpha")["status"] == "active"
