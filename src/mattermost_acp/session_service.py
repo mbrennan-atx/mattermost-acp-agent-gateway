@@ -543,8 +543,16 @@ class SessionService:
         plus ``reasoningEffort`` — same wire path as TUI ``/effort``.
         Returns ``(model_id, effort)``.
         """
+        captured = await self.store.get(thread_id)
+        captured_epoch = self.native_epoch(thread_id)
         async with self._thread_locks.setdefault(thread_id, asyncio.Lock()), self._global_sem:
             check_native_command_admission()
+            current = await self.store.get(thread_id)
+            if self.native_epoch(thread_id) != captured_epoch or (
+                (current.session_id if current else None)
+                != (captured.session_id if captured else None)
+            ):
+                raise NativeDispatchChanged("Native session changed while effort command waited")
             session_id = await self.ensure_session(thread_id)
             record = await self.store.get(thread_id)
             epoch = self.native_epoch(thread_id)
@@ -564,7 +572,13 @@ class SessionService:
             return resolved, effort
 
     async def cancel(
-        self, thread_id: str, *, expected_session=None, expected_epoch=None, guard=None
+        self,
+        thread_id: str,
+        *,
+        expected_session=None,
+        expected_epoch=None,
+        guard=None,
+        on_dispatched=None,
     ) -> bool:
         record = await self.store.get(thread_id)
         if record is None:
@@ -579,9 +593,13 @@ class SessionService:
                     and self.native_epoch(thread_id) == expected_epoch
                     and (guard is None or guard())
                 ),
+                **({"on_dispatched": on_dispatched} if on_dispatched is not None else {}),
             )
             return True
-        await self.broker.cancel(record.session_id)
+        await self.broker.cancel(
+            record.session_id,
+            **({"on_dispatched": on_dispatched} if on_dispatched is not None else {}),
+        )
         return True
 
     async def stop_async_task(

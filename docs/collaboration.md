@@ -105,6 +105,8 @@ mm-work retry REQUEST_ID --reconciliation 'Verified the previous attempt made no
 
 Retry retains old dispatch evidence as history and clears it for the new attempt. It creates a new claim nonce, so an old worker cannot settle the new attempt. Reply submission is idempotent for the same result. Keep completed work and evidence when rolling back the executable; never restore an older database over newer state.
 
+Routine mailbox deliveries, `GET /messages/REQUEST_ID` status reads and hub update receipts omit `delivery_history`. Read retained evidence with `GET /messages/REQUEST_ID?history=1` or `mm-work show PROJECT_ID`. An explicit `mm-work retry` receipt also includes that history after reconciliation. Empty queue fallbacks add no history entries. Existing inline histories migrate once into separate storage without dropping evidence. Direct store `get_message`, `show` and default `update` calls retain complete history receipts.
+
 A correlated answer can arrive while its native execution remains pending. After a gateway restart, that old execution blocks new asks and tasks to the participant in that project. Child results remain queued when their parent is unresolved and the receiving gateway cannot verify continuation ownership. Restarting a gateway does not authorize a new native turn for those results.
 
 Inspect an actor's retained claims with authenticated `GET /claims`. This read includes earlier gateway instances and does not change their leases or ownership. When a terminal request still has pending execution, the recorded recipient can settle it through `POST /messages/REQUEST_ID/update`, even after its old gateway instance has disappeared. Supply the stored `instance` and `claim`, `state: "execution_settled"`, the matching `expected_execution_id`, and verified native `evidence`: matching `session_id` and `execution_id`, `native_dispatched: true`, a terminal `stop_reason`, `pending: false`, and finite `completed_at` at or after the recorded dispatch time. Matching identity alone is insufficient; obtain the evidence from the native execution before submitting it. Verified settlement preserves the answer and makes new project requests admissible. It does not replay the old request.
@@ -158,4 +160,8 @@ Project elapsed budgets start at durable creation intent. On Linux, BOOTTIME and
 
 Native child background commands retain task identity, stop capability and ownership from their observed initial tool calls. Project cancellation can stop an owned command through the root native session after the child's foreground finishes. A stop acknowledgement retains pending execution until its matching task lifecycle reports termination. Duplicate task IDs from different sources leave stop ownership ambiguous.
 
+Deadline observers share concurrent stop attempts and record root cancellation dispatch after writing its native bytes. A timeout or task cancellation before that write remains eligible for a guarded local retry while the hub is unavailable. Written cancellation requests and ambiguous write failures retain unresolved execution until native evidence settles it.
+
 Model and effort persistence share the session-preparation lock with replacement. Replacement cancellation waits for an ongoing settings commit, and a replacement that already changed the session or epoch prevents stale persistence.
+
+Queued effort commands capture their session identity and epoch before waiting for execution capacity. Replacement while they wait rejects the old command and preserves the replacement's native and stored settings.

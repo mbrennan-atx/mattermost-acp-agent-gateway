@@ -84,6 +84,9 @@ class CollaborationStore:
                 recipient TEXT, kind TEXT NOT NULL, state TEXT NOT NULL,
                 created REAL NOT NULL, key TEXT NOT NULL, data TEXT NOT NULL,
                 UNIQUE(project, sender, key));
+            CREATE TABLE IF NOT EXISTS delivery_history(
+                message TEXT NOT NULL, sequence INTEGER NOT NULL, data TEXT NOT NULL,
+                PRIMARY KEY(message,sequence));
             CREATE INDEX IF NOT EXISTS mailbox ON messages(recipient,state,created);
             CREATE INDEX IF NOT EXISTS mailbox_priority ON messages(
                 recipient,state,CASE kind WHEN 'cancel' THEN 0 WHEN 'result' THEN 1
@@ -194,6 +197,12 @@ class CollaborationStore:
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS unresolved_creation ON creations(channel,unresolved)"
             )
+            # Move legacy inline history once. Routine message reads/writes
+            # must stay independent of the retained execution evidence count.
+            for row in self.db.execute(
+                "SELECT data FROM messages WHERE json_type(data,'$.delivery_history') IS NOT NULL"
+            ).fetchall():
+                self.save_message(json.loads(row[0]))
         # A new hub process cannot establish what a crashed native turn did.
         with self.transaction():
             for row in self.db.execute("SELECT data FROM messages WHERE state='running'"):
@@ -356,6 +365,16 @@ class CollaborationStore:
             )
 
     def save_message(self, item):
+        if "delivery_history" in item:
+            self.db.executemany(
+                "INSERT INTO delivery_history(message,sequence,data) VALUES(?,?,?) "
+                "ON CONFLICT(message,sequence) DO UPDATE SET data=excluded.data "
+                "WHERE delivery_history.data<>excluded.data",
+                (
+                    (item["id"], sequence, json.dumps(evidence))
+                    for sequence, evidence in enumerate(item["delivery_history"])
+                ),
+            )
         debt = item.get("execution_pending")
         if debt is None:
             evidence = item.get("evidence") or {}
@@ -380,7 +399,9 @@ class CollaborationStore:
                 item["state"],
                 item["created"],
                 item["key"],
-                json.dumps(item),
+                json.dumps(
+                    {key: value for key, value in item.items() if key != "delivery_history"}
+                ),
                 int(debt == 1),
             ),
         )
@@ -395,12 +416,31 @@ class CollaborationStore:
         return item
 
     def get_message(self, mid, actor):
+        item = self.message_record(mid, actor)
+        item["delivery_history"] = [
+            json.loads(row[0])
+            for row in self.db.execute(
+                "SELECT data FROM delivery_history WHERE message=? ORDER BY sequence", (mid,)
+            )
+        ]
+        return item
+
+    def message_record(self, mid, actor):
         row = self.db.execute("SELECT data FROM messages WHERE id=?", (mid,)).fetchone()
         if row is None:
             raise KeyError("Unknown message")
         item = json.loads(row[0])
         self.get_project(item["project"], actor)
         return item
+
+    def archive_delivery(self, item):
+        evidence = item.get("evidence")
+        if evidence:
+            self.db.execute(
+                "INSERT INTO delivery_history(message,sequence,data) "
+                "SELECT ?,COALESCE(MAX(sequence)+1,0),? FROM delivery_history WHERE message=?",
+                (item["id"], json.dumps(evidence), item["id"]),
+            )
 
     def remaining_seconds(self, project):
         deadline = project.get("elapsed_deadline")
@@ -757,9 +797,9 @@ class CollaborationStore:
     def show(self, pid, actor):
         item = self.get_project(pid, actor)
         item["messages"] = [
-            json.loads(row[0])
+            self.get_message(row[0], actor)
             for row in self.db.execute(
-                "SELECT data FROM messages WHERE project=? ORDER BY created,id", (pid,)
+                "SELECT id FROM messages WHERE project=? ORDER BY created,id", (pid,)
             )
         ]
         item["notes"] = [
@@ -824,7 +864,7 @@ class CollaborationStore:
             parent_id = body.get("parent")
             depth = 0
             if parent_id:
-                parent = self.get_message(parent_id, actor)
+                parent = self.message_record(parent_id, actor)
                 if parent["project"] != pid or parent["recipient"] != actor:
                     raise PermissionError("Delegation parent must be addressed to the sender")
                 depth = parent["depth"] + 1
@@ -835,7 +875,7 @@ class CollaborationStore:
             if not isinstance(dependencies, list) or len(dependencies) > 100:
                 raise ValueError("dependencies must be a bounded list")
             for dependency in dependencies:
-                dep = self.get_message(dependency, actor)
+                dep = self.message_record(dependency, actor)
                 if dep["project"] != pid or dep["kind"] not in WORK:
                     raise ValueError("Dependency must be project work")
             if project["dispatched"] >= project["limits"]["max_turns"]:
@@ -870,7 +910,7 @@ class CollaborationStore:
             if parent_id in seen:
                 raise ValueError("Delegation ancestry is invalid")
             seen.add(parent_id)
-            parent = self.get_message(parent_id, actor)
+            parent = self.message_record(parent_id, actor)
             if parent["project"] != pid:
                 raise ValueError("Delegation ancestry belongs to another project")
             if recipient in {parent["sender"], parent.get("recipient")}:
@@ -998,7 +1038,7 @@ class CollaborationStore:
                     ).fetchone():
                         continue
                     if any(
-                        self.get_message(dep, actor)["state"] != "done"
+                        self.message_record(dep, actor)["state"] != "done"
                         for dep in item["dependencies"]
                     ):
                         continue
@@ -1014,7 +1054,9 @@ class CollaborationStore:
                         # its slot yet. Loan one slot per active parent, bounded
                         # by depth and a hard total ceiling. Siblings serialize.
                         parent = (
-                            self.get_message(item["parent"], actor) if item.get("parent") else None
+                            self.message_record(item["parent"], actor)
+                            if item.get("parent")
+                            else None
                         )
                         sibling = self.db.execute(
                             "SELECT 1 FROM messages WHERE project=? AND kind IN ('ask','work') "
@@ -1056,9 +1098,9 @@ class CollaborationStore:
                 self.save_message(item)
                 continuation = {}
                 if item["kind"] == "result" and item.get("parent"):
-                    child = self.get_message(item["parent"], actor)
+                    child = self.message_record(item["parent"], actor)
                     if child.get("parent"):
-                        parent = self.get_message(child["parent"], actor)
+                        parent = self.message_record(child["parent"], actor)
                         continuation["continuation_parent"] = parent["id"]
                         for source, target in (
                             ("claim", "continuation_claim"),
@@ -1093,11 +1135,36 @@ class CollaborationStore:
         claim=None,
         *,
         expected_execution_id=None,
+        include_history=True,
+    ):
+        receipt = self._update(
+            mid,
+            actor,
+            instance,
+            state,
+            result,
+            evidence,
+            claim,
+            expected_execution_id=expected_execution_id,
+        )
+        return self.get_message(mid, actor) if include_history else receipt
+
+    def _update(
+        self,
+        mid,
+        actor,
+        instance,
+        state,
+        result="",
+        evidence=None,
+        claim=None,
+        *,
+        expected_execution_id=None,
     ):
         with self.transaction():
             if isinstance(result, str):
                 result = result.strip()
-            item = self.get_message(mid, actor)
+            item = self.message_record(mid, actor)
             if (
                 item["recipient"] != actor
                 or item.get("instance") != instance
@@ -1229,7 +1296,7 @@ class CollaborationStore:
                 raise PermissionError("Delivery is no longer owned by this worker")
             if state in {"dispatch", "post_dispatch"}:
                 self.expire()
-                item = self.get_message(mid, actor)
+                item = self.message_record(mid, actor)
                 project = self.get_project(item["project"], actor)
                 if item["state"] != "running" or project["status"] != "active":
                     return item
@@ -1268,7 +1335,7 @@ class CollaborationStore:
                 item["evidence"]["not_dispatched"] = True
                 item["execution_pending"] = False
             elif state == "queued" and item["state"] == "running":
-                item.setdefault("delivery_history", []).append(item["evidence"])
+                self.archive_delivery(item)
                 item["evidence"] = {}
                 item["execution_pending"] = False
                 item.update(state="queued", not_before=self.clock() + 2)
@@ -1295,7 +1362,7 @@ class CollaborationStore:
                     self.save_message(item)
                     return item
                 if item["kind"] in WORK and state != "cancelled":
-                    return self.reply(
+                    return self._reply(
                         mid, actor, result, state=state, evidence=evidence, claim=claim
                     )
                 item.update(
@@ -1311,8 +1378,12 @@ class CollaborationStore:
             return item
 
     def reply(self, mid, actor, result, *, state="done", evidence=None, claim=None):
+        self._reply(mid, actor, result, state=state, evidence=evidence, claim=claim)
+        return self.get_message(mid, actor)
+
+    def _reply(self, mid, actor, result, *, state="done", evidence=None, claim=None):
         with self.transaction():
-            item = self.get_message(mid, actor)
+            item = self.message_record(mid, actor)
             if item["recipient"] != actor or item["kind"] not in WORK:
                 raise PermissionError("Only the addressed worker can reply")
             if (item.get("attempt", 0) > 1 and claim != item.get("claim")) or (
@@ -1380,7 +1451,7 @@ class CollaborationStore:
 
     def retry(self, mid, actor, reconciliation):
         with self.transaction():
-            item = self.get_message(mid, actor)
+            item = self.message_record(mid, actor)
             project = self.get_project(item["project"], actor)
             if actor not in {project["owner"], item["recipient"]}:
                 raise PermissionError("Only owner or recipient can reconcile delivery")
@@ -1393,7 +1464,7 @@ class CollaborationStore:
                     raise ValueError("Project dispatch limit reached")
                 project["dispatched"] += 1
                 self.save_project(project)
-            item.setdefault("delivery_history", []).append(item["evidence"])
+            self.archive_delivery(item)
             item["evidence"] = {}
             item["execution_pending"] = False
             item.update(
@@ -1403,7 +1474,7 @@ class CollaborationStore:
                 not_before=0,
             )
             self.save_message(item)
-            return item
+            return self.get_message(mid, actor)
 
     def cancel(self, pid, actor):
         with self.transaction():

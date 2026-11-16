@@ -36,42 +36,118 @@ def _setup_logging(log_file) -> None:
         root.addHandler(fh)
 
 
+_WORKSPACE_GUARD_SUPERVISOR = """
+import os, selectors, signal, subprocess, sys, threading
+
+# Only this still-live group member can authorize its group signal.
+if os.getpgrp() != os.getpid():
+    raise SystemExit(125)
+try:
+    control = int(sys.argv[1])
+    guard = subprocess.Popen(sys.argv[2:], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+    ready_read, ready_write = os.pipe()
+    def finished():
+        guard.wait()
+        os.write(ready_write, b"x")
+    threading.Thread(target=finished, daemon=True).start()
+    selector = selectors.DefaultSelector()
+    selector.register(control, selectors.EVENT_READ, "cancel")
+    selector.register(ready_read, selectors.EVENT_READ, "finished")
+    for key, _ in selector.select():
+        if key.data == "finished":
+            os.write(1, (str(guard.returncode) + "\\n").encode("ascii"))
+        break
+finally:
+    # The supervisor remains in this group even after the guard is reaped.
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+"""
+
+
+async def _finish_guard_task(task):
+    """Retain launch/wait ownership through repeated caller cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
 def build_workspace_guard(command, *, timeout_s=15):
     """Run an optional trusted executable before native session admission."""
     if not command:
         return None
 
     async def verify(thread_id, cwd, prior_session):
-        process = None
+        process, launch = None, None
+        control_read, control_write = None, None
         try:
             async with asyncio.timeout(timeout_s):
-                process = await asyncio.create_subprocess_exec(
-                    command,
-                    thread_id,
-                    str(cwd),
-                    prior_session or "",
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    start_new_session=os.name == "posix",
+                arguments = [command, thread_id, str(cwd), prior_session or ""]
+                options = {}
+                if os.name == "posix":
+                    control_read, control_write = os.pipe()
+                    arguments = [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-c",
+                        _WORKSPACE_GUARD_SUPERVISOR,
+                        str(control_read),
+                        *arguments,
+                    ]
+                    options = {
+                        "pass_fds": (control_read,),
+                        "start_new_session": True,
+                    }
+                launch = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        *arguments,
+                        stdout=(
+                            asyncio.subprocess.PIPE
+                            if os.name == "posix"
+                            else asyncio.subprocess.DEVNULL
+                        ),
+                        stderr=asyncio.subprocess.DEVNULL,
+                        **options,
+                    )
                 )
-                if await process.wait():
+                process = await asyncio.shield(launch)
+                if os.name == "posix":
+                    result = await process.stdout.readline()
+                    refused = result != b"0\n" or await process.wait() != -signal.SIGKILL
+                else:
+                    refused = await process.wait() != 0
+                if refused:
                     raise NativeDispatchChanged("Workspace verification refused native preparation")
         except BaseException as exc:
+            # Closing the lease lets the live supervisor terminate its own group.
+            # Never signal a numeric group ID belonging to a reaped process.
+            if control_write is not None:
+                os.close(control_write)
+                control_write = None
+            if launch is not None:
+                try:
+                    process = await _finish_guard_task(launch)
+                except BaseException:
+                    process = None
             if process is not None:
                 try:
-                    if os.name == "posix":
-                        # Descendants can outlive an exited guard in its owned group.
-                        os.killpg(process.pid, signal.SIGKILL)
-                    elif process.returncode is None:
+                    if os.name != "posix" and process.returncode is None:
                         process.kill()
                 except ProcessLookupError:
                     pass
-                await process.wait()
+                await _finish_guard_task(asyncio.create_task(process.wait()))
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise NativeDispatchChanged(
                 "Workspace verification refused native preparation"
             ) from exc
+        finally:
+            for descriptor in (control_read, control_write):
+                if descriptor is not None:
+                    os.close(descriptor)
 
     return verify
 

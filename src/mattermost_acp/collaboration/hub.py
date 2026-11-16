@@ -311,6 +311,7 @@ def build_app(
                 body.get("evidence"),
                 body.get("claim"),
                 expected_execution_id=body.get("expected_execution_id"),
+                include_history=False,
             )
         elif action == "reply":
             result = store.reply(
@@ -394,9 +395,10 @@ def build_app(
 
     async def message(request):
         store.expire()
+        read = store.get_message if request.query.get("history") == "1" else store.message_record
         return web.json_response(
             store.deadline_receipt(
-                store.get_message(request.match_info["mid"], request["actor"]), request["actor"]
+                read(request.match_info["mid"], request["actor"]), request["actor"]
             )
         )
 

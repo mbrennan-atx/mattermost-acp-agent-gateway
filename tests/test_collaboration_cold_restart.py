@@ -200,7 +200,8 @@ async def test_refused_cold_restart_restores_normal_admission_and_retains_work(
                 for key, value in receipt.items()
                 if key
                 not in {"project_deadline", "project_remaining_seconds", "local_project_deadline"}
-            } == debt
+            } == {key: value for key, value in debt.items() if key != "delivery_history"}
+            assert "delivery_history" not in receipt
         if boundary == "inbound-timeout":
             assert gateway._inbound_tasks == {"pending-inbound"}
         assert_no_native(gateway, consumer)

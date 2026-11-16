@@ -46,6 +46,8 @@ class CollaborationConsumer:
         self.project_deadlines = {}
         self.deadline_tasks = {}
         self.deadline_stops = set()
+        self.deadline_attempts = set()
+        self.deadline_uncertain = set()
         self.settled_projects = set()
         self.deadline_cleanup_cursor = 0
         self.rejected_reservations = {}
@@ -346,6 +348,8 @@ class CollaborationConsumer:
         self.project_deadlines.pop(pid, None)
         self.hub.deadlines.pop(pid, None)
         self.deadline_stops = {stop for stop in self.deadline_stops if stop[0] != pid}
+        self.deadline_attempts = {stop for stop in self.deadline_attempts if stop[0] != pid}
+        self.deadline_uncertain = {stop for stop in self.deadline_uncertain if stop[0] != pid}
         self.settled_projects.discard(pid)
         return True
 
@@ -371,7 +375,7 @@ class CollaborationConsumer:
             selected = (pending[start:] + pending[:start])[:4]
             self.deadline_cleanup_cursor = start + len(selected)
             for pid in selected:
-                await self.refresh_budget(pid)
+                await self.enforce_deadline(pid)
 
     async def deadline_work(self, item, operation):
         try:
@@ -447,32 +451,49 @@ class CollaborationConsumer:
             if not still_owned():
                 continue
             stop = (pid, session, execution, epoch)
-            if stop in self.deadline_stops:
+            if (
+                stop in self.deadline_stops
+                or stop in self.deadline_attempts
+                or stop in self.deadline_uncertain
+            ):
                 continue
-            # Timer replacement and other expiry observers can overlap. Keep
-            # the original bounded stop attempt uncertain rather than repeat it.
-            self.deadline_stops.add(stop)
+            # Overlapping observers share one attempt. Only the physical write
+            # callback establishes dispatch; waiting on a lock is retryable.
+            self.deadline_attempts.add(stop)
             handled.add(id(owned))
-            await self.stop_owned_async_tasks(
-                binding["thread_id"],
-                owned["reporter"],
-                session=session,
-                epoch=epoch,
-                guard=still_owned,
-            )
+
+            def dispatched(stop=stop):
+                self.deadline_stops.add(stop)
+
             try:
+                await self.stop_owned_async_tasks(
+                    binding["thread_id"],
+                    owned["reporter"],
+                    session=session,
+                    epoch=epoch,
+                    guard=still_owned,
+                    stopped=owned.setdefault("async_stop_requested", set()),
+                )
                 async with asyncio.timeout(3):
                     await self.gateway.sessions.cancel(
                         binding["thread_id"],
                         expected_session=session,
                         expected_epoch=epoch,
                         guard=still_owned,
+                        on_dispatched=dispatched,
                     )
             except asyncio.CancelledError:
                 raise
+            except (TimeoutError, NativeDispatchChanged):
+                # No asynchronous boundary separates the write and callback.
+                # An interrupted wait with no callback therefore wrote nothing.
+                logger.warning("Project deadline cancellation did not complete")
             except Exception:
                 # A refused/ambiguous stop cannot prove that native work ended.
+                self.deadline_uncertain.add(stop)
                 logger.warning("Project deadline reached; native cancellation remains unresolved")
+            finally:
+                self.deadline_attempts.discard(stop)
         await self.refresh_budget(pid)
 
     async def stop_owned_async_tasks(
@@ -645,6 +666,15 @@ class CollaborationConsumer:
             and bool(state.get("reconciliation"))
         )
         if cancelled_retry and report is not None and terminal:
+            if "delivery_history" not in state:
+                state = await self.hub.request("GET", "/messages/" + key[0] + "?history=1")
+                if (
+                    state.get("claim") != key[1]
+                    or state.get("state") != "cancelled"
+                    or self.ownership.get(key) is not report
+                    or key in self.reserving
+                ):
+                    return
             evidence = next(
                 (
                     prior

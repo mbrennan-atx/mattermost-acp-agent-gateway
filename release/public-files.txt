@@ -118,6 +118,7 @@ tests/test_collaboration_final_dispatch_review.py
 tests/test_collaboration_native_creation_review.py
 tests/test_collaboration_provisional_steering.py
 tests/test_collaboration_reply_artifacts.py
+tests/test_collaboration_retry_boundaries.py
 tests/test_collaboration_cold_restart.py
 tests/test_collaboration_history_indexes.py
 tests/test_collaboration_gateway_delivery_regressions.py
