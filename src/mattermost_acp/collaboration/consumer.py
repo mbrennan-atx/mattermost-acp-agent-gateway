@@ -1536,10 +1536,10 @@ class CollaborationConsumer:
             return []
         return sorted(
             task_id
-            for task_id, task in reporter.async_tasks.items()
+            for task_id, task in getattr(reporter, "async_tasks", {}).items()
             if task.get("state") == "stopped"
             and task.get("owned") is True
-            and task.get("toolCallId") in reporter.observed_tools
+            and task.get("toolCallId") in getattr(reporter, "observed_tools", set())
         )
 
     async def handle_cancel(self, item):
