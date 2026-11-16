@@ -710,6 +710,8 @@ def test_attempt_evidence_notes_reserved_keys_and_whitespace(tmp_path):
     assert not store.get_message(m["id"], "alpha")["evidence"]
     now = store.clock()
     store.clock = lambda: now + 3
+    prior_elapsed = store.elapsed
+    store.elapsed = lambda: prior_elapsed() + 3
     store.claim_next("beta", "worker")
     claim = store.get_message(m["id"], "alpha")["claim"]
     store.update(m["id"], "beta", "worker", "done", "Verified.\n", claim=claim)

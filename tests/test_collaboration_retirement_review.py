@@ -332,6 +332,8 @@ async def test_rejected_continuation_restores_parent_and_cancels_discarded_progr
 
             clock = store.clock
             store.clock = lambda: clock() + 3
+            prior_elapsed = store.elapsed
+            store.elapsed = lambda: prior_elapsed() + 3
             reclaimed = store.claim_next("beta", consumer.instance)
             assert reclaimed["id"] == delivery["id"]
             assert (await consumer.continuation(reclaimed))["report"] is old

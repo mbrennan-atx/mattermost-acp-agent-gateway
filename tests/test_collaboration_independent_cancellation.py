@@ -185,6 +185,8 @@ async def test_hub_accepted_child_stop_is_once_and_waits_for_matching_lifecycle(
         gateway._last_terminal["discussion"] = terminal(stop_reason="cancelled")
         next_poll = store.clock() + 3
         store.clock = lambda: next_poll
+        prior_elapsed = store.elapsed
+        store.elapsed = lambda: prior_elapsed() + 3
         control = store.claim_next("beta", consumer.instance, controls_only=True)
         assert control is not None
         await consumer.handle_cancel(control)
