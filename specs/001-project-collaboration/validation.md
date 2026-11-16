@@ -2,7 +2,7 @@
 
 ## Current local checks
 
-- Python 3.12.15 with locked dependencies: 795 parent-verified tests pass with one optional installed Codex adapter fixture skipped in 122.62 seconds. This combined suite includes restart ownership, legacy debt and bounded guard-timeout coverage.
+- Python 3.12.15 with locked dependencies: 806 parent-verified tests pass with one optional installed Codex adapter fixture skipped in 117.72 seconds. Both final native write-race variants also pass separately; source behavior is unchanged from the full-suite run. This suite includes restart ownership, legacy debt and bounded guard-timeout coverage.
 - Ruff passes across the repository. Formatting passes for all 31 changed Python files. Existing formatting differences in untouched files are outside this change.
 - Focused continuation, result, creation, delegation and dispatch checks pass. Regression coverage includes actual broker generations, pre-write loaded-session loss, predecessor work after stop, original owner result routing and cancellation during creation/read-back or hub recovery.
 - Preceding full-branch Sol/high reports and finalized synthesis were inspected. All supported findings have fixes and meaningful regressions. Latest fixes reject unknown and unverified authors in registered discussions, retain ordinary behavior outside projects, and apply expiry inside dispatch transactions after native preparation. A fresh committed-source review precedes publication.
@@ -62,3 +62,5 @@ Before claiming deployment acceptance, complete final committed-source review, e
 The live pilot covers cold Cursor retirement and reapply, durable queued work across an owned hub restart, actual peer answers, busy follow-up delivery, addressed floor requests, owner origin-post read-back, durable CLI receipts, isolated native cancellation and actual native Codex/Gemini exchanges. Verify the original home-shell wrapper independently and leave warmed clients running.
 
 Private runtime identities, credentials, configuration snapshots, native transcripts and detailed rollout receipts remain outside this public repository.
+
+Final inherited-debt fixes fence ordinary prompts, independent results, steering and reservation at native write admission. A recovery read arriving during preparation cancels only the unaccepted provisional turn and preserves its predecessor. Retained non-dispatch evidence settles cancellation only after the hub verifies current claim, execution and epoch. The affected worker suite passes 202 cases, including the final prompt/steering write races; parent independently verified the complete 806-case suite and both final race variants.

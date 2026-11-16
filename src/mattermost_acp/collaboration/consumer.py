@@ -167,6 +167,11 @@ class CollaborationConsumer:
             if mark_unknown is not None:
                 await mark_unknown()
         self.inherited_claims = inherited
+        for report in self.gateway.live_reports():
+            if report.get("preparing") and self.inherited_thread_pending(report.get("thread_id")):
+                # Native dispatch rechecks cancel_requested at its write fence.
+                # Only refuse this provisional turn; never cancel its predecessor.
+                report["cancel_requested"] = True
         self.recovery_pending = False
         self.gateway.collaboration_recovery_pending = False
 
@@ -259,8 +264,18 @@ class CollaborationConsumer:
         )
 
     def owns_thread(self, thread):
-        return thread in self.ownership_threads.values() or any(
-            report and report.get("thread_id") == thread for report in self.ownership.values()
+        return (
+            self.inherited_thread_pending(thread)
+            or thread in self.ownership_threads.values()
+            or any(
+                report and report.get("thread_id") == thread for report in self.ownership.values()
+            )
+        )
+
+    def inherited_thread_pending(self, thread):
+        return any(
+            item.get("binding", {}).get("thread_id") in {None, thread}
+            for item in self.inherited_claims
         )
 
     def release_ownership(self, key):
@@ -448,7 +463,8 @@ class CollaborationConsumer:
     def continuation_idle(self, info, *, reserved=False):
         report = info["report"]
         return (
-            not self.gateway.sessions.is_busy(info["thread"])
+            not self.inherited_thread_pending(info["thread"])
+            and not self.gateway.sessions.is_busy(info["thread"])
             and not report.get("active")
             and report.get("foreground_complete")
             and not report["reporter"].has_pending_work()
@@ -689,6 +705,9 @@ class CollaborationConsumer:
                 )
                 return
             thread = binding["thread_id"]
+            if self.inherited_thread_pending(thread):
+                await self.update(item, "queued")
+                return
             # Verify the declared discussion/binding before creating native work.
             post = await self.gateway.client.get_post(thread)
             if post.get("channel_id") != binding["channel_id"] or post.get("root_id"):
@@ -742,7 +761,8 @@ class CollaborationConsumer:
                         expected_session=record.session_id,
                         expected_epoch=item["native_epoch"],
                         guard=lambda: (
-                            is_loaded(record.session_id)
+                            not self.inherited_thread_pending(thread)
+                            and is_loaded(record.session_id)
                             and report is not None
                             and self.gateway._reports.get(record.session_id) is report
                             and self.ownership.get((item["id"], item.get("claim"))) is report
@@ -960,6 +980,9 @@ class CollaborationConsumer:
         return receipt
 
     async def reserve(self, item, session):
+        if self.inherited_thread_pending(item["binding"]["thread_id"]):
+            await self.update(item, "queued")
+            return False
         report = self.gateway._reports.get(session)
         if report is None or not report.get("execution_id"):
             current = await self.hub.request("GET", "/messages/" + item["id"])
@@ -1019,6 +1042,7 @@ class CollaborationConsumer:
                 receipt["state"] == "running"
                 and receipt.get("claim") == item.get("claim")
                 and key not in self.cancelled_claims
+                and not self.inherited_thread_pending(item["binding"]["thread_id"])
             )
             if accepted:
                 item["native_epoch"] = epoch
@@ -1061,7 +1085,29 @@ class CollaborationConsumer:
                 await asyncio.sleep(1)
                 continue
             binding = target.get("binding", item["binding"])
-            expected = target.get("evidence", {}).get("session_id")
+            reserved = target.get("evidence", {})
+            expected = reserved.get("session_id")
+            if (
+                expected
+                and reserved.get("execution_id")
+                and reserved.get("native_dispatched") is False
+                and reserved.get("not_dispatched") is True
+                and target.get("execution_pending") is False
+            ):
+                # Revalidate the stored proof against this claim's current
+                # reservation, including execution and epoch, before settling it.
+                await self.hub.request(
+                    "POST",
+                    f"/messages/{target['id']}/update",
+                    {
+                        "instance": target.get("instance"),
+                        "claim": target.get("claim"),
+                        "state": "undispatched",
+                        "expected_execution_id": reserved["execution_id"],
+                        "evidence": reserved,
+                    },
+                )
+                continue
             if not expected:
                 await self.hub.request(
                     "POST",
