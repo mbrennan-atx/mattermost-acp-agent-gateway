@@ -620,6 +620,7 @@ def test_failed_result_prompt_preserves_status_parent_and_evidence(tmp_path):
     )
     result = store.claim_next("alpha", "owner")
     consumer = object.__new__(CollaborationConsumer)
+    consumer.gateway = SimpleNamespace(config=SimpleNamespace(collab_cli_command=None))
     prompt = consumer.prompt(result)
     assert "Result status: blocked" in prompt
     assert m["id"] in prompt and "https://example.com/failure" in prompt
@@ -1030,6 +1031,7 @@ def test_result_requeue_preserves_peer_provenance_and_artifacts(tmp_path):
     store.update(result["id"], "alpha", "owner", "queued")
     queued = store.get_message(result["id"], "alpha")
     consumer = object.__new__(CollaborationConsumer)
+    consumer.gateway = SimpleNamespace(config=SimpleNamespace(collab_cli_command=None))
     prompt = consumer.prompt({**result, **queued})
     assert "peer-native" in prompt and "https://example.com/proof" in prompt
     store.close()

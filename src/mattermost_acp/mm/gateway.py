@@ -818,7 +818,8 @@ class MattermostGateway:
         state = {
             "draining": self.draining,
             "sealed": self.sealed,
-            "restart_pending": self._restart_pending or any(
+            "restart_pending": self._restart_pending
+            or any(
                 task.get_name() == "mattermost-acp-restart" and not task.done()
                 for task in self._slash_tasks
             ),
