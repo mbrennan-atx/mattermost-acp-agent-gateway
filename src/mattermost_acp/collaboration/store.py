@@ -1078,7 +1078,18 @@ class CollaborationStore:
         self.save_message(item)
         return False
 
+    def has_timed_work(self) -> bool:
+        """Return True when any active project, running lease, or queued message exists."""
+        row = self.db.execute(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE status='active') "
+            "OR EXISTS(SELECT 1 FROM messages WHERE state IN ('running','queued'))"
+        ).fetchone()
+        return bool(row and row[0])
+
     def claim_next(self, actor, instance, *, controls_only=False):
+        self.last_claim_had_timed_work = self.has_timed_work()
+        if not self.last_claim_had_timed_work:
+            return None
         with self.transaction():
             self.expire()
             for item in self.queued_candidates(actor, controls_only):

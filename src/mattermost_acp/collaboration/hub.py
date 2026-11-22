@@ -379,17 +379,26 @@ def build_app(
             item = store.claim_next(
                 request["actor"], instance, controls_only=controls_only or mode == "controls"
             )
+            now = asyncio.get_running_loop().time()
             if (
                 item is not None
-                or asyncio.get_running_loop().time() >= deadline
+                or now >= deadline
                 or (mode == "controls" and not controls_only)
             ):
                 if item is not None:
                     item["project_mailbox_wait_seconds"] = waited
                 return web.json_response(item)
+            remaining = max(0.0, deadline - now)
+            poll_timeout = (
+                min(1.0, remaining)
+                if getattr(store, "last_claim_had_timed_work", True)
+                else remaining
+            )
             try:
-                # Deterministic lease/deadline checks; no model is polled or woken.
-                await asyncio.wait_for(changed.wait(), timeout=min(1, wait))
+                # Deterministic 1s lease/deadline checks while active/queued work
+                # exists; when completely idle, wait until a POST sets changed or
+                # the long-poll window ends.
+                await asyncio.wait_for(changed.wait(), timeout=poll_timeout)
             except TimeoutError:
                 pass
 
