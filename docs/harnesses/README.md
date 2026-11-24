@@ -6,15 +6,15 @@ availability. Install and authenticate the selected client separately. These
 capabilities describe the implementation; installed versions and account access
 still determine what a particular deployment can use.
 
-| Capability | Grok Build | Claude Code | Codex | Cursor |
-|---|---|---|---|---|
-| Launch | `grok agent stdio` | `claude-agent-acp` | `codex-acp` | `cursor-agent acp` |
-| Resume/load | Advertised ACP capability | Advertised ACP capability | Advertised ACP capability | Load plus gateway rehydration handling |
-| Model/effort | Model extension and effort fields | Config options `model` / `effort` | Config options `model` / `reasoning_effort` | Native model IDs and effort variants |
-| Active steering | Only if advertised | `_session/steering` | Requires `promptRequired` capability | Only if advertised |
-| Connector status | `grok mcp doctor` | `claude mcp list` | `codex mcp list/get` | `cursor-agent mcp list/list-tools` |
-| Passthroughs | Grok catalog | `/context`, `/compact` forwarded | `/context`, `/compact` forwarded | Unavailable |
-| Worker events | Render recognized events | Render recognized events | Async-task events prolong collection | Render recognized events |
+| Capability | Grok Build | Claude Code | Codex | Cursor | Antigravity (`agy`) |
+|---|---|---|---|---|---|
+| Launch | `grok agent stdio` | `claude-agent-acp` | `codex-acp` | `cursor-agent acp` | `agy acp` |
+| Resume/load | Advertised ACP capability | Advertised ACP capability | Advertised ACP capability | Load plus gateway rehydration handling | Advertised ACP capability |
+| Model/effort | Model extension and effort fields | Config options `model` / `effort` | Config options `model` / `reasoning_effort` | Native model IDs and effort variants | Config options `model` / `thought_level` |
+| Active steering | Only if advertised | `_session/steering` | Requires `promptRequired` capability | Only if advertised | Only if advertised |
+| Connector status | `grok mcp doctor` | `claude mcp list` | `codex mcp list/get` | `cursor-agent mcp list/list-tools` | `agy mcp list` or configured `AGY_MCP_SERVERS_FILE` |
+| Passthroughs | Grok catalog | `/context`, `/compact` forwarded | `/context`, `/compact` forwarded | Unavailable | Unavailable |
+| Worker events | Render recognized events | Render recognized events | Async-task events prolong collection | Render recognized events | Render recognized events |
 
 Session resume/load is negotiated, not inferred from the provider name. The
 gateway preserves thread mappings and re-applies model/effort settings after
@@ -34,4 +34,6 @@ info are rejected on other harnesses. Cursor's interactive plan/question UI is
 not implemented by this transport.
 
 Provider notes: [Grok](grok.md), [Claude](claude.md), [Codex](codex.md),
-[Cursor](cursor.md).
+[Cursor](cursor.md), [Antigravity](agy.md).
+
+Native Gemini can run through its experimental ACP stdio interface with `HARNESS=gemini`. Set an explicit `AGENT_MODEL` and point `AGENT_COMMAND` to one executable wrapper that supplies the native CLI ACP mode arguments. The packaged gateway does not expose an extra-arguments selector. Preserve the native provider/profile settings in that wrapper. Connector access and optional commands depend on that native client; this mode does not imply capability parity with the four clients above. Warmed native goal and queue boundaries remain unknown for maintenance.

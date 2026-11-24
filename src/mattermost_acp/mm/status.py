@@ -409,9 +409,7 @@ class TurnStatus:
             entry.ended = now
         entry.status = status
 
-    def close_open_tools(
-        self, *, now: float | None = None, status: str = "completed"
-    ) -> None:
+    def close_open_tools(self, *, now: float | None = None, status: str = "completed") -> None:
         """Mark any still-running tools finished (turn end / cancel)."""
         t = now if now is not None else time.monotonic()
         for tid in list(self._active.keys()):
@@ -471,9 +469,7 @@ class TurnStatus:
                 lines.append(f"{icon} {title} · {format_duration(elapsed)}…")
         if max_lines is not None and len(lines) > max_lines:
             hidden = len(lines) - max_lines
-            lines = [f"… +{hidden} earlier tool{'s' if hidden != 1 else ''}"] + lines[
-                -max_lines:
-            ]
+            lines = [f"… +{hidden} earlier tool{'s' if hidden != 1 else ''}"] + lines[-max_lines:]
         return lines
 
     def render(
@@ -485,10 +481,8 @@ class TurnStatus:
         extra: str | None = None,
     ) -> str:
         """Model stamp, status line, tool timeline, intermediate narrations."""
-        if phase in {"done", "failed"}:
-            return self._render_terminal(
-                phase=phase, now=now, stop_reason=stop_reason, extra=extra
-            )
+        if phase in {"done", "failed", "queued", "cancelled"}:
+            return self._render_terminal(phase=phase, now=now, stop_reason=stop_reason, extra=extra)
 
         trail = ""
         icons = [_CATALOG[c][0] for c in self._trail if c in _CATALOG]
@@ -513,8 +507,12 @@ class TurnStatus:
         ok = phase == "done"
         self.close_open_tools(now=t, status="completed" if ok else "cancelled")
 
-        mark = "✅" if ok else "❌"
-        verb = "Done" if ok else "Failed"
+        mark, verb = {
+            "done": ("✅", "Done"),
+            "failed": ("❌", "Failed"),
+            "queued": ("⏳", "Queued"),
+            "cancelled": ("⏹", "Cancelled"),
+        }[phase]
         head = f"{mark} {verb}"
         if stop_reason:
             head += f" · {stop_reason}"
@@ -540,9 +538,7 @@ class TurnStatus:
             return head
         return f"{format_model_stamp(None, label=self.model_label, effort=self.effort)}\n{head}"
 
-    def _pack(
-        self, head: str, tool_lines: list[str], *, max_progress: int | None = None
-    ) -> str:
+    def _pack(self, head: str, tool_lines: list[str], *, max_progress: int | None = None) -> str:
         """Keep the head; drop oldest narration then oldest tool lines to fit."""
         tools = list(tool_lines)
         progress = list(self.progress_lines)

@@ -16,6 +16,8 @@ dependencies = [
 
 [project.scripts]
 mattermost-acp-gateway = "mattermost_acp.main:main"
+mm-work = "mattermost_acp.collaboration.cli:main"
+mattermost-acp-collaboration = "mattermost_acp.collaboration.hub:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mattermost_acp"]
@@ -47,6 +49,50 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.hatch.build.targets.sdist]
 include = [
+    "/.specify/memory/constitution.md",
+    "/AGENTS.md",
+    "/docs/collaboration.md",
+    "/src/mattermost_acp/collaboration/*.py",
+    "/tests/test_collaboration.py",
+    "/tests/test_collaboration_independent_cancellation.py",
+    "/tests/test_collaboration_final_review.py",
+    "/tests/test_collaboration_regressions.py",
+    "/tests/test_collaboration_state_review.py",
+    "/tests/test_collaboration_continuation_review.py",
+    "/tests/test_collaboration_dispatch_review.py",
+    "/tests/test_collaboration_dispatch_regressions.py",
+    "/tests/test_collaboration_ordinary_recovery.py",
+    "/tests/test_collaboration_creation_admission.py",
+    "/tests/test_collaboration_creation_correlation.py",
+    "/tests/test_collaboration_command_selection.py",
+    "/tests/test_collaboration_final_dispatch_review.py",
+    "/tests/test_collaboration_native_creation_review.py",
+    "/tests/test_collaboration_provisional_steering.py",
+    "/tests/test_collaboration_reply_artifacts.py",
+    "/tests/test_collaboration_retry_boundaries.py",
+    "/tests/test_collaboration_cold_restart.py",
+    "/tests/test_collaboration_history_indexes.py",
+    "/tests/test_collaboration_hub_idle_wait.py",
+    "/tests/test_collaboration_stop_order.py",
+    "/tests/test_collaboration_cancellation_recovery_followup.py",
+    "/tests/test_collaboration_elapsed_deadlines.py",
+    "/tests/test_collaboration_worker_leases.py",
+    "/tests/test_subagent_sibling_collisions.py",
+    "/tests/test_collaboration_stop_report_final.py",
+    "/tests/test_subagent_activity_history.py",
+    "/tests/test_collaboration_inactivity_cancellation.py",
+    "/tests/test_collaboration_settlement_retry_clocks.py",
+    "/tests/test_collaboration_settings_child_review.py",
+    "/tests/test_collaboration_child_lifecycle.py",
+    "/tests/test_collaboration_deadline_admission_followup.py",
+    "/tests/test_collaboration_deadline_enforcement_overlap.py",
+    "/tests/test_collaboration_gateway_delivery_regressions.py",
+    "/tests/test_workspace_guard.py",
+    "/tests/test_workspace_guard_pinned_source.py",
+    "/tests/test_collaboration_retirement_review.py",
+    "/tests/test_collaboration_result_review.py",
+    "/tests/test_collaboration_admission_review.py",
+    "/specs/001-project-collaboration/**",
     "/.env.example",
     "/.github/workflows/checks.yml",
     "/.gitignore",
@@ -56,6 +102,7 @@ include = [
     "/docs/deployment.md",
     "/docs/harness-switching.md",
     "/docs/harnesses/README.md",
+    "/docs/harnesses/agy.md",
     "/docs/harnesses/claude.md",
     "/docs/harnesses/codex.md",
     "/docs/harnesses/cursor.md",
@@ -128,8 +175,10 @@ include = [
     "/systemd/mattermost-acp-gateway.service.example",
     "/systemd/mattermost-acp-tunnel.service.example",
     "/tests/fake_agent.py",
+    "/tests/test_agy.py",
     "/tests/test_attachments.py",
     "/tests/test_broker.py",
+    "/tests/test_broker_long_turn_timeouts.py",
     "/tests/test_channel_context.py",
     "/tests/test_chunk.py",
     "/tests/test_codex_catalog.py",

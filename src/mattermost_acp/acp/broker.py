@@ -6,10 +6,14 @@ One broker multiplexes many ACP sessions (one chat thread each).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -32,9 +36,9 @@ _DEFAULT_RPC_TIMEOUT_S = 120.0
 # produce no ACP events for several minutes.
 _DEFAULT_PROMPT_IDLE_TIMEOUT_S = 900.0
 
-# Absolute ceiling for one prompt turn regardless of activity.
-# Override with ACP_PROMPT_HARD_MAX_SEC.
-_DEFAULT_PROMPT_HARD_MAX_S = 7200.0
+# Active turns have no absolute deadline by default. Operators can opt into
+# a finite ceiling with ACP_PROMPT_HARD_MAX_SEC; zero disables that ceiling.
+_DEFAULT_PROMPT_HARD_MAX_S = 0.0
 
 _TOOL_DONE_STATUSES = frozenset(
     {"completed", "cancelled", "canceled", "success", "failed", "error"}
@@ -52,6 +56,17 @@ def _env_float(name: str, default: float) -> float:
     return val if val > 0 else default
 
 
+def _prompt_hard_max() -> float:
+    raw = (
+        os.environ.get("ACP_PROMPT_HARD_MAX_SEC")
+        or os.environ.get("GROK_ACP_PROMPT_HARD_MAX_SEC", "")
+    ).strip()
+    value = float(raw) if raw else _DEFAULT_PROMPT_HARD_MAX_S
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("ACP_PROMPT_HARD_MAX_SEC must be finite and nonnegative")
+    return value
+
+
 def is_tool_complete_update(update: SessionUpdate) -> bool:
     """True when a session/update reports a tool call finishing."""
     if update.kind != "tool_call_update":
@@ -64,6 +79,42 @@ class AcpError(RuntimeError):
     def __init__(self, message: str, *, data: Any = None) -> None:
         super().__init__(message)
         self.data = data
+
+
+class NativeDispatchChanged(AcpError):
+    """A guarded control was rejected before any bytes reached the adapter."""
+
+
+_command_admission = ContextVar("native_command_admission", default=None)
+_inactivity_cancellation = ContextVar("native_inactivity_cancellation", default=None)
+
+
+@contextmanager
+def native_command_admission(guard):
+    previous = _command_admission.get()
+    combined = (lambda: previous() and guard()) if previous and guard else guard
+    token = _command_admission.set(combined)
+    try:
+        check_native_command_admission()
+        yield
+    finally:
+        _command_admission.reset(token)
+
+
+def check_native_command_admission():
+    guard = _command_admission.get()
+    if guard is not None and not guard():
+        raise NativeDispatchChanged("Native command admission changed before dispatch")
+
+
+@contextmanager
+def native_inactivity_cancellation(cancel):
+    """Bind cancellation of dispatched work to its independent native owner."""
+    token = _inactivity_cancellation.set(cancel)
+    try:
+        yield
+    finally:
+        _inactivity_cancellation.reset(token)
 
 
 def _format_rpc_error(err: Any) -> str:
@@ -188,11 +239,18 @@ class AcpBroker:
         always_approve: bool = True,
         extra_args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        agy_cli_home: Path | None = None,
+        agy_app_data_dir: str | None = None,
+        agy_disable_telemetry: bool = False,
+        agy_auth_method: str | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
         # Injectable process factory for tests (fake agent)
         process_factory: Callable[..., Awaitable[asyncio.subprocess.Process]] | None = None,
         rpc_timeout_s: float | None = None,
         prompt_idle_timeout_s: float | None = None,
         prompt_hard_max_s: float | None = None,
+        initial_native_uncertainty: bool = False,
+        on_native_start: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         self.command = command
         # "grok" spawns `grok agent ... stdio`, a CLI-specific subcommand
@@ -204,6 +262,11 @@ class AcpBroker:
         self.always_approve = always_approve
         self.extra_args = list(extra_args or [])
         self.env = env
+        self.agy_cli_home = agy_cli_home
+        self.agy_app_data_dir = agy_app_data_dir
+        self.agy_disable_telemetry = agy_disable_telemetry
+        self.agy_auth_method = agy_auth_method
+        self._mcp_servers = copy.deepcopy(list(mcp_servers or []))
         self._process_factory = process_factory
         self.rpc_timeout_s = (
             rpc_timeout_s
@@ -213,27 +276,28 @@ class AcpBroker:
         self.prompt_idle_timeout_s = (
             prompt_idle_timeout_s
             if prompt_idle_timeout_s is not None
-            else _env_float(
-                "ACP_PROMPT_IDLE_TIMEOUT_SEC", _DEFAULT_PROMPT_IDLE_TIMEOUT_S
-            )
+            else _env_float("ACP_PROMPT_IDLE_TIMEOUT_SEC", _DEFAULT_PROMPT_IDLE_TIMEOUT_S)
         )
         self.prompt_hard_max_s = (
-            prompt_hard_max_s
-            if prompt_hard_max_s is not None
-            else _env_float(
-                "ACP_PROMPT_HARD_MAX_SEC", _DEFAULT_PROMPT_HARD_MAX_S
-            )
+            prompt_hard_max_s if prompt_hard_max_s is not None else _prompt_hard_max()
         )
+        if not math.isfinite(self.prompt_hard_max_s) or self.prompt_hard_max_s < 0:
+            raise ValueError("prompt_hard_max_s must be finite and nonnegative")
 
         self._proc: asyncio.subprocess.Process | None = None
+        self._native_spawned = initial_native_uncertainty
+        self._on_native_start = on_native_start
         self._reader_task: asyncio.Task[None] | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._session_queues: dict[str, list[asyncio.Queue[SessionUpdate | None]]] = {}
+        self.prompt_subscriptions: set[str] = set()
         self._capabilities = AcpCapabilities()
         self.subagents = SubagentTracker()
         self.update_observer: Callable[[SessionUpdate], None] | None = None
         self._started = False
+        self._initialized = False
+        self._initialization_pending = False
         self._lock = asyncio.Lock()
         self._write_lock = asyncio.Lock()
         # session_id → in-flight turn lock
@@ -241,6 +305,7 @@ class AcpBroker:
         self._permission_handler: PermissionHandler | None = None
         self.session_config_options: dict[str, list[dict[str, Any]]] = {}
         self._cursor_live_sessions: set[str] = set()
+        self._live_sessions: set[str] = set()
 
     @property
     def capabilities(self) -> AcpCapabilities:
@@ -249,6 +314,26 @@ class AcpBroker:
     @property
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
+
+    def is_session_loaded(self, session_id: str) -> bool:
+        """Require successful admission by the current live process."""
+        return self.is_running and session_id in self._live_sessions
+
+    def _remember_session(self, session_id: str, process: Any) -> bool:
+        if process is not None and self._proc is process and self.is_running:
+            self._live_sessions.add(session_id)
+            return True
+        return False
+
+    @property
+    def native_boundary_idle(self) -> bool:
+        """ACP foreground completion does not prove native goals/queues are idle."""
+        return not self._native_spawned and not self.is_running
+
+    async def mark_native_boundary_unknown(self) -> None:
+        self._native_spawned = True
+        if self._on_native_start is not None:
+            await self._on_native_start()
 
     def set_permission_handler(self, handler: PermissionHandler | None) -> None:
         self._permission_handler = handler
@@ -261,9 +346,20 @@ class AcpBroker:
         return lock
 
     def _build_argv(self) -> list[str]:
+        if self.backend == "agy":
+            args = [self.command, *self.extra_args, "acp"]
+            if self.agy_cli_home is not None:
+                args.extend(["--gemini-dir", str(self.agy_cli_home)])
+            if self.agy_app_data_dir:
+                args.extend(["--app-data-dir", self.agy_app_data_dir])
+            if self.always_approve:
+                args.append("--dangerously-skip-permissions")
+            if self.agy_disable_telemetry:
+                args.append("--disable-telemetry")
+            return args
         if self.backend == "cursor":
             return [self.command, *self.extra_args, "acp"]
-        if self.backend in {"claude", "codex"}:
+        if self.backend in {"claude", "codex", "gemini"}:
             # Adapters speak ACP directly on stdio. Model/effort use session
             # config options; adapter environment controls the initial mode.
             return [self.command, *self.extra_args]
@@ -277,56 +373,119 @@ class AcpBroker:
         args.append("stdio")
         return args
 
+    def _resolve_agy_auth_method(self) -> str | None:
+        if self.agy_auth_method == "none":
+            return None
+        if self.agy_auth_method:
+            return self.agy_auth_method
+        effective_env = {**os.environ, **(self.env or {})}
+        if effective_env.get("GEMINI_API_KEY") or effective_env.get("GOOGLE_API_KEY"):
+            return "gemini-api-key"
+        if effective_env.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return "agent-platform"
+        return "oauth-personal"
+
     async def start(self) -> AcpCapabilities:
         async with self._lock:
+            check_native_command_admission()
             if self.is_running and self._started:
                 return self._capabilities
 
-            self._cursor_live_sessions.clear()
-            argv = self._build_argv()
-            logger.info("Starting ACP agent: %s", " ".join(argv[:8]))
+            if not self.is_running:
+                self._started = False
+                self._initialized = False
+                self._initialization_pending = False
+                self._cursor_live_sessions.clear()
+                self._live_sessions.clear()
+                argv = self._build_argv()
+                logger.info("Starting ACP agent: %s", " ".join(argv[:8]))
 
-            if self._process_factory is not None:
-                self._proc = await self._process_factory(argv)
-            else:
-                env = {**os.environ, **(self.env or {})}
-                self._proc = await asyncio.create_subprocess_exec(
-                    *argv,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=env,
-                    limit=16 * 1024 * 1024,
+                # Persist before process creation, including a crash before the
+                # first thread mapping is saved. Persistence failure prevents launch.
+                await self.mark_native_boundary_unknown()
+                check_native_command_admission()
+
+                if self._process_factory is not None:
+                    self._proc = await self._process_factory(argv)
+                else:
+                    env = {**os.environ, **(self.env or {})}
+                    self._proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                        limit=16 * 1024 * 1024,
+                    )
+
+                assert self._proc.stdout is not None
+                # Persistent I/O tasks must not inherit one command's transient
+                # admission guard and apply it to unrelated later sessions.
+                with native_command_admission(None), native_inactivity_cancellation(None):
+                    self._reader_task = asyncio.create_task(
+                        self._read_loop(), name="acp-broker-reader"
+                    )
+                    if self._proc.stderr is not None:
+                        asyncio.create_task(
+                            self._drain_stderr(self._proc.stderr), name="acp-stderr"
+                        )
+            elif self._reader_task is None or self._reader_task.done():
+                raise AcpError(
+                    "Native process is running without a working reader; recovery required"
                 )
-
-            assert self._proc.stdout is not None
-            self._reader_task = asyncio.create_task(
-                self._read_loop(), name="acp-broker-reader"
-            )
-            # Drain stderr in background so the pipe cannot fill
-            if self._proc.stderr is not None:
-                asyncio.create_task(self._drain_stderr(self._proc.stderr), name="acp-stderr")
 
             # Do NOT advertise fs/terminal client capabilities. If we claim them,
             # Grok issues fs/* and terminal/* RPCs to us and blocks the turn until
             # we answer — this gateway is not an IDE, so those hang forever after the
             # first tool_call UI event. Empty caps force agent-side tools.
-            result = await self.request(
-                "initialize",
-                {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {"subagents": {}},
-                    "clientInfo": {
-                        "name": "mattermost-acp-gateway",
-                        "title": "Mattermost ACP gateway",
-                        "version": "0.1.0",
+            if not self._initialized:
+                if self._initialization_pending:
+                    raise AcpError("Native initialization is unconfirmed; recovery required")
+
+                def initialize_dispatched():
+                    self._initialization_pending = True
+
+                result = await self.request(
+                    "initialize",
+                    {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {
+                            "subagents": {},
+                            **(
+                                {
+                                    "_meta": {
+                                        "jetbrains": {
+                                            "air": {"version": 1, "capabilities": ["asyncTasks"]}
+                                        }
+                                    }
+                                }
+                                if self.backend == "claude"
+                                else {}
+                            ),
+                        },
+                        "clientInfo": {
+                            "name": "mattermost-acp-gateway",
+                            "title": "Mattermost ACP gateway",
+                            "version": "0.1.0",
+                        },
                     },
-                },
-            )
-            caps_raw = result if isinstance(result, dict) else {}
-            self._capabilities = self._parse_capabilities(caps_raw)
+                    on_write=initialize_dispatched,
+                )
+                caps_raw = result if isinstance(result, dict) else {}
+                self._capabilities = self._parse_capabilities(caps_raw)
+                self._initialized = True
+                self._initialization_pending = False
             if self.backend == "cursor":
                 await self.request("authenticate", {"methodId": "cursor_login"})
+            elif self.backend == "agy":
+                auth_method = self._resolve_agy_auth_method()
+                if auth_method is not None:
+                    await self.request("authenticate", {"methodId": auth_method})
             self._started = True
             logger.info(
                 "ACP initialized loadSession=%s resume=%s close=%s",
@@ -339,7 +498,10 @@ class AcpBroker:
     async def stop(self) -> None:
         async with self._lock:
             self._started = False
+            self._initialized = False
+            self._initialization_pending = False
             self._cursor_live_sessions.clear()
+            self._live_sessions.clear()
             self.subagents = SubagentTracker()
             proc = self._proc
             self._proc = None
@@ -372,6 +534,8 @@ class AcpBroker:
         params: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        guard: Callable[[], bool] | None = None,
+        on_write: Callable[[], None] | None = None,
     ) -> Any:
         if self._proc is None or self._proc.stdin is None:
             raise AcpError("agent process is not running")
@@ -383,12 +547,21 @@ class AcpBroker:
         self._pending[req_id] = fut
 
         msg = {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
-        await self._write(msg)
-
-        # None → control-plane default. session/prompt passes a hard max; idle
-        # kill for prompts is owned by prompt_turn (resets on tool completion).
+        # None selects the control-plane default. Only session/prompt can
+        # explicitly disable its absolute ceiling with zero; prompt_turn still
+        # enforces inactivity independently.
         wait_s = self.rpc_timeout_s if timeout is None else timeout
+        if method == "session/prompt" and timeout == 0:
+            wait_s = None
         try:
+            if guard is None and on_write is None:
+                await self._write(msg)
+            else:
+                await self._write(
+                    msg,
+                    **({"guard": guard} if guard is not None else {}),
+                    **({"on_write": on_write} if on_write is not None else {}),
+                )
             return await asyncio.wait_for(fut, timeout=wait_s)
         except TimeoutError as exc:
             self._pending.pop(req_id, None)
@@ -396,12 +569,14 @@ class AcpBroker:
         except asyncio.CancelledError:
             self._pending.pop(req_id, None)
             raise
+        finally:
+            self._pending.pop(req_id, None)
 
     async def notify(self, method: str, params: dict[str, Any] | None = None) -> None:
         msg = {"jsonrpc": "2.0", "method": method, "params": params or {}}
         await self._write(msg)
 
-    async def steer(self, session_id: str, text: str) -> str:
+    async def steer(self, session_id: str, text: str, *, guard=None) -> str:
         """Inject into a live turn without taking its lock or starting a turn.
 
         The idle opt-in keeps a turn-completion race from launching an
@@ -423,24 +598,33 @@ class AcpBroker:
                 "prompt": [{"type": "text", "text": text.strip()}],
                 "_meta": {"steering": {"idleBehavior": "promptRequired"}},
             },
+            **({"guard": guard} if guard is not None else {}),
         )
         outcome = result.get("outcome") if isinstance(result, dict) else None
         if outcome not in {"injected", "promptRequired"}:
             raise AcpError(f"Hint was not confirmed by the adapter (outcome: {outcome!r}).")
         return outcome
 
-    async def session_new(self, cwd: str | Path, *, meta: dict[str, Any] | None = None) -> str:
+    async def session_new(
+        self, cwd: str | Path, *, meta: dict[str, Any] | None = None, on_dispatched=None
+    ) -> str:
+        process = self._proc
         params: dict[str, Any] = {
             "cwd": str(cwd),
-            "mcpServers": [],
+            "mcpServers": copy.deepcopy(self._mcp_servers),
         }
         if meta:
             params["_meta"] = meta
-        result = await self.request("session/new", params)
+        result = await self.request(
+            "session/new",
+            params,
+            **({"on_write": on_dispatched} if on_dispatched is not None else {}),
+        )
         if not isinstance(result, dict) or "sessionId" not in result:
             raise AcpError("session/new missing sessionId", data=result)
         self._remember_config(str(result["sessionId"]), result)
-        if self.backend == "cursor":
+        loaded = self._remember_session(str(result["sessionId"]), process)
+        if self.backend == "cursor" and loaded:
             self._cursor_live_sessions.add(str(result["sessionId"]))
         return str(result["sessionId"])
 
@@ -449,27 +633,39 @@ class AcpBroker:
             self.session_config_options[session_id] = result["configOptions"]
 
     async def session_resume(self, session_id: str, cwd: str | Path) -> None:
+        process = self._proc
         result = await self.request(
             "session/resume",
-            {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []},
+            {
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "mcpServers": copy.deepcopy(self._mcp_servers),
+            },
         )
         self._remember_config(session_id, result)
+        self._remember_session(session_id, process)
 
     async def session_load(self, session_id: str, cwd: str | Path) -> None:
         """Load session; discard replayed history updates for Mattermost."""
         # Cursor cannot load a new, unpersisted chat already live in this process.
         if self.backend == "cursor" and session_id in self._cursor_live_sessions:
             return
+        process = self._proc
         # Subscribe a throwaway queue so replay does not leak into other waiters
         q: asyncio.Queue[SessionUpdate | None] = asyncio.Queue()
         self._session_queues.setdefault(session_id, []).append(q)
         try:
             result = await self.request(
                 "session/load",
-                {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []},
+                {
+                    "sessionId": session_id,
+                    "cwd": str(cwd),
+                    "mcpServers": copy.deepcopy(self._mcp_servers),
+                },
             )
             self._remember_config(session_id, result)
-            if self.backend == "cursor":
+            loaded = self._remember_session(session_id, process)
+            if self.backend == "cursor" and loaded:
                 self._cursor_live_sessions.add(session_id)
         finally:
             queues = self._session_queues.get(session_id, [])
@@ -494,16 +690,22 @@ class AcpBroker:
         """
         if self.backend == "cursor":
             from mattermost_acp.commands.cursor_models import with_effort
+
             model_id = with_effort(model_id, effort)
-            result = await self.request("session/set_config_option", {
-                "sessionId": session_id, "configId": "model", "value": model_id,
-            })
+            result = await self.request(
+                "session/set_config_option",
+                {
+                    "sessionId": session_id,
+                    "configId": "model",
+                    "value": model_id,
+                },
+            )
             self._remember_config(session_id, result)
             for option in self.session_config_options.get(session_id, []):
                 if option.get("id") == "model":
                     return str(option.get("currentValue") or model_id)
             return model_id
-        if self.backend in {"claude", "codex"}:
+        if self.backend in {"claude", "codex", "agy"}:
             return await self._set_model_config(session_id, model_id, effort=effort)
         params: dict[str, Any] = {"sessionId": session_id, "modelId": model_id}
         if effort:
@@ -531,10 +733,11 @@ class AcpBroker:
         *,
         effort: str | None = None,
     ) -> str:
-        """Claude and Codex expose model and effort through configOptions.
+        """Claude, Codex and Antigravity expose model and effort through configOptions.
 
-        Codex names its effort option ``reasoning_effort``; Claude uses
-        ``effort``. The adapter resolves model values against its own catalog.
+        Codex names its effort option ``reasoning_effort``, Antigravity uses
+        ``thought_level``, and Claude uses ``effort``. The adapter resolves model
+        values against its own catalog.
         """
         result = await self.request(
             "session/set_config_option",
@@ -551,11 +754,15 @@ class AcpBroker:
                         resolved = current
                     break
         if effort:
+            effort_config_id = {
+                "codex": "reasoning_effort",
+                "agy": "thought_level",
+            }.get(self.backend, "effort")
             result = await self.request(
                 "session/set_config_option",
                 {
                     "sessionId": session_id,
-                    "configId": "reasoning_effort" if self.backend == "codex" else "effort",
+                    "configId": effort_config_id,
                     "value": effort,
                 },
             )
@@ -563,16 +770,38 @@ class AcpBroker:
         return resolved
 
     async def session_close(self, session_id: str) -> None:
-        self.subagents.forget(session_id)
+        self.subagents.retire(session_id)
         if not self._capabilities.close:
             return
+        process = self._proc
         try:
             await self.request("session/close", {"sessionId": session_id})
+            if self._proc is process:
+                self._live_sessions.discard(session_id)
+                self._cursor_live_sessions.discard(session_id)
         except AcpError as exc:
             logger.warning("session/close failed for %s: %s", session_id, exc)
 
-    async def cancel(self, session_id: str) -> None:
-        await self.notify("session/cancel", {"sessionId": session_id})
+    async def cancel(self, session_id: str, *, guard=None, on_dispatched=None) -> None:
+        if guard is None and on_dispatched is None:
+            await self.notify("session/cancel", {"sessionId": session_id})
+        else:
+            await self._write(
+                {"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session_id}},
+                guard=guard,
+                on_write=on_dispatched,
+            )
+
+    async def stop_async_task(self, session_id: str, task_id: str, *, guard) -> bool:
+        if self.backend != "claude":
+            raise AcpError("Native async task stop is unsupported by this adapter")
+        result = await self.request(
+            "_session/async_task/stop",
+            {"sessionId": session_id, "asyncTaskId": task_id},
+            guard=guard,
+        )
+        # This acknowledges the request; lifecycle notifications prove completion.
+        return isinstance(result, dict) and result.get("stopped") is True
 
     async def prompt_turn(
         self,
@@ -580,6 +809,8 @@ class AcpBroker:
         text: str,
         *,
         on_update: Callable[[SessionUpdate], Awaitable[None]] | None = None,
+        guard=None,
+        on_dispatched: Callable[[], None] | None = None,
     ) -> TurnResult:
         """Run one prompt turn; buffer answer text; invoke on_update for status.
 
@@ -587,13 +818,20 @@ class AcpBroker:
         wall for the whole turn. The idle clock resets whenever a tool call
         completes (and when the agent streams message/thought chunks so a
         long final answer does not get killed). Synthetic heartbeats do not
-        reset it. A separate hard max (default 2h) still bounds pathological
-        turns.
+        reset it. There is no default absolute ceiling on active turns.
+        Operators can opt into a finite hard maximum.
         """
         async with self._turn_lock(session_id):
+            inactivity_cancel = _inactivity_cancellation.get()
             q: asyncio.Queue[SessionUpdate | None] = asyncio.Queue()
             self._session_queues.setdefault(session_id, []).append(q)
+            self.prompt_subscriptions.add(session_id)
             for snapshot in self.subagents.snapshots(session_id):
+                if self.update_observer is not None:
+                    try:
+                        self.update_observer(snapshot)
+                    except Exception:
+                        logger.exception("background snapshot observer failed")
                 q.put_nowait(snapshot)
 
             answer_parts: list[str] = []
@@ -618,11 +856,46 @@ class AcpBroker:
                         "prompt": [{"type": "text", "text": text}],
                     },
                     timeout=hard_max_s,
+                    **({"guard": guard} if guard is not None else {}),
+                    **({"on_write": on_dispatched} if on_dispatched is not None else {}),
                 )
             )
 
             last_heartbeat = turn_started
             result: Any = None
+
+            async def enforce_idle(now):
+                if not prompt_task.done() and now - last_progress >= idle_s:
+                    logger.warning(
+                        "session/prompt idle timeout session=%s idle=%.0fs",
+                        session_id,
+                        idle_s,
+                    )
+                    try:
+                        if inactivity_cancel is None:
+                            await self.cancel(session_id)
+                        else:
+                            # Closing work admission cannot authorize or prevent
+                            # this independently guarded stop of dispatched work.
+                            with native_command_admission(None):
+                                await inactivity_cancel(session_id)
+                    except Exception:
+                        logger.debug(
+                            "session/cancel after idle timeout failed",
+                            exc_info=True,
+                        )
+                    if not prompt_task.done():
+                        prompt_task.cancel()
+                        try:
+                            await prompt_task
+                        except (asyncio.CancelledError, AcpError):
+                            pass
+                    raise AcpError(
+                        f"RPC idle timeout: session/prompt "
+                        f"(no tool completion or agent output for "
+                        f"{idle_s:.0f}s)"
+                    ) from None
+
             try:
                 while True:
                     if prompt_task.done() and q.empty():
@@ -633,31 +906,7 @@ class AcpBroker:
                         if prompt_task.done() and q.empty():
                             break
                         now = loop.time()
-                        # Idle kill: no tool completion / agent output for idle_s.
-                        if now - last_progress >= idle_s:
-                            logger.warning(
-                                "session/prompt idle timeout session=%s idle=%.0fs",
-                                session_id,
-                                idle_s,
-                            )
-                            try:
-                                await self.cancel(session_id)
-                            except Exception:
-                                logger.debug(
-                                    "session/cancel after idle timeout failed",
-                                    exc_info=True,
-                                )
-                            if not prompt_task.done():
-                                prompt_task.cancel()
-                                try:
-                                    await prompt_task
-                                except (asyncio.CancelledError, AcpError):
-                                    pass
-                            raise AcpError(
-                                f"RPC idle timeout: session/prompt "
-                                f"(no tool completion or agent output for "
-                                f"{idle_s:.0f}s)"
-                            ) from None
+                        await enforce_idle(now)
                         # Periodic heartbeat so chat status doesn't look frozen
                         # during long tool/model phases with no session/update traffic.
                         # Heartbeats intentionally do NOT reset last_progress.
@@ -691,7 +940,8 @@ class AcpBroker:
                             last_progress = loop.time()
                     elif item.kind == "subagent_activity":
                         # Real worker output is progress; synthetic heartbeats are not.
-                        last_progress = loop.time()
+                        if not item.raw.get("ownership_snapshot"):
+                            last_progress = loop.time()
                     elif item.kind == "usage_update":
                         usage_used = item.usage_used
                         usage_size = item.usage_size
@@ -699,12 +949,16 @@ class AcpBroker:
                     if item.model_id:
                         model_id = item.model_id
 
+                    # Nonprogress notifications must not keep a stalled turn
+                    # alive merely by keeping its update queue nonempty.
+                    await enforce_idle(loop.time())
                     if on_update is not None:
                         await on_update(item)
                         last_heartbeat = loop.time()
 
                 result = await prompt_task
             finally:
+                self.prompt_subscriptions.discard(session_id)
                 queues = self._session_queues.get(session_id, [])
                 if q in queues:
                     queues.remove(q)
@@ -731,12 +985,17 @@ class AcpBroker:
                 model_id=model_id,
             )
 
-    async def _write(self, msg: dict[str, Any]) -> None:
+    async def _write(self, msg: dict[str, Any], *, guard=None, on_write=None) -> None:
         if self._proc is None or self._proc.stdin is None:
             raise AcpError("agent process is not running")
         line = json.dumps(msg, separators=(",", ":")) + "\n"
         async with self._write_lock:
+            check_native_command_admission()
+            if guard is not None and not guard():
+                raise NativeDispatchChanged("Native execution changed before control dispatch")
             self._proc.stdin.write(line.encode("utf-8"))
+            if on_write is not None:
+                on_write()
             await self._proc.stdin.drain()
 
     async def _read_loop(self) -> None:
@@ -793,11 +1052,19 @@ class AcpBroker:
                 # Mattermost answers arrive on a later turn. Never invent a user
                 # selection or silently approve a plan requiring explicit approval.
                 outcome = "skipped" if method == "cursor/ask_question" else "rejected"
-                await self._write({"jsonrpc": "2.0", "id": req_id, "result": {
-                    "outcome": {"outcome": outcome, "reason":
-                        "Present this question or plan in your chat response "
-                        "and wait for the user's next message."}
-                }})
+                await self._write(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": req_id,
+                        "result": {
+                            "outcome": {
+                                "outcome": outcome,
+                                "reason": "Present this question or plan in your chat response "
+                                "and wait for the user's next message.",
+                            }
+                        },
+                    }
+                )
                 return
             logger.warning(
                 "Rejecting unsupported ACP server request method=%s id=%s",
@@ -835,6 +1102,7 @@ class AcpBroker:
                         self.update_observer(event)
                     except Exception:
                         logger.exception("background update observer failed")
+            self.subagents.prune_retired()
             return
 
         if method:

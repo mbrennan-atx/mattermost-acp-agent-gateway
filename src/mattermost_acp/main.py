@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from logging.handlers import RotatingFileHandler
 
 from mattermost_acp.acp import AcpBroker
-from mattermost_acp.config import Config
+from mattermost_acp.acp.broker import NativeDispatchChanged
+from mattermost_acp.config import Config, load_mcp_servers_file
 from mattermost_acp.harness_switch import busy_path
 from mattermost_acp.mm.client import MattermostClient
 from mattermost_acp.mm.gateway import MattermostGateway
@@ -34,6 +36,152 @@ def _setup_logging(log_file) -> None:
         root.addHandler(fh)
 
 
+_WORKSPACE_GUARD_SUPERVISOR = """
+import os, selectors, signal, subprocess, sys, threading
+
+# Only this still-live group member can authorize its group signal.
+if os.getpgrp() != os.getpid():
+    raise SystemExit(125)
+try:
+    control = int(sys.argv[1])
+    guard = subprocess.Popen(sys.argv[2:], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=True)
+    ready_read, ready_write = os.pipe()
+    def finished():
+        guard.wait()
+        os.write(ready_write, b"x")
+    threading.Thread(target=finished, daemon=True).start()
+    selector = selectors.DefaultSelector()
+    selector.register(control, selectors.EVENT_READ, "cancel")
+    selector.register(ready_read, selectors.EVENT_READ, "finished")
+    for key, _ in selector.select():
+        if key.data == "finished":
+            os.write(1, (str(guard.returncode) + "\\n").encode("ascii"))
+        break
+finally:
+    # The supervisor remains in this group even after the guard is reaped.
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+"""
+
+
+_WORKSPACE_GUARD_PINNED_SOURCE = """
+import hashlib, os, stat, sys
+path, expected, *arguments = sys.argv[1:]
+limit = 8 * 1024 * 1024
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+with os.fdopen(fd, "rb") as stream:
+    info = os.fstat(stream.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+        raise SystemExit(125)
+    source = stream.read(limit + 1)
+if len(source) > limit or hashlib.sha256(source).hexdigest() != expected:
+    raise SystemExit(125)
+sys.argv = [path, *arguments]
+exec(compile(source, path, "exec", dont_inherit=True), {
+    "__name__": "__main__", "__file__": path, "__package__": None,
+})
+"""
+
+
+async def _finish_guard_task(task):
+    """Retain launch/wait ownership through repeated caller cancellation."""
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+    return task.result()
+
+
+def build_workspace_guard(command, *, timeout_s=15, source_sha256=None):
+    """Run an optional trusted executable before native session admission."""
+    if not command:
+        return None
+
+    async def verify(thread_id, cwd, prior_session):
+        process, launch = None, None
+        control_read, control_write = None, None
+        try:
+            async with asyncio.timeout(timeout_s):
+                arguments = [command, thread_id, str(cwd), prior_session or ""]
+                if source_sha256 is not None:
+                    arguments = [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-c",
+                        _WORKSPACE_GUARD_PINNED_SOURCE,
+                        command,
+                        source_sha256,
+                        *arguments[1:],
+                    ]
+                options = {}
+                if os.name == "posix":
+                    control_read, control_write = os.pipe()
+                    arguments = [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-c",
+                        _WORKSPACE_GUARD_SUPERVISOR,
+                        str(control_read),
+                        *arguments,
+                    ]
+                    options = {
+                        "pass_fds": (control_read,),
+                        "start_new_session": True,
+                    }
+                launch = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        *arguments,
+                        stdout=(
+                            asyncio.subprocess.PIPE
+                            if os.name == "posix"
+                            else asyncio.subprocess.DEVNULL
+                        ),
+                        stderr=asyncio.subprocess.DEVNULL,
+                        **options,
+                    )
+                )
+                process = await asyncio.shield(launch)
+                if os.name == "posix":
+                    result = await process.stdout.readline()
+                    refused = result != b"0\n" or await process.wait() != -signal.SIGKILL
+                else:
+                    refused = await process.wait() != 0
+                if refused:
+                    raise NativeDispatchChanged("Workspace verification refused native preparation")
+        except BaseException as exc:
+            # Closing the lease lets the live supervisor terminate its own group.
+            # Never signal a numeric group ID belonging to a reaped process.
+            if control_write is not None:
+                os.close(control_write)
+                control_write = None
+            if launch is not None:
+                try:
+                    process = await _finish_guard_task(launch)
+                except BaseException:
+                    process = None
+            if process is not None:
+                try:
+                    if os.name != "posix" and process.returncode is None:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+                await _finish_guard_task(asyncio.create_task(process.wait()))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise NativeDispatchChanged(
+                "Workspace verification refused native preparation"
+            ) from exc
+        finally:
+            for descriptor in (control_read, control_write):
+                if descriptor is not None:
+                    os.close(descriptor)
+
+    return verify
+
+
 async def _amain() -> None:
     config = Config.load()
     _setup_logging(config.log_file)
@@ -48,17 +196,30 @@ async def _amain() -> None:
         backend=config.harness,
         model=config.grok_model,
         always_approve=config.always_approve,
+        agy_cli_home=config.agy_cli_home,
+        agy_app_data_dir=config.agy_app_data_dir,
+        agy_disable_telemetry=config.agy_disable_telemetry,
+        agy_auth_method=config.agy_auth_method,
+        mcp_servers=load_mcp_servers_file(config.agy_mcp_servers_file),
+        initial_native_uncertainty=await store.native_boundary_unknown(),
+        on_native_start=store.mark_native_boundary_unknown,
     )
     sessions = SessionService(
         broker,
         store,
         default_cwd=config.grok_cwd,
         default_model=config.grok_model,
+        default_effort=config.grok_effort,
         grok_command=config.grok_command,
         max_parallel_turns=config.max_parallel_turns,
         inject_channel_context=config.inject_channel_context,
         busy_marker=busy_path(config.db_path),
         router=load_router_from_env(),
+        workspace_guard=build_workspace_guard(
+            config.workspace_guard_command,
+            timeout_s=config.workspace_guard_timeout_s,
+            source_sha256=config.workspace_guard_source_sha256,
+        ),
     )
 
     client = MattermostClient(config.mattermost_url, config.mattermost_token)

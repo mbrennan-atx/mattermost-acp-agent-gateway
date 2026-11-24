@@ -4,17 +4,29 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 import time
+import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import aiohttp
 
 from mattermost_acp import harness_switch
 from mattermost_acp.acp import AcpError, SessionUpdate
+from mattermost_acp.acp.broker import (
+    NativeDispatchChanged,
+    native_command_admission,
+    native_inactivity_cancellation,
+)
 from mattermost_acp.attachments import (
     RemoteFile,
     format_attachment_note,
     save_files,
 )
 from mattermost_acp.channel_context import load_role_text, wrap_user_prompt
+from mattermost_acp.collaboration.client import HubError
 from mattermost_acp.commands.defs import (
     TEXT_COMMANDS,
     help_text,
@@ -55,6 +67,7 @@ from mattermost_acp.mm.status import (
 )
 from mattermost_acp.mm.wake import classify_wake
 from mattermost_acp.model_router import RouteRequest
+from mattermost_acp.session_service import ThreadBusy
 from mattermost_acp.thread_title import (
     MAX_RENAME_ATTEMPTS,
     compose_titled_root,
@@ -89,6 +102,24 @@ class MattermostGateway:
         self._status_lock = asyncio.Lock()
         self._rename_attempts: dict[str, int] = {}
         self._reports: dict[str, dict] = {}
+        self._prompt_locks: dict[str, asyncio.Lock] = {}
+        self._last_terminal: dict[str, dict] = {}
+        self.collaboration = None
+        # The maintenance listener starts before run() constructs its consumer.
+        # A configured project gateway cannot declare idleness in that interval.
+        self.collaboration_recovery_pending = bool(
+            os.environ.get("MATTERMOST_COLLAB_URL", "").strip()
+            or getattr(config, "collab_sidecar", False)
+        )
+        self.draining = False
+        self.sealed = False
+        self._maintenance_lock = asyncio.Lock()
+        self._maintenance_generation = 0
+        self._restart_pending = False
+        self._inbound_tasks = set()
+        self._slash_tasks = set()
+        self._active_controls = 0
+        self._harness_restart_task: asyncio.Task | None = None
         broker = getattr(self.sessions, "broker", None)
         if broker is not None:
             broker.update_observer = self._observe_background_update
@@ -107,7 +138,20 @@ class MattermostGateway:
 
     async def run(self) -> None:
         await self.client.get_me()
-        asyncio.create_task(self._handle_pending_restart_bump(), name="post-restart-bump")
+        from mattermost_acp.collaboration.client import Settings
+        from mattermost_acp.collaboration.consumer import CollaborationConsumer
+
+        settings = Settings.load()
+        if settings is not None:
+            self.collaboration_recovery_pending = True
+        if getattr(self.config, "collab_sidecar", False) and settings is None:
+            raise ValueError("A collaboration sidecar requires a configured hub")
+        await self._ensure_peer_membership()
+        if settings is not None:
+            self.collaboration = CollaborationConsumer(self, settings)
+            self.collaboration.start()
+        if not getattr(self.config, "collab_sidecar", False):
+            self._track_control(self._handle_pending_restart_bump(), "post-restart-bump")
         logger.info(
             "Gateway online as %s (%s) harness=%s home=%s peer=%s",
             self.client.username,
@@ -116,13 +160,14 @@ class MattermostGateway:
             "ALL" if self.config.all_channels else sorted(self.config.channel_ids),
             self.config.peer_channel_id or "-",
         )
-        await self._ensure_peer_membership()
-        if self.config.auto_join_channels:
+        if self.config.auto_join_channels and not getattr(self.config, "collab_sidecar", False):
             asyncio.create_task(self._join_all_public_channels(), name="auto-join")
         async for payload in self.client.events(stop=self._stop):
             event = payload.get("event")
             if event == "channel_created":
-                if self.config.auto_join_channels:
+                if self.config.auto_join_channels and not getattr(
+                    self.config, "collab_sidecar", False
+                ):
                     asyncio.create_task(self._join_new_channel(payload), name="auto-join-new")
                 continue
             if event != "posted":
@@ -143,6 +188,9 @@ class MattermostGateway:
             )
 
     async def _handle_posted_safe(self, posted: PostedEvent) -> None:
+        task = asyncio.current_task()
+        owns_tracking = task not in self._inbound_tasks
+        self._inbound_tasks.add(task)
         try:
             await self.handle_posted(posted)
         except Exception:
@@ -156,6 +204,9 @@ class MattermostGateway:
                 )
             except Exception:
                 logger.exception("failed to post error notice")
+        finally:
+            if owns_tracking:
+                self._inbound_tasks.discard(task)
 
     async def _join_all_public_channels(self) -> None:
         """Join every public channel on the team. WS `posted` events only
@@ -198,6 +249,8 @@ class MattermostGateway:
 
     async def close(self) -> None:
         self._stop.set()
+        if self.collaboration is not None:
+            await self.collaboration.close()
         for report in self._reports.values():
             if report.get("task"):
                 report["task"].cancel()
@@ -205,16 +258,49 @@ class MattermostGateway:
 
     def _observe_background_update(self, update: SessionUpdate) -> None:
         report = self._reports.get(update.session_id)
-        if report is None or report["active"] or report.get("suppressed"):
+        if report is None:
             return
         if update.kind not in {
             "agent_message_chunk",
             "tool_call",
             "tool_call_update",
             "subagent_activity",
+            "async_task_spawned",
+            "async_task_progress",
+            "async_task_state_update",
         }:
             return
+        previous = report.get("previous")
+        while previous is not None:
+            if report.get("preparing") or report.get("native_dispatched") is False:
+                previous["reporter"].observe(update)
+            else:
+                previous["reporter"].observe_retained(update)
+            previous = previous.get("previous")
+        # Observe native work before a queued prompt callback or final write
+        # guard can run. The callback consumes the same event without applying
+        # its pending-work state again after newer notifications.
         report["reporter"].observe(update)
+        update.report_observed = True
+        self.prune_reports()
+        if report["active"]:
+            return
+        receipt = self._last_terminal.get(report["thread_id"])
+        if (
+            receipt
+            and receipt.get("session_id") == update.session_id
+            and receipt.get("execution_id") == report.get("execution_id")
+        ):
+            was_pending = receipt.get("pending")
+            receipt["pending"] = report["reporter"].has_pending_work()
+            if was_pending and not receipt["pending"]:
+                receipt["completed_at"] = time.time()
+                if self.collaboration is None or not self.collaboration.owns_thread(
+                    report["thread_id"]
+                ):
+                    self._last_terminal.pop(report["thread_id"], None)
+        if report.get("suppressed"):
+            return
         if report.get("task") is None or report["task"].done():
             report["task"] = asyncio.create_task(
                 self._publish_progress(report), name=f"progress-{report['thread_id']}"
@@ -245,12 +331,17 @@ class MattermostGateway:
                 reporter.published()
 
     def _stop_reports(self, thread_id: str) -> None:
-        for session_id, report in list(self._reports.items()):
+        for report in self.live_reports():
             if report["thread_id"] == thread_id:
                 report["suppressed"] = True
                 if report.get("task"):
                     report["task"].cancel()
-                self._reports.pop(session_id, None)
+        if not self.background_pending(thread_id) and not (
+            self.collaboration is not None and self.collaboration.owns_thread(thread_id)
+        ):
+            for session_id, report in list(self._reports.items()):
+                if report["thread_id"] == thread_id:
+                    self._reports.pop(session_id, None)
 
     async def _ensure_peer_membership(self) -> None:
         peer = self.config.peer_channel_id
@@ -279,6 +370,33 @@ class MattermostGateway:
         return str(root.get("user_id") or "")
 
     async def handle_posted(self, posted: PostedEvent) -> None:
+        task = asyncio.current_task()
+        owns_tracking = task not in self._inbound_tasks
+        self._inbound_tasks.add(task)
+        try:
+            await self._handle_posted(posted)
+        finally:
+            if owns_tracking:
+                self._inbound_tasks.discard(task)
+
+    async def _handle_posted(self, posted: PostedEvent) -> None:
+        if (
+            self.collaboration is not None
+            and posted.root_id
+            and posted.channel_id == self.config.peer_channel_id
+            and re.match(
+                r"^\s*@"
+                + re.escape(self.client.username)
+                + r"\s+ASK(?:\s+\[[0-9a-f]{32}\])?:\s+\S",
+                posted.message,
+                re.IGNORECASE,
+            )
+            and posted.user_id != self.client.user_id
+        ):
+            if await self.collaboration.mention(posted):
+                return
+        if getattr(self.config, "collab_sidecar", False):
+            return
         _kind, reason = classify_wake(
             channel_id=posted.channel_id,
             author_id=posted.user_id,
@@ -303,6 +421,13 @@ class MattermostGateway:
                     posted.user_id,
                     reason,
                 )
+            return
+        if (
+            self.collaboration is not None
+            and posted.root_id
+            and posted.channel_id == self.config.peer_channel_id
+            and not await self._ordinary_floor_reply_allowed(posted)
+        ):
             return
         content = (posted.message or "").strip()
         if not content and not posted.file_ids:
@@ -336,7 +461,39 @@ class MattermostGateway:
             has_attachments=bool(posted.file_ids),
         )
 
+    async def _ordinary_floor_reply_allowed(self, posted: PostedEvent) -> bool:
+        """Allow ordinary wake only after confirming an unregistered discussion."""
+        try:
+            result = await self.collaboration.hub.request(
+                "POST",
+                "/mentions",
+                {
+                    # An unknown author selects the hub's read-only fallback.
+                    # Registered discussions reject before any work is created.
+                    "author_id": None,
+                    "channel_id": posted.channel_id,
+                    "thread_id": posted.root_id,
+                    "post_id": posted.post_id,
+                    "text": posted.message,
+                },
+            )
+        except (HubError, aiohttp.ClientError, TimeoutError, ValueError):
+            logger.info("ordinary floor wake suppressed post=%s", posted.post_id)
+            return False
+        return result is None
+
     async def handle_slash(self, req: SlashRequest) -> dict[str, str]:
+        self._active_controls += 1
+        try:
+            return await self._handle_slash(req)
+        finally:
+            self._active_controls -= 1
+
+    async def _handle_slash(self, req: SlashRequest) -> dict[str, str]:
+        if getattr(self.config, "collab_sidecar", False):
+            return ephemeral("Use mm-work for shared project work.")
+        if self.sealed or (self.draining and req.command != "stop"):
+            return ephemeral("Gateway updating. Retry the command shortly.")
         if not self.allowed(req.user_id):
             return ephemeral("Not allowed.")
         if not self.in_home(req.channel_id):
@@ -355,7 +512,7 @@ class MattermostGateway:
             )
             thread_id = str(starter.get("id") or "")
         # MM requires a JSON response in a few seconds. Do the real work after ACK.
-        asyncio.create_task(
+        task = asyncio.create_task(
             self._slash_dispatch(
                 thread_id=thread_id,
                 channel_id=req.channel_id,
@@ -366,6 +523,8 @@ class MattermostGateway:
             ),
             name=f"slash-{cmd}",
         )
+        self._slash_tasks.add(task)
+        task.add_done_callback(self._slash_tasks.discard)
         if req.root_id:
             ack = f"Working in this thread (`/{cmd}`)."
         else:
@@ -405,7 +564,39 @@ class MattermostGateway:
             except Exception:
                 logger.exception("slash error notice failed")
 
-    async def dispatch_command(
+    async def dispatch_command(self, **kwargs) -> None:
+        if self.sealed or (self.draining and kwargs["cmd"] != "stop"):
+            await self._post(
+                kwargs["channel_id"],
+                "Gateway updating. Retry the command shortly.",
+                root_id=kwargs["thread_id"],
+            )
+            return
+        self._active_controls += 1
+        try:
+            if kwargs["cmd"] in {"new", "clear", "restart", "model", "models", "effort", "harness"}:
+                with native_command_admission(
+                    lambda: self.native_command_admitted(kwargs["thread_id"])
+                ):
+                    await self._dispatch_command(**kwargs)
+            else:
+                await self._dispatch_command(**kwargs)
+        except NativeDispatchChanged:
+            await self._post(
+                kwargs["channel_id"],
+                "Project work is pending. Retry the command after it settles.",
+                root_id=kwargs["thread_id"],
+            )
+        finally:
+            self._active_controls -= 1
+
+    def _track_control(self, operation, name):
+        task = asyncio.create_task(operation, name=name)
+        self._slash_tasks.add(task)
+        task.add_done_callback(self._slash_tasks.discard)
+        return task
+
+    async def _dispatch_command(
         self,
         *,
         thread_id: str,
@@ -434,8 +625,32 @@ class MattermostGateway:
             return
         if cmd == "stop":
             self._stop_reports(thread_id)
-            ok = await self.sessions.cancel(thread_id)
-            await reply("⏹ Cancelled." if ok else "Nothing to cancel.")
+            project_stop = None
+            if self.collaboration is not None:
+                cutoff = self.collaboration.record_stop(thread_id)
+                project_stop = self._track_control(
+                    self.collaboration.cancel_thread(thread_id, retry=True, cutoff=cutoff),
+                    "project-stop-" + thread_id,
+                )
+            ok = False
+            native_error = None
+            try:
+                ok = await self.sessions.cancel(thread_id)
+            except Exception as exc:
+                native_error = type(exc).__name__
+            project_error = False
+            if project_stop is not None:
+                try:
+                    await project_stop
+                except Exception:
+                    project_error = True
+                    logger.warning("Project cancellation unconfirmed; retry intent retained")
+            answer = "⏹ Cancelled." if ok else "Nothing to cancel."
+            if native_error:
+                answer = f"Native stop was not confirmed ({native_error})."
+            if project_error:
+                answer += " Project cancellation is unconfirmed; retry remains queued."
+            await reply(answer)
             return
         if cmd in {"new", "clear"}:
             self._stop_reports(thread_id)
@@ -454,17 +669,20 @@ class MattermostGateway:
             )
             return
         if cmd == "restart":
-            msg = await self._request_restart(
-                thread_id=thread_id,
-                channel_id=channel_id,
-                user_id=user_id,
-                reason="slash_restart",
+            await reply("Restart requires verified idle status across this agent's sessions.")
+            self._track_control(
+                self._restart_when_idle(
+                    thread_id, channel_id, user_id, timeout_s=0, reason="slash_restart"
+                ),
+                "explicit-restart",
             )
-            await reply(msg)
             return
         if cmd in {"mcps", "mcp"}:
             report = await mcp_status_report(
-                self.config.harness, self.config.grok_command, server=arg or None
+                self.config.harness,
+                self.config.grok_command,
+                server=arg or None,
+                mcp_servers_file=self.config.agy_mcp_servers_file,
             )
             await reply(report.text)
             return
@@ -486,6 +704,9 @@ class MattermostGateway:
             if self.config.harness == "cursor":
                 await reply(f"`/{cmd}` passthrough is unavailable for Cursor.")
                 return
+            if self.config.harness == "agy":
+                await reply(f"`/{cmd}` passthrough is unavailable for Antigravity.")
+                return
             await reply(f"↗ `{prompt}`")
             await self.run_prompt(
                 thread_id=thread_id,
@@ -498,7 +719,201 @@ class MattermostGateway:
             return
         await reply(f"Unknown command `/{cmd}`. Try `/help`.")
 
-    async def run_prompt(
+    def collaboration_recovering(self):
+        return self.collaboration_recovery_pending or bool(
+            getattr(self.collaboration, "recovery_pending", False)
+        )
+
+    def ordinary_admitted(self, thread_id, ownership_guard=None):
+        if self.collaboration_recovering():
+            return False
+        if self.collaboration is None:
+            return True
+        inherited = getattr(self.collaboration, "inherited_thread_pending", lambda _thread: False)
+        if inherited(thread_id):
+            return False
+        return not self.collaboration.owns_thread(thread_id) or bool(
+            ownership_guard and ownership_guard()
+        )
+
+    def native_command_admitted(self, thread_id):
+        return (
+            not self.draining
+            and not self.sealed
+            and self.ordinary_admitted(thread_id)
+            and not any(
+                report.get("collaboration_project")
+                and report["thread_id"] == thread_id
+                and (report.get("active") or report["reporter"].has_pending_work())
+                for report in self.live_reports()
+            )
+        )
+
+    async def run_prompt(self, *, thread_id: str, **kwargs) -> dict | None:
+        if self.draining or self.sealed:
+            if kwargs.get("before_native") is not None:
+                return {"queued": True}
+            await self._post(
+                kwargs["channel_id"],
+                "Gateway updating. Retry this message shortly.",
+                root_id=thread_id,
+            )
+            return None
+        if kwargs.get("before_native") is None and self.collaboration_recovering():
+            await self._post(
+                kwargs["channel_id"],
+                "Project recovery is pending. Retry this message shortly.",
+                root_id=thread_id,
+            )
+            return None
+        lock = self._prompt_locks.setdefault(thread_id, asyncio.Lock())
+        if lock.locked() and kwargs.get("before_native") is None:
+            await self._post(
+                kwargs["channel_id"],
+                "Already working in this thread. Use /hint or /stop.",
+                root_id=thread_id,
+            )
+            return None
+        async with lock:
+            if self.draining or self.sealed:
+                if kwargs.get("before_native") is not None:
+                    return {"queued": True}
+                await self._post(
+                    kwargs["channel_id"],
+                    "Gateway updating. Retry this message shortly.",
+                    root_id=thread_id,
+                )
+                return None
+            if kwargs.get("before_native") is None and self.collaboration_recovering():
+                await self._post(
+                    kwargs["channel_id"],
+                    "Project recovery is pending. Retry this message shortly.",
+                    root_id=thread_id,
+                )
+                return None
+            if (
+                self.collaboration is not None
+                and self.collaboration.owns_thread(thread_id)
+                and not (kwargs.get("ownership_guard") and kwargs["ownership_guard"]())
+            ):
+                if kwargs.get("before_native") is None:
+                    await self._post(
+                        kwargs["channel_id"],
+                        "Project work is still pending in this thread. Use /hint or /stop.",
+                        root_id=thread_id,
+                    )
+                    return None
+                return {"queued": True}
+            try:
+                return await self._run_prompt(thread_id=thread_id, **kwargs)
+            finally:
+                for report in self.live_reports():
+                    if report["thread_id"] == thread_id:
+                        report["preparing"] = False
+                self.prune_reports()
+                for report in self.live_reports():
+                    if report["thread_id"] == thread_id and not report.get("active"):
+                        report["foreground_complete"] = True
+
+    def live_reports(self):
+        seen = set()
+        for report in self._reports.values():
+            while report is not None and id(report) not in seen:
+                seen.add(id(report))
+                yield report
+                report = report.get("previous")
+
+    def prune_reports(self):
+        """Keep predecessors only while preparation, work or ownership needs them."""
+        owned = {id(report) for report in getattr(self.collaboration, "ownership", {}).values()}
+        for head in self._reports.values():
+            if head.get("preparing"):
+                continue
+            current = head
+            seen = {id(head)}
+            while (previous := current.get("previous")) is not None:
+                if id(previous) in seen:
+                    current["previous"] = None
+                    break
+                seen.add(id(previous))
+                if (
+                    previous.get("active")
+                    or previous["reporter"].has_pending_work()
+                    or id(previous) in owned
+                ):
+                    current = previous
+                    continue
+                current["previous"] = previous.get("previous")
+                previous["previous"] = None
+                if previous.get("task"):
+                    previous["task"].cancel()
+
+    def background_pending(self, thread_id, *, exclude=None):
+        return any(
+            report is not exclude
+            and report["thread_id"] == thread_id
+            and (report.get("active") or report["reporter"].has_pending_work())
+            for report in self.live_reports()
+        )
+
+    def maintenance_state(self):
+        native_unknown = not getattr(
+            self.sessions.broker,
+            "native_boundary_idle",
+            not getattr(self.sessions.broker, "is_running", False),
+        )
+        pending = sum(
+            bool(report.get("active") or report["reporter"].has_pending_work())
+            for report in self.live_reports()
+        )
+        state = {
+            "draining": self.draining,
+            "sealed": self.sealed,
+            "restart_pending": self._restart_pending
+            or any(
+                task.get_name() == "mattermost-acp-restart" and not task.done()
+                for task in self._slash_tasks
+            ),
+            "foreground": len(getattr(self.sessions, "busy_threads", ())),
+            "responses": sum(lock.locked() for lock in self._prompt_locks.values()),
+            "inbound": len(self._inbound_tasks),
+            "commands": self._active_controls + sum(not task.done() for task in self._slash_tasks),
+            "native_rpc": len(getattr(self.sessions.broker, "_pending", {})),
+            "background": pending + int(native_unknown),
+            "native_boundary_unknown": native_unknown,
+            "collaboration": (
+                len(self.collaboration.workers)
+                + len(getattr(self.collaboration, "pending_stops", ()))
+                + len(getattr(self.collaboration, "ownership", ()))
+                + len(getattr(self.collaboration, "reserving", ()))
+                + int(getattr(self.collaboration, "claiming", False))
+                + int(getattr(self.collaboration, "claim_uncertain", False))
+                + getattr(self.collaboration, "admission_pending", 0)
+                + int(getattr(self.collaboration, "recovery_pending", False))
+                + len(getattr(self.collaboration, "inherited_claims", ()))
+            )
+            if self.collaboration
+            else int(self.collaboration_recovery_pending),
+            "sidecar": getattr(self.config, "collab_sidecar", False),
+            "actor": getattr(self.collaboration, "actor", ""),
+            "harness": self.config.harness,
+            "db_path": str(getattr(self.config, "db_path", "")),
+        }
+        state["idle"] = not any(
+            state[key]
+            for key in {
+                "foreground",
+                "responses",
+                "inbound",
+                "commands",
+                "native_rpc",
+                "background",
+                "collaboration",
+            }
+        )
+        return state
+
+    async def _run_prompt(
         self,
         *,
         thread_id: str,
@@ -508,8 +923,19 @@ class MattermostGateway:
         author_name: str,
         passthrough: bool = False,
         has_attachments: bool = False,
-    ) -> None:
+        workspace: str | None = None,
+        collaboration_project: str | None = None,
+        before_native=None,
+        ownership_guard=None,
+    ) -> dict | None:
+        ordinary_collaboration = before_native is None and (
+            self.collaboration is not None or self.collaboration_recovery_pending
+        )
+        if before_native is not None and self.background_pending(thread_id):
+            return {"queued": True}
         if self.sessions.is_busy(thread_id):
+            if before_native is not None:
+                return {"queued": True, "native_dispatched": False}
             await self._post(
                 channel_id,
                 "⏳ Already working in this thread. `/hint <text>` to add guidance; "
@@ -551,9 +977,45 @@ class MattermostGateway:
             if passthrough
             else RouteRequest(prompt, channel_id=channel_id, has_attachments=has_attachments)
         )
+        if ordinary_collaboration and not self.ordinary_admitted(thread_id, ownership_guard):
+            await self._post(
+                channel_id,
+                "Project work is pending. Retry when the thread is ready.",
+                root_id=thread_id,
+            )
+            return None
         try:
-            await self.sessions.ensure_session(thread_id, channel_id=channel_id, route=route)
+            options = {"channel_id": channel_id, "route": route}
+            if workspace:
+                record = await self.sessions.store.get(thread_id)
+                if record is not None and Path(record.cwd).resolve() != Path(workspace).resolve():
+                    raise ValueError("Existing native session uses a different workspace")
+                options["cwd"] = Path(workspace)
+            if ordinary_collaboration:
+                with native_command_admission(
+                    lambda: (
+                        self.ordinary_admitted(thread_id, ownership_guard)
+                        and not self.draining
+                        and not self.sealed
+                    )
+                ):
+                    await self.sessions.ensure_session(thread_id, **options)
+            else:
+                await self.sessions.ensure_session(thread_id, **options)
+        except NativeDispatchChanged:
+            logger.warning("Workspace verification refused native preparation")
+            if before_native is not None:
+                return {"queued": True, "native_dispatched": False}
+            await self._post(
+                channel_id,
+                "Workspace verification failed. Resolve the settings before retrying.",
+                root_id=thread_id,
+            )
+            return None
         except Exception:
+            if workspace:
+                logger.warning("Project workspace preparation failed; no native work started")
+                return None
             logger.debug("ensure_session before model stamp failed", exc_info=True)
         session_status = await self.sessions.status(thread_id)
         model_label = pretty_model_name(str(session_status.get("model") or "") or None)
@@ -597,7 +1059,15 @@ class MattermostGateway:
             # Never let status UX abort the ACP turn.
             try:
                 status.observe(update)
-                reporter.observe(update)
+                if not update.report_observed:
+                    reporter.observe(update)
+                    prior = report.get("previous")
+                    while prior is not None:
+                        if report.get("preparing") or report.get("native_dispatched") is False:
+                            prior["reporter"].observe(update)
+                        else:
+                            prior["reporter"].observe_retained(update)
+                        prior = prior.get("previous")
                 if update.kind == "agent_message_chunk":
                     if not update.text:
                         return
@@ -624,13 +1094,29 @@ class MattermostGateway:
 
         session_id = str(session_status.get("session_id") or "")
         previous = self._reports.get(session_id)
+        previous_terminal = self._last_terminal.get(thread_id)
+        if before_native is not None and self.background_pending(thread_id):
+            return {"queued": True}
         if previous and previous.get("task"):
             previous["task"].cancel()
         report = {
+            "execution_id": uuid.uuid4().hex,
+            "collaboration_project": collaboration_project,
             "reporter": reporter,
             "thread_id": thread_id,
             "channel_id": channel_id,
             "active": True,
+            "foreground_complete": False,
+            "preparing": before_native is not None or ordinary_collaboration,
+            "native_dispatched": False,
+            "previous": previous
+            if previous
+            and (
+                before_native is not None
+                or ordinary_collaboration
+                or self.background_pending(thread_id)
+            )
+            else None,
             "task": None,
         }
         if session_id:
@@ -639,12 +1125,145 @@ class MattermostGateway:
             self._publish_progress(report), name=f"progress-{thread_id}"
         )
         report["task"] = progress_task
+
+        async def restore_undispatched():
+            actual_session = str(session_status.get("session_id") or "")
+            if previous is not None and self._reports.get(actual_session) is report:
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+                self._reports.pop(actual_session, None)
+                self._reports[session_id] = previous
+                if previous_terminal is not None:
+                    previous_terminal["pending"] = previous["reporter"].has_pending_work()
+                    self._last_terminal[thread_id] = previous_terminal
+                if previous["reporter"].has_pending_work() and (
+                    previous.get("task") is None or previous["task"].done()
+                ):
+                    previous["task"] = asyncio.create_task(
+                        self._publish_progress(previous), name=f"progress-{thread_id}"
+                    )
+
         try:
             await _publish_status(status.render(), force=True)
             try:
-                result = await self.sessions.run_turn(
-                    thread_id, text, channel_id=channel_id, on_update=on_update, route=route
-                )
+                idle_owner = None
+
+                def mark_native_dispatched(actual_session):
+                    nonlocal idle_owner
+                    report["native_dispatched"] = True
+                    report["preparing"] = False
+                    if ordinary_collaboration:
+                        broker = self.sessions.broker
+                        idle_owner = (
+                            actual_session,
+                            getattr(self.sessions, "native_epoch", lambda _thread: None)(thread_id),
+                            broker,
+                            getattr(broker, "_proc", None),
+                        )
+
+                async def cancel_ordinary_idle(actual_session):
+                    if (
+                        idle_owner is None
+                        or idle_owner[0] != actual_session
+                        or idle_owner[1] is None
+                    ):
+                        raise NativeDispatchChanged(
+                            "Inactivity cancellation lacks native ownership"
+                        )
+                    _session, epoch, broker, process = idle_owner
+                    await self.sessions.cancel(
+                        thread_id,
+                        expected_session=actual_session,
+                        expected_epoch=epoch,
+                        guard=lambda: (
+                            self._reports.get(actual_session) is report
+                            and self.sessions.broker is broker
+                            and getattr(broker, "_proc", None) is process
+                        ),
+                    )
+
+                turn_options = {
+                    "channel_id": channel_id,
+                    "on_update": on_update,
+                    "route": route,
+                    "on_dispatched": mark_native_dispatched,
+                }
+                if workspace:
+                    turn_options["cwd"] = Path(workspace)
+                if before_native is not None:
+
+                    async def bind_native(actual_session):
+                        if (
+                            self.background_pending(thread_id, exclude=report)
+                            or reporter.has_pending_work()
+                        ):
+                            raise NativeDispatchChanged("Background work resumed before dispatch")
+                        old_session = str(session_status.get("session_id") or "")
+                        if (
+                            self._reports.get(old_session) is report
+                            and old_session != actual_session
+                        ):
+                            self._reports.pop(old_session, None)
+                        self._reports[actual_session] = report
+                        session_status["session_id"] = actual_session
+                        try:
+                            return await before_native(actual_session)
+                        except Exception as exc:
+                            # Preparation callbacks run before session/prompt can
+                            # write anything. A lost hub response is recoverable
+                            # without claiming native termination or repeating an
+                            # operation that could have reached the native client.
+                            raise NativeDispatchChanged(
+                                "Native reservation did not finish"
+                            ) from exc
+
+                    turn_options["before_prompt"] = bind_native
+                    turn_options["dispatch_guard"] = lambda: (
+                        not self.background_pending(thread_id, exclude=report)
+                        and not reporter.has_pending_work()
+                        and not report.get("cancel_requested")
+                    )
+                elif ordinary_collaboration:
+
+                    async def bind_ordinary(actual_session):
+                        if (
+                            not self.ordinary_admitted(thread_id, ownership_guard)
+                            or self.draining
+                            or self.sealed
+                        ):
+                            raise NativeDispatchChanged("Project recovery changed native admission")
+                        old_session = str(session_status.get("session_id") or "")
+                        if (
+                            self._reports.get(old_session) is report
+                            and old_session != actual_session
+                        ):
+                            self._reports.pop(old_session, None)
+                        self._reports[actual_session] = report
+                        session_status["session_id"] = actual_session
+                        return True
+
+                    turn_options["before_prompt"] = bind_ordinary
+                    turn_options["dispatch_guard"] = lambda: (
+                        self.ordinary_admitted(thread_id, ownership_guard)
+                        and not self.draining
+                        and not self.sealed
+                        and not report.get("cancel_requested")
+                    )
+                if ordinary_collaboration:
+                    with (
+                        native_command_admission(
+                            lambda: (
+                                self.ordinary_admitted(thread_id, ownership_guard)
+                                and not self.draining
+                                and not self.sealed
+                                and not report.get("cancel_requested")
+                            )
+                        ),
+                        native_inactivity_cancellation(cancel_ordinary_idle),
+                    ):
+                        result = await self.sessions.run_turn(thread_id, text, **turn_options)
+                else:
+                    result = await self.sessions.run_turn(thread_id, text, **turn_options)
             finally:
                 report["active"] = False
                 if not reporter.has_pending_work():
@@ -653,10 +1272,33 @@ class MattermostGateway:
                         await progress_task
                     except asyncio.CancelledError:
                         pass
+        except NativeDispatchChanged:
+            await restore_undispatched()
+            await _publish_status(
+                status.render(phase="queued", extra="Native work did not start"), force=True
+            )
+            if ordinary_collaboration:
+                await self._post(
+                    channel_id,
+                    "This message did not start. Retry when the thread is ready.",
+                    root_id=thread_id,
+                )
+                return None
+            return {"queued": True}
         except AcpError as exc:
             logger.warning("ACP error thread=%s: %s", thread_id, exc)
             await _publish_status(status.render(phase="failed"), force=True)
             await self._post(channel_id, f"❌ ACP error: {exc}", root_id=thread_id)
+            return
+        except ThreadBusy as exc:
+            await _publish_status(
+                status.render(phase="queued", extra="Native work did not start"), force=True
+            )
+            if before_native is not None:
+                await restore_undispatched()
+                return {"queued": True, "native_dispatched": False}
+            logger.warning("turn busy thread=%s: %s", thread_id, exc)
+            await self._post(channel_id, f"⏳ {exc}", root_id=thread_id)
             return
         except RuntimeError as exc:
             logger.warning("turn busy/runtime thread=%s: %s", thread_id, exc)
@@ -672,6 +1314,13 @@ class MattermostGateway:
             )
             return
 
+        if before_native is not None and not result.native_dispatched:
+            await restore_undispatched()
+            await _publish_status(
+                status.render(phase="cancelled", extra="Before native dispatch"), force=True
+            )
+            return {"queued": True, "native_dispatched": False}
+
         # Progress already has its own live post. Keep it out of the answer.
         # Preserve the narration fallback when an adapter supplies no final text.
         answer = normalize_answer(
@@ -686,6 +1335,39 @@ class MattermostGateway:
                 )
             except Exception:
                 logger.exception("model set from agent failed")
+
+        public_answer = answer
+        receipt = {
+            "execution_id": report["execution_id"],
+            "answer": public_answer,
+            "stop_reason": result.stop_reason,
+            "native_dispatched": result.native_dispatched,
+            "session_id": result.session_id,
+            "model": result.model_id or str(session_status.get("model") or ""),
+            "pending": reporter.has_pending_work(),
+            "completed_at": time.time(),
+        }
+        if (
+            reporter.has_pending_work()
+            or before_native is not None
+            or (self.collaboration is not None and self.collaboration.owns_thread(thread_id))
+        ):
+            self._last_terminal[thread_id] = receipt
+            # Keep a bounded preview and durable full output while ownership is unresolved.
+            if len(public_answer) > 8000:
+                from mattermost_acp.collaboration.consumer import CollaborationConsumer
+
+                receipt["answer"] = public_answer[:8000]
+                try:
+                    evidence = CollaborationConsumer.foreground(
+                        {"id": report["execution_id"], "claim": "terminal"},
+                        {**receipt, "answer": public_answer},
+                    )
+                except OSError as exc:
+                    receipt["result_file_error"] = f"{type(exc).__name__}: {exc}"
+                    logger.exception("foreground artifact failed thread=%s", thread_id)
+                else:
+                    receipt["result_file"] = evidence["result_file"]
 
         if self.config.show_thoughts and result.thought_text:
             answer = f"_{result.thought_text.strip()}_\n\n{answer}".strip()
@@ -714,7 +1396,7 @@ class MattermostGateway:
                 f"Buffered {len(answer)} chars, {len(parts)} parts.",
                 root_id=thread_id,
             )
-            return
+            return receipt
 
         if result.usage_used is not None:
             status.usage_used = result.usage_used
@@ -735,6 +1417,9 @@ class MattermostGateway:
             status.render(phase="done", stop_reason=result.stop_reason, extra=extra),
             force=True,
         )
+        receipt["response_delivered"] = True
+        logger.info("response complete thread=%s session=%s", thread_id, result.session_id)
+        return receipt
 
     async def _root_preview(self, thread_id: str) -> tuple[str, str]:
         rec = await self.sessions.store.get(thread_id)
@@ -893,14 +1578,15 @@ class MattermostGateway:
         effort: str | None,
         scope: str,
     ) -> None:
-        catalog = await self._model_catalog(thread_id, channel_id)
-        mid, _ = resolve_model_id(catalog, query)
-        if not mid:
-            logger.warning("MATTERMOST_MODEL_SET unknown query=%s", query)
-            return
-        await self.sessions.switch_model(
-            thread_id, mid, effort=effort, scope=scope, channel_id=channel_id
-        )
+        with native_command_admission(lambda: self.native_command_admitted(thread_id)):
+            catalog = await self._model_catalog(thread_id, channel_id)
+            mid, _ = resolve_model_id(catalog, query)
+            if not mid:
+                logger.warning("MATTERMOST_MODEL_SET unknown query=%s", query)
+                return
+            await self.sessions.switch_model(
+                thread_id, mid, effort=effort, scope=scope, channel_id=channel_id
+            )
 
     async def _model_catalog(self, thread_id: str, channel_id: str) -> ModelCatalog:
         if self.config.harness == "grok":
@@ -953,37 +1639,129 @@ class MattermostGateway:
         except harness_switch.SwitchError as exc:
             await reply(f"❌ {exc}")
             return
-        busy = self.sessions.busy_threads
-        wait_note = f" after {len(busy)} running turn(s) finish" if busy else ""
         await reply(
             f"🔀 `{plan.old_harness}` → `{plan.new_harness}` (model `{plan.model}`). "
-            f"Restarting{wait_note}."
+            "Saved. Automatic restart requires verified idle status."
         )
-        asyncio.create_task(
-            self._restart_when_idle(thread_id, channel_id, user_id),
-            name="harness-switch-restart",
-        )
+        pending_restart = getattr(self, "_harness_restart_task", None)
+        if pending_restart is None or pending_restart.done():
+            self._harness_restart_task = self._track_control(
+                self._restart_when_idle(thread_id, channel_id, user_id),
+                "harness-switch-restart",
+            )
 
     async def _restart_when_idle(
-        self, thread_id: str, channel_id: str, user_id: str, *, timeout_s: float = 900
+        self,
+        thread_id: str,
+        channel_id: str,
+        user_id: str,
+        *,
+        timeout_s: float = 900,
+        reason: str = "harness_switch",
     ) -> None:
         deadline = time.monotonic() + timeout_s
-        while self.sessions.busy_threads and time.monotonic() < deadline:
-            await asyncio.sleep(5)
-        if self.sessions.busy_threads:
+        admission = getattr(self.collaboration, "set_admission", None)
+        restart_scheduled = False
+        hub_sealed = admission is None
+        previous_flags = None
+        generation = None
+        try:
+            async with self._maintenance_lock:
+                previous_flags = self.draining, self.sealed
+                self._maintenance_generation += 1
+                generation = self._maintenance_generation
+                self.draining = True
+                if admission is not None:
+                    await admission("controls")
+            while True:
+                notice = None
+                async with self._maintenance_lock:
+                    if generation != self._maintenance_generation:
+                        return  # A newer operator transition owns admission.
+                    state = self.maintenance_state()
+                    # This helper is the control deciding whether it may restart.
+                    state["commands"] -= int(asyncio.current_task() in self._slash_tasks)
+                    if state["native_boundary_unknown"]:
+                        notice = (
+                            "The new harness is saved. Native goal/queue idle status is unknown; "
+                            "automatic restart is deferred."
+                            if reason == "harness_switch"
+                            else "Restart deferred. Native goal/queue idle status is unknown."
+                        )
+                    elif not any(
+                        state[key]
+                        for key in (
+                            "foreground",
+                            "responses",
+                            "inbound",
+                            "commands",
+                            "native_rpc",
+                            "background",
+                            "collaboration",
+                        )
+                    ):
+                        if not hub_sealed:
+                            self.sealed = True
+                            await admission("sealed")
+                            hub_sealed = True
+                            continue
+                        # Keep the last idle check, local fence and restart
+                        # scheduling in the same operator transition.
+                        self.draining = self.sealed = True
+                        self._restart_pending = True
+                        msg = await self._request_restart(
+                            thread_id=thread_id,
+                            channel_id=channel_id,
+                            user_id=user_id,
+                            reason=reason,
+                        )
+                        restart_scheduled = True
+                        logger.info("verified idle restart: %s", msg)
+                        if reason == "slash_restart":
+                            await self._post(channel_id, msg, root_id=thread_id)
+                        break
+                    elif time.monotonic() >= deadline:
+                        notice = (
+                            "The new harness is saved. Pending work prevents automatic restart."
+                            if reason == "harness_switch"
+                            else "Restart deferred. Pending work remains in this agent's sessions."
+                        )
+                if notice is not None:
+                    await self._post(channel_id, notice, root_id=thread_id)
+                    return
+                await asyncio.sleep(min(5, max(0, deadline - time.monotonic())))
+        except Exception:
+            logger.exception("Automatic harness restart could not settle admission")
             await self._post(
                 channel_id,
-                "⏳ Still busy after 15 minutes. The new harness is saved; `/restart` when ready.",
+                "The new harness is saved. Automatic restart could not settle admission."
+                if reason == "harness_switch"
+                else "Restart deferred. Native admission could not be settled.",
                 root_id=thread_id,
             )
-            return
-        msg = await self._request_restart(
-            thread_id=thread_id,
-            channel_id=channel_id,
-            user_id=user_id,
-            reason="harness_switch",
-        )
-        logger.info("harness switch restart: %s", msg)
+        finally:
+            if not restart_scheduled and generation is not None:
+                async with self._maintenance_lock:
+                    if generation == self._maintenance_generation:
+                        self._restart_pending = False
+                        self.draining = self.sealed = True
+                        try:
+                            if admission is not None:
+                                if not any(previous_flags):
+                                    # Reconcile a lost acknowledgement before
+                                    # polling reopens. Unresolved claims remain.
+                                    await admission("controls")
+                                await admission(
+                                    "sealed"
+                                    if previous_flags[1]
+                                    else "controls"
+                                    if previous_flags[0]
+                                    else "normal"
+                                )
+                        except Exception:
+                            logger.exception("Restart admission recovery remains unresolved")
+                        else:
+                            self.draining, self.sealed = previous_flags
 
     def _format_status(self, st: dict[str, object]) -> str:
         reporter = TurnReporter()
@@ -1019,30 +1797,41 @@ class MattermostGateway:
         user_id: str,
         reason: str,
     ) -> str:
-        rec = await self.sessions.store.get(thread_id)
-        pending = now_pending(
-            thread_id=thread_id,
-            session_id=rec.session_id if rec else None,
-            user_id=user_id,
-            reason=reason,
-            team_id=self.config.team_id,
-            parent_channel_id=channel_id,
-        )
+        self._restart_pending = True
+        try:
+            rec = await self.sessions.store.get(thread_id)
+            pending = now_pending(
+                thread_id=thread_id,
+                session_id=rec.session_id if rec else None,
+                user_id=user_id,
+                reason=reason,
+                team_id=self.config.team_id,
+                parent_channel_id=channel_id,
+            )
 
-        async def _cancel() -> None:
-            if self.sessions.is_busy(thread_id):
-                try:
-                    await self.sessions.cancel(thread_id)
-                except Exception:
-                    logger.exception("cancel before restart failed")
+            async def _cancel() -> None:
+                if self.sessions.is_busy(thread_id):
+                    try:
+                        await self.sessions.cancel(thread_id)
+                    except Exception:
+                        logger.exception("cancel before restart failed")
 
-        return await restart_gateway(
-            pending=pending,
-            db_path=self.config.db_path,
-            stop_coro=self.sessions.broker.stop,
-            cancel_coro=_cancel,
-            unit="mattermost-acp-gateway.service",
-        )
+            def track_restart(operation, name):
+                task = self._track_control(operation, name)
+                task.add_done_callback(lambda _task: setattr(self, "_restart_pending", False))
+                return task
+
+            return await restart_gateway(
+                pending=pending,
+                db_path=self.config.db_path,
+                stop_coro=self.sessions.broker.stop,
+                cancel_coro=_cancel,
+                unit="mattermost-acp-gateway.service",
+                track=track_restart,
+            )
+        except BaseException:
+            self._restart_pending = False
+            raise
 
     async def _handle_pending_restart_bump(self) -> None:
         pending = consume_pending(pending_path(self.config.db_path))
@@ -1051,8 +1840,11 @@ class MattermostGateway:
         sid = pending.session_id
         resume_note = "no prior session map"
         try:
-            sid = await self.sessions.ensure_session(pending.thread_id)
+            with native_command_admission(lambda: self.native_command_admitted(pending.thread_id)):
+                sid = await self.sessions.ensure_session(pending.thread_id)
             resume_note = f"session `{sid}` resumed"
+        except NativeDispatchChanged:
+            resume_note = "session preparation deferred until this thread is admitted"
         except Exception as exc:
             logger.exception("Post-restart ensure_session failed")
             resume_note = f"session warm failed: {exc}"

@@ -37,3 +37,8 @@ secrets/
 state/
 # Synthetic examples are publishable.
 !**/*.env.example
+
+# Spec Kit installs local workflows; authored specs and constitution are versioned.
+.agents/skills/speckit-*/
+.specify/*
+!.specify/memory/

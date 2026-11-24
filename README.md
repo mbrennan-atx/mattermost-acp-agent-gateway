@@ -2,7 +2,7 @@
 
 Run an agent harness in Mattermost. Each thread has an independent native session,
 with streamed progress, cancellation, model selection and persistent thread mappings.
-The gateway supports Grok Build, Claude Code, Codex and Cursor through ACP. The
+The gateway supports Grok Build, Claude Code, Codex, Cursor, Antigravity (`agy`) and experimental native Gemini through ACP. The
 operator supplies accounts, credentials, workspace permissions and optional personas.
 
 ## Run one assistant
@@ -110,3 +110,7 @@ fresh-history export, package checks and private identifier policy. Exporting a
 candidate does not publish it or change any repository's visibility.
 
 See [LICENSE](LICENSE) for attribution and terms.
+
+## Project collaboration
+
+The optional collaboration hub lets existing assistants assign work, ask peers and return results to the requesting native session. Shared project state and delivery receipts survive restarts. Busy steering remains capability-gated; unknown delivery is retained for reconciliation. See [project collaboration](docs/collaboration.md) for configuration, commands, limits and cancellation.

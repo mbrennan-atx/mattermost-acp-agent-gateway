@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
+from mattermost_acp.commands.effort import normalize_effort
 from mattermost_acp.deployment import config_root, resolve_path
 
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "mattermost-acp-gateway" / "token"
+AGY_AUTH_METHODS = frozenset(
+    {"oauth-personal", "oauth-business", "gemini-api-key", "agent-platform", "none"}
+)
 
 
 def _truthy(value: str | None, default: bool = False) -> bool:
@@ -60,11 +67,50 @@ def _optional_path(value: str | None) -> Path | None:
     return selected
 
 
+def _collaboration_cli_command(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    selected = Path(raw)
+    if (
+        any(character in raw for character in "\x00\r\n`")
+        or not selected.is_absolute()
+        or not selected.is_file()
+        or not os.access(selected, os.X_OK)
+    ):
+        raise ValueError("MATTERMOST_COLLAB_CLI_COMMAND must select one absolute executable file")
+    return str(selected)
+
+
 def _read_token(path: Path) -> str:
     try:
         return path.expanduser().read_text(encoding="utf-8").strip()
     except OSError:
         return ""
+
+
+def load_mcp_servers_file(path: Path | None) -> list[dict[str, Any]]:
+    """Read an optional JSON list of ACP ``mcpServers`` objects."""
+    if path is None:
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("AGY_MCP_SERVERS_FILE must select a readable JSON file") from exc
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise ValueError("AGY_MCP_SERVERS_FILE must contain a JSON list of server objects")
+    return data
+
+
+def _optional_mcp_servers_file(value: str | None) -> Path | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    selected = resolve_path(raw, config_root())
+    if not selected.is_file():
+        raise ValueError("AGY_MCP_SERVERS_FILE must select an existing JSON file")
+    load_mcp_servers_file(selected)
+    return selected
 
 
 @dataclass(frozen=True)
@@ -106,6 +152,18 @@ class Config:
     log_file: Path | None
     attachments_dir: Path
     attachments_max_bytes: int
+    collab_sidecar: bool = False
+    collab_origin_actor: str = ""
+    collab_cli_command: str | None = None
+    workspace_guard_command: str | None = None
+    workspace_guard_timeout_s: float = 15
+    workspace_guard_source_sha256: str | None = None
+    grok_effort: str | None = None
+    agy_cli_home: Path | None = None
+    agy_app_data_dir: str | None = None
+    agy_disable_telemetry: bool = False
+    agy_auth_method: str | None = None
+    agy_mcp_servers_file: Path | None = None
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -132,8 +190,7 @@ class Config:
         token = os.environ.get("MATTERMOST_TOKEN", "").strip() or _read_token(token_file)
         if not token:
             raise ValueError(
-                "MATTERMOST_TOKEN is required (or MATTERMOST_TOKEN_FILE "
-                f"at {token_file})"
+                f"MATTERMOST_TOKEN is required (or MATTERMOST_TOKEN_FILE at {token_file})"
             )
 
         raw_channels = _csv(os.environ.get("MATTERMOST_CHANNEL_ID")) | _csv(
@@ -141,32 +198,52 @@ class Config:
         )
         # `all` / `*` / `any` — or an empty value — means every channel this
         # account can see, including channels created after startup.
-        all_channels = not raw_channels or any(
-            c.lower() in WILDCARD_CHANNELS for c in raw_channels
-        )
-        channel_ids = frozenset(
-            c for c in raw_channels if c.lower() not in WILDCARD_CHANNELS
-        )
-        auto_join = _truthy(
-            os.environ.get("MATTERMOST_AUTO_JOIN_CHANNELS"), default=all_channels
-        )
+        all_channels = not raw_channels or any(c.lower() in WILDCARD_CHANNELS for c in raw_channels)
+        channel_ids = frozenset(c for c in raw_channels if c.lower() not in WILDCARD_CHANNELS)
+        auto_join = _truthy(os.environ.get("MATTERMOST_AUTO_JOIN_CHANNELS"), default=all_channels)
         # Channels this account must never join or answer in, even in `all`
         # mode. Used to keep one harness out of another harness's channel.
-        exclude_channel_ids = _csv(
-            os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_ID")
-        ) | _csv(os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_IDS"))
+        exclude_channel_ids = _csv(os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_ID")) | _csv(
+            os.environ.get("MATTERMOST_EXCLUDE_CHANNEL_IDS")
+        )
 
         team_raw = os.environ.get("MATTERMOST_TEAM_ID", "").strip()
         team_id = team_raw or None
         peer_channel_id = os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "").strip() or None
 
         harness = os.environ.get("HARNESS", "").strip()
-        if harness not in {"grok", "claude", "codex", "cursor"}:
-            raise ValueError("HARNESS must explicitly select grok, claude, codex or cursor")
+        if harness not in {"grok", "claude", "codex", "cursor", "gemini", "agy"}:
+            raise ValueError(
+                "HARNESS must explicitly select grok, claude, codex, cursor, gemini or agy"
+            )
         command = _env("AGENT_COMMAND", "").strip()
         if not command:
             raise ValueError("AGENT_COMMAND is required")
         model = _env("AGENT_MODEL", "").strip() or None
+        if harness == "gemini" and model is None:
+            raise ValueError("AGENT_MODEL is required for the native Gemini harness")
+        effort_raw = _env("AGENT_EFFORT", "").strip()
+        effort: str | None = None
+        if effort_raw:
+            effort = normalize_effort(effort_raw)
+            if effort is None:
+                raise ValueError("AGENT_EFFORT must be a supported effort level")
+
+        agy_home_raw = os.environ.get("AGY_CLI_HOME", "").strip()
+        agy_cli_home = Path(agy_home_raw).expanduser() if agy_home_raw else None
+        agy_app_data_raw = os.environ.get("AGY_APP_DATA_DIR", "").strip()
+        agy_app_data_dir = agy_app_data_raw or ("antigravity-cli" if agy_cli_home else None)
+        agy_disable_telemetry = _truthy(os.environ.get("AGY_DISABLE_TELEMETRY"), default=False)
+        agy_auth_raw = os.environ.get("AGY_AUTH_METHOD", "").strip()
+        agy_auth_method = agy_auth_raw or None
+        if agy_auth_method is not None and agy_auth_method not in AGY_AUTH_METHODS:
+            raise ValueError(
+                "AGY_AUTH_METHOD must be oauth-personal, oauth-business, "
+                "gemini-api-key, agent-platform or none"
+            )
+        agy_mcp_servers_file = _optional_mcp_servers_file(
+            os.environ.get("AGY_MCP_SERVERS_FILE")
+        )
         cwd = Path(_env("AGENT_CWD", ".")).expanduser()
         answer_mode = _env("AGENT_ANSWER_MODE", "finalize").strip().lower()
         if answer_mode not in {"finalize", "live"}:
@@ -191,9 +268,19 @@ class Config:
         status_done_tool_lines = max(
             0, int(os.environ.get("MATTERMOST_STATUS_DONE_TOOL_LINES", "0"))
         )
-        status_progress_lines = max(
-            0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3"))
-        )
+        status_progress_lines = max(0, int(os.environ.get("MATTERMOST_STATUS_PROGRESS_LINES", "3")))
+
+        guard_timeout = float(os.environ.get("AGENT_WORKSPACE_GUARD_TIMEOUT_S", "15"))
+        if not math.isfinite(guard_timeout) or not 0 < guard_timeout <= 300:
+            raise ValueError("AGENT_WORKSPACE_GUARD_TIMEOUT_S must be positive and at most 300")
+        guard_command = os.environ.get("AGENT_WORKSPACE_GUARD_COMMAND", "").strip() or None
+        guard_source = os.environ.get("AGENT_WORKSPACE_GUARD_SOURCE_SHA256", "").strip() or None
+        if guard_source is not None and (
+            guard_command is None
+            or len(guard_source) != 64
+            or any(char not in "0123456789abcdef" for char in guard_source)
+        ):
+            raise ValueError("Workspace guard source pin requires a command and lowercase SHA256")
 
         return cls(
             mattermost_url=url,
@@ -209,6 +296,9 @@ class Config:
             role_file=_optional_path(os.environ.get("MATTERMOST_ROLE_FILE")),
             harness=harness,
             grok_command=command,
+            workspace_guard_command=guard_command,
+            workspace_guard_timeout_s=guard_timeout,
+            workspace_guard_source_sha256=guard_source,
             grok_model=model,
             grok_cwd=cwd,
             always_approve=_truthy(_env("AGENT_ALWAYS_APPROVE"), default=True),
@@ -216,12 +306,8 @@ class Config:
             max_parallel_turns=max(1, max_parallel),
             show_thoughts=_truthy(_env("AGENT_SHOW_THOUGHTS"), default=False),
             text_slash=_truthy(_env("AGENT_TEXT_SLASH"), default=True),
-            auto_rename_threads=_truthy(
-                _env("AGENT_AUTO_RENAME_THREADS"), default=True
-            ),
-            inject_channel_context=_truthy(
-                _env("AGENT_INJECT_CHANNEL_CONTEXT"), default=True
-            ),
+            auto_rename_threads=_truthy(_env("AGENT_AUTO_RENAME_THREADS"), default=True),
+            inject_channel_context=_truthy(_env("AGENT_INJECT_CHANNEL_CONTEXT"), default=True),
             post_max_lines=post_max_lines,
             status_tool_lines=status_tool_lines,
             status_done_tool_lines=status_done_tool_lines,
@@ -229,11 +315,21 @@ class Config:
             slash_tokens=_csv(os.environ.get("MATTERMOST_SLASH_TOKEN"))
             | _csv(os.environ.get("MATTERMOST_SLASH_TOKENS"))
             | _token_file_csv(os.environ.get("MATTERMOST_SLASH_TOKEN_FILE")),
-            slash_host=os.environ.get("MATTERMOST_SLASH_HOST", "127.0.0.1").strip()
-            or "127.0.0.1",
+            slash_host=os.environ.get("MATTERMOST_SLASH_HOST", "127.0.0.1").strip() or "127.0.0.1",
             slash_port=slash_port,
             db_path=db,
             log_file=log_file,
             attachments_dir=attachments_dir,
             attachments_max_bytes=int(attachments_max_mb * 1024 * 1024),
+            collab_sidecar=_truthy(os.environ.get("MATTERMOST_COLLAB_SIDECAR")),
+            collab_origin_actor=os.environ.get("MATTERMOST_COLLAB_ORIGIN_ACTOR", "").strip(),
+            collab_cli_command=_collaboration_cli_command(
+                os.environ.get("MATTERMOST_COLLAB_CLI_COMMAND")
+            ),
+            grok_effort=effort,
+            agy_cli_home=agy_cli_home,
+            agy_app_data_dir=agy_app_data_dir,
+            agy_disable_telemetry=agy_disable_telemetry,
+            agy_auth_method=agy_auth_method,
+            agy_mcp_servers_file=agy_mcp_servers_file,
         )

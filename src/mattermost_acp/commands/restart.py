@@ -44,6 +44,7 @@ async def restart_gateway(
     stop_coro: StopCoro | None = None,
     cancel_coro: CancelCoro | None = None,
     unit: str = DEFAULT_UNIT,
+    track=None,
 ) -> str:
     """Schedule a clean gateway exit and return a user-facing status string.
 
@@ -60,8 +61,7 @@ async def restart_gateway(
 
     if under_systemd():
         msg = (
-            f"♻️ Restarting `{unit}`… "
-            "I'll post back in this thread when I'm up."
+            f"♻️ Restarting `{unit}`… I'll post back in this thread when I'm up."
             if pending and pending.thread_id
             else f"♻️ Restarting `{unit}`…"
         )
@@ -85,5 +85,8 @@ async def restart_gateway(
         logger.info("Exiting for clean restart (pid=%s)", os.getpid())
         os._exit(0)
 
-    asyncio.create_task(_kick(), name="mattermost-acp-restart")
+    if track is None:
+        asyncio.create_task(_kick(), name="mattermost-acp-restart")
+    else:
+        track(_kick(), "mattermost-acp-restart")
     return msg

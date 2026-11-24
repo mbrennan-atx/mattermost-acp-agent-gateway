@@ -4,6 +4,7 @@
     "codex": {"command": "codex-acp", "env": {}},
     "claude": {"command": "claude-agent-acp", "env": {}},
     "grok": {"command": "grok", "env": {}},
-    "cursor": {"command": "cursor-agent", "env": {}}
+    "cursor": {"command": "cursor-agent", "env": {}},
+    "agy": {"command": "agy", "env": {}}
   }
 }

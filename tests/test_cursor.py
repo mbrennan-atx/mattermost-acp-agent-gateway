@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock
 
 import pytest
+from fake_agent import spawn_fake_agent_process
 
 from mattermost_acp.acp.broker import AcpBroker, AcpError
 from mattermost_acp.commands.cursor_models import model_effort, with_effort
@@ -58,18 +59,27 @@ def test_glm_stamp():
 
 @pytest.mark.asyncio
 async def test_cursor_load_only_once_per_process():
-    b = AcpBroker(backend="cursor")
-    b.request = AsyncMock(return_value={"sessionId": "new"})
-    await b.session_new("/tmp")
-    b.request.reset_mock()
-    await b.session_load("new", "/tmp")
-    b.request.assert_not_awaited()
-    await b.session_load("persisted", "/tmp")
-    await b.session_load("persisted", "/tmp")
-    b.request.assert_awaited_once_with(
-        "session/load", {"sessionId": "persisted", "cwd": "/tmp", "mcpServers": []}
-    )
-    await b.stop()
-    b.request.reset_mock()
-    await b.session_load("new", "/tmp")
-    b.request.assert_awaited_once()
+    b = AcpBroker(backend="cursor", process_factory=spawn_fake_agent_process)
+    await b.start()
+    try:
+        session = await b.session_new("/tmp")
+        b.request = AsyncMock(wraps=b.request)
+        await b.session_load(session, "/tmp")
+        b.request.assert_not_awaited()
+        assert b.is_session_loaded(session)
+        await b.session_load("persisted", "/tmp")
+        await b.session_load("persisted", "/tmp")
+        b.request.assert_awaited_once_with(
+            "session/load", {"sessionId": "persisted", "cwd": "/tmp", "mcpServers": []}
+        )
+        await b.stop()
+        assert b._live_sessions == b._cursor_live_sessions == set()
+        await b.start()
+        b.request.reset_mock()
+        await b.session_load(session, "/tmp")
+        b.request.assert_awaited_once_with(
+            "session/load", {"sessionId": session, "cwd": "/tmp", "mcpServers": []}
+        )
+        assert b.is_session_loaded(session)
+    finally:
+        await b.stop()
