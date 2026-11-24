@@ -12,7 +12,7 @@ from logging.handlers import RotatingFileHandler
 
 from mattermost_acp.acp import AcpBroker
 from mattermost_acp.acp.broker import NativeDispatchChanged
-from mattermost_acp.config import Config
+from mattermost_acp.config import Config, load_mcp_servers_file
 from mattermost_acp.harness_switch import busy_path
 from mattermost_acp.mm.client import MattermostClient
 from mattermost_acp.mm.gateway import MattermostGateway
@@ -196,6 +196,11 @@ async def _amain() -> None:
         backend=config.harness,
         model=config.grok_model,
         always_approve=config.always_approve,
+        agy_cli_home=config.agy_cli_home,
+        agy_app_data_dir=config.agy_app_data_dir,
+        agy_disable_telemetry=config.agy_disable_telemetry,
+        agy_auth_method=config.agy_auth_method,
+        mcp_servers=load_mcp_servers_file(config.agy_mcp_servers_file),
         initial_native_uncertainty=await store.native_boundary_unknown(),
         on_native_start=store.mark_native_boundary_unknown,
     )
@@ -204,6 +209,7 @@ async def _amain() -> None:
         store,
         default_cwd=config.grok_cwd,
         default_model=config.grok_model,
+        default_effort=config.grok_effort,
         grok_command=config.grok_command,
         max_parallel_turns=config.max_parallel_turns,
         inject_channel_context=config.inject_channel_context,

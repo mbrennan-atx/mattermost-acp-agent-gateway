@@ -147,7 +147,7 @@ def help_text(*, home_channel_ids: Iterable[str], harness: str = "") -> str:
         "• `/mcps [name]`: connector status through the selected harness CLI",
         "• `/model [id] [effort] [scope]`: list or select a model for thread, channel or harness",
         "• `/effort [level]`: show or select supported reasoning effort",
-        "• `/harness [grok|claude|codex|cursor] [model]`: switch using private profiles; "
+        "• `/harness [grok|claude|codex|cursor|agy] [model]`: switch using private profiles; "
         "restarts when idle and creates new native sessions",
         "• `/help`: this message",
         "",
@@ -164,6 +164,11 @@ def help_text(*, home_channel_ids: Iterable[str], harness: str = "") -> str:
     elif harness == "cursor":
         lines.append(
             "Cursor session/model features follow its adapter capabilities; "
+            "Grok workflow commands are unavailable."
+        )
+    elif harness == "agy":
+        lines.append(
+            "Antigravity session/model/thought-level features follow its ACP capabilities; "
             "Grok workflow commands are unavailable."
         )
     lines.extend(

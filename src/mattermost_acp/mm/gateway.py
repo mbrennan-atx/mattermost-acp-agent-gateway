@@ -679,7 +679,10 @@ class MattermostGateway:
             return
         if cmd in {"mcps", "mcp"}:
             report = await mcp_status_report(
-                self.config.harness, self.config.grok_command, server=arg or None
+                self.config.harness,
+                self.config.grok_command,
+                server=arg or None,
+                mcp_servers_file=self.config.agy_mcp_servers_file,
             )
             await reply(report.text)
             return
@@ -700,6 +703,9 @@ class MattermostGateway:
                 return
             if self.config.harness == "cursor":
                 await reply(f"`/{cmd}` passthrough is unavailable for Cursor.")
+                return
+            if self.config.harness == "agy":
+                await reply(f"`/{cmd}` passthrough is unavailable for Antigravity.")
                 return
             await reply(f"↗ `{prompt}`")
             await self.run_prompt(

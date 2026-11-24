@@ -2,7 +2,7 @@
 
 ## Completed acceptance, November 16
 
-Final runtime source `e8fca39fa239257e488b567a9e46920fc69efbf6` passes [final-source CI](https://github.com/mbrennan-atx/mattermost-acp-agent-gateway/actions/runs/43890518442): 1,424 tests pass, with one optional adapter skip. Ruff and immutable export/archive/wheel checks pass. All 46 installed Python files match the reviewed source, and all seven actual persona profiles import successfully.
+Final runtime source `e8fca39fa239257e488b567a9e46920fc69efbf6` passes final-source CI (run `43890518442`): 1,424 tests pass, with one optional adapter skip. Ruff and immutable export/archive/wheel checks pass. All 46 installed Python files match the reviewed source, and all seven actual persona profiles import successfully.
 
 The private deployment has an active hub and seven project sidecars. Native Claude, Codex, Cursor and Gemini shell requests completed with correlated replies and verified Mattermost read-backs. Task claims, duplicate replies, CLI waits, floor mentions, busy follow-ups, queued-request recovery through hub restart, native shell cancellation and unrelated-project preservation passed. Seven original identities, process/start identities, model pins, connector selectors and Gemini's bridge were independently preserved. Both repository root AGENTS.md files are present.
 
@@ -14,11 +14,11 @@ Private acceptance receipts, including native delivery, cancellation, warm-bound
 
 ## Final runtime candidate, November 16
 
-Runtime source d773cbb9b13087f84c42200c74d9de5a47be4726 passes 1,416 tests with one optional adapter skip on Python 3.12. Ruff, immutable source/archive/wheel checks, parity for all 46 installed Python files and seven configured profile imports pass. [Hosted CI](https://github.com/mbrennan-atx/mattermost-acp-agent-gateway/actions/runs/43873697014) passes at that exact source.
+Runtime source d773cbb9b13087f84c42200c74d9de5a47be4726 passes 1,416 tests with one optional adapter skip on Python 3.12. Ruff, immutable source/archive/wheel checks, parity for all 46 installed Python files and seven configured profile imports pass. Hosted CI (run `43873697014`) passes at that exact source.
 
 A fresh 45-second worker lease at elapsed time 51.78335005859267 could reject itself because deadline subtraction rounded to 45.00000000000001. Lease and retry validation now compare their absolute bounds, preserving expiry and rejecting an extended lease. The affected 44-case run passes. Workspace-guard process cleanup also accepts an exited procfs process during observation.
 
-Matthew's November 16 policy exempts GitHub-only code from automatic BugShark. Supported findings from completed earlier reviews remain fixed and tested; further broad reviews are unnecessary. Live deployment acceptance remains separate from these source checks.
+The November 16 repository policy exempts GitHub-only code from automatic BugShark. Supported findings from completed earlier reviews remain fixed and tested; further broad reviews are unnecessary. Live deployment acceptance remains separate from these source checks.
 
 ## Current completion candidate
 
@@ -161,7 +161,7 @@ The parent's 38 new integrated regressions pass. 73 settings/subagent/reporting/
 
 ## Final review corrections and long prompt lifetime
 
-Matthew required completion of the rollout and removal of the recurring two-hour
+The deployment required completion of the rollout and removal of the recurring two-hour
 prompt failure. Active prompts now have no default absolute ceiling; zero
 explicitly disables it, finite positive caps remain available, and malformed or
 nonfinite caps refuse. Real inactivity still cancels the native prompt, including

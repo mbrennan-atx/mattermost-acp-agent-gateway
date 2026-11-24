@@ -131,6 +131,7 @@ class SessionService:
         *,
         default_cwd: Path,
         default_model: str | None = None,
+        default_effort: str | None = None,
         grok_command: str | None = None,
         grok_home: Path | None = None,
         max_parallel_turns: int = 4,
@@ -146,6 +147,7 @@ class SessionService:
         self.store = store
         self.default_cwd = default_cwd
         self.default_model = default_model
+        self.default_effort = default_effort
         self.grok_command = grok_command
         self.grok_home = grok_home
         self.inject_channel_context = inject_channel_context
@@ -245,8 +247,11 @@ class SessionService:
 
         if record is None:
             model, effort, source = await self.store.model_preference(thread_id, channel_id)
-            if source == "configuration" and route is not None:
-                model, effort = await self._route(thread_id, route, model, effort)
+            if source == "configuration":
+                if effort is None:
+                    effort = self.default_effort
+                if route is not None:
+                    model, effort = await self._route(thread_id, route, model, effort)
             return await self._create_and_pin(
                 thread_id,
                 work_cwd,
@@ -282,9 +287,13 @@ class SessionService:
             desired_model, desired_effort, source = await self.store.model_preference(
                 thread_id, channel_id
             )
-            if source == "configuration" and record.model:
-                # Keep the model this thread already ran on (routed or default).
-                desired_model, desired_effort = record.model, record.effort
+            if source == "configuration":
+                if record.model:
+                    # Keep the model this thread already ran on (routed or default).
+                    desired_model = record.model
+                    desired_effort = record.effort or self.default_effort
+                elif desired_effort is None:
+                    desired_effort = self.default_effort
             return await self._create_and_pin(
                 thread_id,
                 work_cwd,
@@ -299,7 +308,18 @@ class SessionService:
             )
             record = await self.store.get(thread_id)
             assert record is not None
-        desired_model, desired_effort, _ = await self.store.model_preference(thread_id, channel_id)
+        desired_model, desired_effort, source = await self.store.model_preference(
+            thread_id, channel_id
+        )
+        if source == "configuration":
+            if (
+                desired_model is None
+                and getattr(self.broker, "backend", "") == "agy"
+                and (record.model or self.default_model)
+            ):
+                desired_model = record.model or self.default_model
+            if desired_effort is None:
+                desired_effort = record.effort or self.default_effort
         await self._sync_live_model(
             thread_id,
             record.session_id,
@@ -662,7 +682,11 @@ class SessionService:
                 pass
             await self.broker.session_close(record.session_id)
 
-        desired_model, desired_effort, _ = await self.store.model_preference(thread_id, channel_id)
+        desired_model, desired_effort, source = await self.store.model_preference(
+            thread_id, channel_id
+        )
+        if source == "configuration" and desired_effort is None:
+            desired_effort = self.default_effort
         self._pinned.discard(thread_id)
         return await self._create_and_pin(
             thread_id,
@@ -681,11 +705,11 @@ class SessionService:
             )
             if live:
                 model = live
-        effort = record.effort if record else None
+        effort = (record.effort if record else None) or self.default_effort
         backend = getattr(self.broker, "backend", "grok")
-        if record and backend in {"claude", "codex"}:
+        if record and backend in {"claude", "codex", "agy"}:
             for option in self.broker.session_config_options.get(record.session_id, []):
-                if option.get("id") in {"effort", "reasoning_effort"}:
+                if option.get("id") in {"effort", "reasoning_effort", "thought_level"}:
                     value = option.get("currentValue")
                     if isinstance(value, str) and value:
                         effort = value

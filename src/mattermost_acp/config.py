@@ -2,16 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
+from mattermost_acp.commands.effort import normalize_effort
 from mattermost_acp.deployment import config_root, resolve_path
 
 DEFAULT_TOKEN_FILE = Path.home() / ".config" / "mattermost-acp-gateway" / "token"
+AGY_AUTH_METHODS = frozenset(
+    {"oauth-personal", "oauth-business", "gemini-api-key", "agent-platform", "none"}
+)
 
 
 def _truthy(value: str | None, default: bool = False) -> bool:
@@ -83,6 +89,30 @@ def _read_token(path: Path) -> str:
         return ""
 
 
+def load_mcp_servers_file(path: Path | None) -> list[dict[str, Any]]:
+    """Read an optional JSON list of ACP ``mcpServers`` objects."""
+    if path is None:
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("AGY_MCP_SERVERS_FILE must select a readable JSON file") from exc
+    if not isinstance(data, list) or not all(isinstance(item, dict) for item in data):
+        raise ValueError("AGY_MCP_SERVERS_FILE must contain a JSON list of server objects")
+    return data
+
+
+def _optional_mcp_servers_file(value: str | None) -> Path | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    selected = resolve_path(raw, config_root())
+    if not selected.is_file():
+        raise ValueError("AGY_MCP_SERVERS_FILE must select an existing JSON file")
+    load_mcp_servers_file(selected)
+    return selected
+
+
 @dataclass(frozen=True)
 class Config:
     mattermost_url: str
@@ -128,6 +158,12 @@ class Config:
     workspace_guard_command: str | None = None
     workspace_guard_timeout_s: float = 15
     workspace_guard_source_sha256: str | None = None
+    grok_effort: str | None = None
+    agy_cli_home: Path | None = None
+    agy_app_data_dir: str | None = None
+    agy_disable_telemetry: bool = False
+    agy_auth_method: str | None = None
+    agy_mcp_servers_file: Path | None = None
 
     @classmethod
     def load(cls, env_file: str | Path | None = None) -> Config:
@@ -176,14 +212,38 @@ class Config:
         peer_channel_id = os.environ.get("MATTERMOST_PEER_CHANNEL_ID", "").strip() or None
 
         harness = os.environ.get("HARNESS", "").strip()
-        if harness not in {"grok", "claude", "codex", "cursor", "gemini"}:
-            raise ValueError("HARNESS must explicitly select grok, claude, codex, cursor or gemini")
+        if harness not in {"grok", "claude", "codex", "cursor", "gemini", "agy"}:
+            raise ValueError(
+                "HARNESS must explicitly select grok, claude, codex, cursor, gemini or agy"
+            )
         command = _env("AGENT_COMMAND", "").strip()
         if not command:
             raise ValueError("AGENT_COMMAND is required")
         model = _env("AGENT_MODEL", "").strip() or None
         if harness == "gemini" and model is None:
             raise ValueError("AGENT_MODEL is required for the native Gemini harness")
+        effort_raw = _env("AGENT_EFFORT", "").strip()
+        effort: str | None = None
+        if effort_raw:
+            effort = normalize_effort(effort_raw)
+            if effort is None:
+                raise ValueError("AGENT_EFFORT must be a supported effort level")
+
+        agy_home_raw = os.environ.get("AGY_CLI_HOME", "").strip()
+        agy_cli_home = Path(agy_home_raw).expanduser() if agy_home_raw else None
+        agy_app_data_raw = os.environ.get("AGY_APP_DATA_DIR", "").strip()
+        agy_app_data_dir = agy_app_data_raw or ("antigravity-cli" if agy_cli_home else None)
+        agy_disable_telemetry = _truthy(os.environ.get("AGY_DISABLE_TELEMETRY"), default=False)
+        agy_auth_raw = os.environ.get("AGY_AUTH_METHOD", "").strip()
+        agy_auth_method = agy_auth_raw or None
+        if agy_auth_method is not None and agy_auth_method not in AGY_AUTH_METHODS:
+            raise ValueError(
+                "AGY_AUTH_METHOD must be oauth-personal, oauth-business, "
+                "gemini-api-key, agent-platform or none"
+            )
+        agy_mcp_servers_file = _optional_mcp_servers_file(
+            os.environ.get("AGY_MCP_SERVERS_FILE")
+        )
         cwd = Path(_env("AGENT_CWD", ".")).expanduser()
         answer_mode = _env("AGENT_ANSWER_MODE", "finalize").strip().lower()
         if answer_mode not in {"finalize", "live"}:
@@ -266,4 +326,10 @@ class Config:
             collab_cli_command=_collaboration_cli_command(
                 os.environ.get("MATTERMOST_COLLAB_CLI_COMMAND")
             ),
+            grok_effort=effort,
+            agy_cli_home=agy_cli_home,
+            agy_app_data_dir=agy_app_data_dir,
+            agy_disable_telemetry=agy_disable_telemetry,
+            agy_auth_method=agy_auth_method,
+            agy_mcp_servers_file=agy_mcp_servers_file,
         )

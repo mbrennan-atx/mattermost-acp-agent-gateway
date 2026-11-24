@@ -13,6 +13,9 @@ import os
 import shlex
 import shutil
 from dataclasses import dataclass
+from pathlib import Path
+
+from mattermost_acp.config import load_mcp_servers_file
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +180,48 @@ async def mcp_cli_report(
     return McpProbeResult(ok=rc == 0, text=f"**MCP status** ({label})\n```\n{body[:1800]}\n```")
 
 
+def _format_configured_mcp_servers(
+    path: Path, *, server: str | None = None
+) -> McpProbeResult:
+    try:
+        servers = load_mcp_servers_file(path)
+    except ValueError as exc:
+        return McpProbeResult(ok=False, text=f"**MCP status failed**: {exc}")
+    rows = []
+    for entry in servers:
+        name = str(entry.get("name") or "?")
+        if server and name.lower() != server.lower():
+            continue
+        target = str(entry.get("url") or entry.get("command") or "")
+        rows.append(f"{name}: {target}" if target else name)
+    if server and not rows:
+        known = sorted(str(entry.get("name")) for entry in servers if entry.get("name"))
+        return McpProbeResult(
+            ok=False,
+            text=(
+                f"No configured ACP MCP server named `{server}`.\n"
+                f"Known: {', '.join(f'`{name}`' for name in known) or '—'}"
+            ),
+        )
+    body = "\n".join(rows) or "(none configured)"
+    return McpProbeResult(
+        ok=True,
+        text=f"**MCP status** (agy configured ACP servers)\n```\n{body[:1800]}\n```",
+    )
+
+
 async def mcp_status_report(
     harness: str,
     grok_command: str,
     *,
     server: str | None = None,
+    mcp_servers_file: Path | None = None,
 ) -> McpProbeResult:
     """Route ``/mcp`` to the CLI that owns this agent's MCP config."""
+    if harness == "agy":
+        if mcp_servers_file is not None:
+            return _format_configured_mcp_servers(mcp_servers_file, server=server)
+        return await mcp_cli_report([grok_command, "mcp", "list"], "agy mcp")
     if harness == "cursor":
         argv = (
             [grok_command, "mcp", "list-tools", server] if server else [grok_command, "mcp", "list"]

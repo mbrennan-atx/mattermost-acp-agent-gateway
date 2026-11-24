@@ -2,7 +2,7 @@
 
 Run an agent harness in Mattermost. Each thread has an independent native session,
 with streamed progress, cancellation, model selection and persistent thread mappings.
-The gateway supports Grok Build, Claude Code, Codex, Cursor and experimental native Gemini through ACP. The
+The gateway supports Grok Build, Claude Code, Codex, Cursor, Antigravity (`agy`) and experimental native Gemini through ACP. The
 operator supplies accounts, credentials, workspace permissions and optional personas.
 
 ## Run one assistant

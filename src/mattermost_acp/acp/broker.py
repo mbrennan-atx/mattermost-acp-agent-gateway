@@ -6,6 +6,7 @@ One broker multiplexes many ACP sessions (one chat thread each).
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import math
@@ -238,6 +239,11 @@ class AcpBroker:
         always_approve: bool = True,
         extra_args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        agy_cli_home: Path | None = None,
+        agy_app_data_dir: str | None = None,
+        agy_disable_telemetry: bool = False,
+        agy_auth_method: str | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
         # Injectable process factory for tests (fake agent)
         process_factory: Callable[..., Awaitable[asyncio.subprocess.Process]] | None = None,
         rpc_timeout_s: float | None = None,
@@ -256,6 +262,11 @@ class AcpBroker:
         self.always_approve = always_approve
         self.extra_args = list(extra_args or [])
         self.env = env
+        self.agy_cli_home = agy_cli_home
+        self.agy_app_data_dir = agy_app_data_dir
+        self.agy_disable_telemetry = agy_disable_telemetry
+        self.agy_auth_method = agy_auth_method
+        self._mcp_servers = copy.deepcopy(list(mcp_servers or []))
         self._process_factory = process_factory
         self.rpc_timeout_s = (
             rpc_timeout_s
@@ -335,6 +346,17 @@ class AcpBroker:
         return lock
 
     def _build_argv(self) -> list[str]:
+        if self.backend == "agy":
+            args = [self.command, *self.extra_args, "acp"]
+            if self.agy_cli_home is not None:
+                args.extend(["--gemini-dir", str(self.agy_cli_home)])
+            if self.agy_app_data_dir:
+                args.extend(["--app-data-dir", self.agy_app_data_dir])
+            if self.always_approve:
+                args.append("--dangerously-skip-permissions")
+            if self.agy_disable_telemetry:
+                args.append("--disable-telemetry")
+            return args
         if self.backend == "cursor":
             return [self.command, *self.extra_args, "acp"]
         if self.backend in {"claude", "codex", "gemini"}:
@@ -350,6 +372,23 @@ class AcpBroker:
         args.extend(self.extra_args)
         args.append("stdio")
         return args
+
+    def _resolve_agy_auth_method(self) -> str | None:
+        if self.agy_auth_method == "none":
+            return None
+        if self.agy_auth_method:
+            return self.agy_auth_method
+        effective_env = {**os.environ, **(self.env or {})}
+        if effective_env.get("GEMINI_API_KEY") or effective_env.get("GOOGLE_API_KEY"):
+            return "gemini-api-key"
+        if effective_env.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            return "agent-platform"
+        return "oauth-personal"
 
     async def start(self) -> AcpCapabilities:
         async with self._lock:
@@ -443,6 +482,10 @@ class AcpBroker:
                 self._initialization_pending = False
             if self.backend == "cursor":
                 await self.request("authenticate", {"methodId": "cursor_login"})
+            elif self.backend == "agy":
+                auth_method = self._resolve_agy_auth_method()
+                if auth_method is not None:
+                    await self.request("authenticate", {"methodId": auth_method})
             self._started = True
             logger.info(
                 "ACP initialized loadSession=%s resume=%s close=%s",
@@ -568,7 +611,7 @@ class AcpBroker:
         process = self._proc
         params: dict[str, Any] = {
             "cwd": str(cwd),
-            "mcpServers": [],
+            "mcpServers": copy.deepcopy(self._mcp_servers),
         }
         if meta:
             params["_meta"] = meta
@@ -593,7 +636,11 @@ class AcpBroker:
         process = self._proc
         result = await self.request(
             "session/resume",
-            {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []},
+            {
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "mcpServers": copy.deepcopy(self._mcp_servers),
+            },
         )
         self._remember_config(session_id, result)
         self._remember_session(session_id, process)
@@ -610,7 +657,11 @@ class AcpBroker:
         try:
             result = await self.request(
                 "session/load",
-                {"sessionId": session_id, "cwd": str(cwd), "mcpServers": []},
+                {
+                    "sessionId": session_id,
+                    "cwd": str(cwd),
+                    "mcpServers": copy.deepcopy(self._mcp_servers),
+                },
             )
             self._remember_config(session_id, result)
             loaded = self._remember_session(session_id, process)
@@ -654,7 +705,7 @@ class AcpBroker:
                 if option.get("id") == "model":
                     return str(option.get("currentValue") or model_id)
             return model_id
-        if self.backend in {"claude", "codex"}:
+        if self.backend in {"claude", "codex", "agy"}:
             return await self._set_model_config(session_id, model_id, effort=effort)
         params: dict[str, Any] = {"sessionId": session_id, "modelId": model_id}
         if effort:
@@ -682,10 +733,11 @@ class AcpBroker:
         *,
         effort: str | None = None,
     ) -> str:
-        """Claude and Codex expose model and effort through configOptions.
+        """Claude, Codex and Antigravity expose model and effort through configOptions.
 
-        Codex names its effort option ``reasoning_effort``; Claude uses
-        ``effort``. The adapter resolves model values against its own catalog.
+        Codex names its effort option ``reasoning_effort``, Antigravity uses
+        ``thought_level``, and Claude uses ``effort``. The adapter resolves model
+        values against its own catalog.
         """
         result = await self.request(
             "session/set_config_option",
@@ -702,11 +754,15 @@ class AcpBroker:
                         resolved = current
                     break
         if effort:
+            effort_config_id = {
+                "codex": "reasoning_effort",
+                "agy": "thought_level",
+            }.get(self.backend, "effort")
             result = await self.request(
                 "session/set_config_option",
                 {
                     "sessionId": session_id,
-                    "configId": "reasoning_effort" if self.backend == "codex" else "effort",
+                    "configId": effort_config_id,
                     "value": effort,
                 },
             )

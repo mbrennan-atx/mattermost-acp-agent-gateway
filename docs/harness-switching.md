@@ -1,8 +1,8 @@
 # Switching harnesses
 
 The selected external inventory maps assistants to environment files and service
-units. The selected external harness profiles map `grok`, `claude`, `codex` or
-`cursor` to executable, model, path prefixes and provider-specific environment.
+units. The selected external harness profiles map `grok`, `claude`, `codex`, `cursor` or
+`agy` to executable, model, path prefixes and provider-specific environment.
 See [deployment](deployment.md) for selectors, versioning and relative paths.
 
 ```bash

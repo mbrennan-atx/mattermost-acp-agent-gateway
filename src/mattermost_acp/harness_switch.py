@@ -1,4 +1,4 @@
-"""Switch a fleet agent between harnesses (grok, claude, codex, cursor).
+"""Switch a fleet agent between harnesses (grok, claude, codex, cursor, agy).
 
 Shared by ``scripts/set-harness`` and the ``/harness`` chat command. Stdlib
 only so the script runs without the virtualenv.
